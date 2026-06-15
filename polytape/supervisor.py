@@ -60,6 +60,11 @@ class StreamSupervisor:
         self._name = stream.stream
         self._stop = asyncio.Event()
 
+    @property
+    def name(self) -> str:
+        """The supervised stream's name."""
+        return self._name
+
     def stop(self) -> None:
         """Request a graceful stop; the current backoff wait is interrupted."""
         self._stop.set()

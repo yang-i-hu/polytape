@@ -154,10 +154,13 @@ def main(argv: list[str] | None = None) -> int:
         config.hash_usernames,
         config.dry_run,
     )
-    # Capture orchestration (Gamma resolve + websockets + writer) is wired in
-    # later build steps; until then the CLI only validates and reports config.
-    logger.warning("capture pipeline not yet wired up (CLI + config only); nothing recorded")
-    return 0
+    if config.dry_run:
+        # Offline mock pipeline is wired in step 9.
+        logger.warning("dry-run mock not yet wired up; nothing recorded")
+        return 0
+    from polytape.app import run_live
+
+    return run_live(config)
 
 
 if __name__ == "__main__":
