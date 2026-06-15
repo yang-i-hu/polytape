@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polytape"
+version = "0.1.0"
+description = "Record Polymarket's public real-time comment and order-book feeds to timestamped JSONL."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "polytape contributors" }]
+keywords = ["polymarket", "websocket", "order-book", "recorder", "jsonl", "research"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+  "websockets>=12.0",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5",
+  "black>=24.0",
+]
+
+[project.scripts]
+polytape = "polytape.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/polytape/polytape"
+Source = "https://github.com/polytape/polytape"
+
+[tool.hatch.build.targets.wheel]
+packages = ["polytape"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

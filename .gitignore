@@ -1,0 +1,22 @@
+# Captured recordings — never commit data
+data/
+
+# Claude Code (personal / machine-specific — keep out of version control)
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
