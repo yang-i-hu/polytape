@@ -1,0 +1,104 @@
+"""RTDS comment stream consumer.
+
+Connects to Polymarket's Real-Time Data Service ``comments`` topic and records
+the comments/reactions for one Event.
+
+**Filtering is client-side.** Live testing (2026-06-15) showed the server-side
+per-event ``filters`` field returns *zero* messages for every format tried
+(stringified int/string and object), while the unfiltered firehose delivers the
+event's comments normally. So polytape subscribes to the firehose and keeps only
+messages belonging to its event: comments by ``parentEntityID``, and reactions
+(which carry no ``parentEntityID``) by ``commentID`` against the comments seen
+this session. See ``PROTOCOL.md`` §1 and Open Question #3.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from polytape.config import STREAM_COMMENTS
+from polytape.streams.base import WebSocketStream
+
+logger = logging.getLogger("polytape.stream.rtds")
+
+RTDS_URL = "wss://ws-live-data.polymarket.com"
+
+# Application-level keepalive: the RTDS reference client sends the literal
+# lowercase text "ping" every 5s (PROTOCOL.md §1.4).
+_PING_TEXT = "ping"
+_PING_INTERVAL = 5.0
+
+
+def comment_subscribe_frame() -> str:
+    """Build the RTDS subscribe frame for the (unfiltered) comments firehose.
+
+    No ``filters`` field: the server-side filter was found to drop all messages,
+    so filtering happens client-side in :meth:`CommentStream.should_record`.
+    """
+    frame = {
+        "action": "subscribe",
+        "subscriptions": [{"topic": "comments", "type": "*"}],
+    }
+    return json.dumps(frame)
+
+
+class CommentStream(WebSocketStream):
+    """Records the RTDS ``comments`` topic for a single event (client-filtered).
+
+    Tracks :attr:`last_comment_id` (the latest *comment* id, ignoring reactions)
+    so the supervisor can resume comment backfill after a disconnect, and the set
+    of comment ids seen this session so reactions can be attributed.
+    """
+
+    stream = STREAM_COMMENTS
+
+    def __init__(self, *, event_id: str | int, writer: Any, connect: Any = None) -> None:
+        kwargs: dict[str, Any] = {}
+        if connect is not None:
+            kwargs["connect"] = connect
+        super().__init__(
+            url=RTDS_URL,
+            writer=writer,
+            ping_text=_PING_TEXT,
+            ping_interval=_PING_INTERVAL,
+            **kwargs,
+        )
+        self.event_id = str(event_id)
+        self.last_comment_id: str | None = None
+        self._known_comment_ids: set[str] = set()
+
+    def subscribe_frames(self) -> list[str]:
+        return [comment_subscribe_frame()]
+
+    @staticmethod
+    def _core(raw: dict[str, Any]) -> dict[str, Any]:
+        payload = raw.get("payload")
+        return payload if isinstance(payload, dict) else raw
+
+    def should_record(self, raw: dict[str, Any]) -> bool:
+        """Keep only this event's comments/reactions from the firehose.
+
+        Comments are matched by ``parentEntityID``. Reactions carry no
+        ``parentEntityID``, so they are matched by ``commentID`` against the
+        comments already seen this session (reactions to comments we never saw,
+        e.g. older ones, are not attributable and are dropped).
+        """
+        core = self._core(raw)
+        parent = core.get("parentEntityID")
+        if parent is not None:
+            return str(parent) == self.event_id
+        comment_id = core.get("commentID")
+        if comment_id is not None:
+            return str(comment_id) in self._known_comment_ids
+        return False
+
+    def on_written(self, raw: dict[str, Any]) -> None:
+        """Track the latest comment id (backfill cursor) and seen comment ids."""
+        if raw.get("type", "").startswith("reaction"):
+            return  # reactions don't move the cursor or seed attribution
+        cid = self._core(raw).get("id")
+        if cid is not None:
+            self.last_comment_id = str(cid)
+            self._known_comment_ids.add(str(cid))
