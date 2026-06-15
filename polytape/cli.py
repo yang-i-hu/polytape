@@ -155,9 +155,9 @@ def main(argv: list[str] | None = None) -> int:
         config.dry_run,
     )
     if config.dry_run:
-        # Offline mock pipeline is wired in step 9.
-        logger.warning("dry-run mock not yet wired up; nothing recorded")
-        return 0
+        from polytape.mock import run_dry_run
+
+        return run_dry_run(config)
     from polytape.app import run_live
 
     return run_live(config)

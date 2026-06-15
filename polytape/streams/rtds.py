@@ -28,9 +28,15 @@ def comment_subscribe_frame(event_id: str | int) -> str:
     """Build the RTDS subscribe frame for one event's comments.
 
     ``filters`` is a *stringified* JSON object (RTDS quirk), and
-    ``parentEntityID`` must be the numeric event id.
+    ``parentEntityID`` must be the numeric event id. A non-numeric id (only
+    possible under ``--dry-run``) is passed through as-is.
     """
-    inner = json.dumps({"parentEntityID": int(event_id), "parentEntityType": "Event"})
+    entity_id: int | str
+    try:
+        entity_id = int(event_id)
+    except (TypeError, ValueError):
+        entity_id = str(event_id)
+    inner = json.dumps({"parentEntityID": entity_id, "parentEntityType": "Event"})
     frame = {
         "action": "subscribe",
         "subscriptions": [{"topic": "comments", "type": "*", "filters": inner}],
