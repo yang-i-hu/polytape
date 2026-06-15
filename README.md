@@ -65,7 +65,7 @@ until you stop it with `Ctrl-C` (SIGINT) or SIGTERM.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--event-id ID` | *(required)* | Polymarket **Event** ID to record. |
+| `--event-id ID` | *(required)* | Polymarket **Event** ID to record (numeric for a live capture; any string under `--dry-run`). |
 | `--out DIR` | `./data` | Output root directory. Data is written to `DIR/event-<id>/`. |
 | `--comments` / `--no-comments` | on | Record (or skip) the RTDS comment stream. |
 | `--book` / `--no-book` | on | Record (or skip) the CLOB order-book stream. |
@@ -253,15 +253,25 @@ black .
 ### Smoke test (manual, requires network + a live event)
 
 ```bash
-# Record a currently-live event for ~60 seconds, then Ctrl-C:
+# 1. Record a currently-live event for ~60 seconds, then press Ctrl-C:
 python -m polytape --event-id <LIVE_EVENT_ID> --out ./smoke
 
-# Confirm both files filled with well-formed lines carrying both timestamps:
-python -c "import json,sys; [print(json.loads(l)['stream'], json.loads(l)['ts_recv'], json.loads(l)['ts_server']) for l in open('smoke/event-<LIVE_EVENT_ID>/comments.jsonl')]" | head
+# 2. Validate the capture (well-formed envelopes carrying both timestamps):
+python scripts/validate_capture.py ./smoke/event-<LIVE_EVENT_ID>
 ```
 
-Both `comments.jsonl` and `book.jsonl` should contain valid JSON lines, each with
-a non-null `ts_recv` and (where the feed provides one) a `ts_server`.
+The validator reports, per stream file, how many lines are valid envelopes and
+how many carry a server timestamp, and exits non-zero if anything is malformed or
+a stream produced no lines. A healthy run shows non-empty `comments.jsonl` and
+`book.jsonl`, each line with a `ts_recv` and (where the feed provides one) a
+`ts_server`.
+
+For a network-free check that the whole capture path works, use the dry run:
+
+```bash
+python -m polytape --event-id demo --dry-run --out ./smoke
+python scripts/validate_capture.py ./smoke/event-demo
+```
 
 ---
 
