@@ -39,8 +39,12 @@ def synthetic_event(config: Config) -> EventInfo:
     )
 
 
-def synthetic_comment_frames() -> list[str]:
-    """Comment-stream frames: comments, a reaction, and a duplicate (for dedup)."""
+def synthetic_comment_frames(event_id: str) -> list[str]:
+    """Comment-stream frames: comments, a reaction, and a duplicate (for dedup).
+
+    Comments carry ``parentEntityID`` and the reaction a ``commentID`` so they
+    pass the client-side event filter, exactly like live frames.
+    """
     frames: list[str] = []
     for i in range(3):
         frames.append(
@@ -51,6 +55,8 @@ def synthetic_comment_frames() -> list[str]:
                     "timestamp": 1700000000000 + i,
                     "payload": {
                         "id": f"dry-c{i}",
+                        "parentEntityID": event_id,
+                        "parentEntityType": "Event",
                         "createdAt": f"2026-01-01T00:00:0{i}Z",
                         "userAddress": f"0xUSER{i}",
                         "body": f"synthetic comment {i}",
@@ -69,7 +75,12 @@ def synthetic_comment_frames() -> list[str]:
                 "topic": "comments",
                 "type": "reaction_created",
                 "timestamp": 1700000000100,
-                "payload": {"id": "dry-r0", "reactionType": "like", "userAddress": "0xUSER0"},
+                "payload": {
+                    "id": "dry-r0",
+                    "commentID": "dry-c0",
+                    "reactionType": "like",
+                    "userAddress": "0xUSER0",
+                },
             }
         )
     )
@@ -77,7 +88,7 @@ def synthetic_comment_frames() -> list[str]:
     return frames
 
 
-def synthetic_backfill_comments() -> list[dict[str, Any]]:
+def synthetic_backfill_comments(event_id: str) -> list[dict[str, Any]]:
     """Flat (Gamma-shaped) comments simulating a reconnect backfill.
 
     Includes a duplicate of a live comment id to demonstrate overlap protection.
@@ -85,6 +96,7 @@ def synthetic_backfill_comments() -> list[dict[str, Any]]:
     return [
         {
             "id": "dry-bf0",
+            "parentEntityID": event_id,
             "createdAt": "2026-01-01T00:01:00Z",
             "userAddress": "0xUSER9",
             "body": "missed during the gap",
@@ -92,6 +104,7 @@ def synthetic_backfill_comments() -> list[dict[str, Any]]:
         },
         {  # already seen live -> deduped, counts as not-newly-written
             "id": "dry-c0",
+            "parentEntityID": event_id,
             "createdAt": "2026-01-01T00:00:00Z",
             "userAddress": "0xUSER0",
             "body": "synthetic comment 0",
@@ -228,13 +241,13 @@ async def run_dry(config: Config) -> int:
             comments = CommentStream(
                 event_id=event.event_id,
                 writer=writer,
-                connect=_mock_connect(synthetic_comment_frames()),
+                connect=_mock_connect(synthetic_comment_frames(event.event_id)),
             )
             await comments.run_once()
             # Simulate a disconnect + comment backfill recovery.
             disconnected_at = utc_now_iso()
             recovered = 0
-            for comment in synthetic_backfill_comments():
+            for comment in synthetic_backfill_comments(event.event_id):
                 if writer.write(STREAM_COMMENTS, comment):
                     recovered += 1
             writer.record_gap(

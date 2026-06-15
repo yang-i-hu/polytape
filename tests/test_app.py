@@ -29,7 +29,12 @@ async def test_run_records_both_streams_and_finalizes(make_config, sample_event,
     cframe = {
         "topic": "comments",
         "type": "comment_created",
-        "payload": {"id": "c1", "userAddress": "0xW", "createdAt": "2025-01-01T00:00:00Z"},
+        "payload": {
+            "id": "c1",
+            "parentEntityID": 20200,
+            "userAddress": "0xW",
+            "createdAt": "2025-01-01T00:00:00Z",
+        },
     }
     bframe = {"event_type": "book", "asset_id": "t1", "hash": "0xH", "timestamp": "1700000000000"}
     connect = make_connect(

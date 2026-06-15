@@ -74,6 +74,14 @@ class WebSocketStream:
         """Return the text frames to send immediately after connecting."""
         raise NotImplementedError
 
+    def should_record(self, raw: dict[str, Any]) -> bool:
+        """Whether a decoded message belongs to this capture.
+
+        Default accepts everything; the comment stream overrides this to filter
+        the firehose down to its event (server-side filtering is unavailable).
+        """
+        return True
+
     def on_written(self, raw: dict[str, Any]) -> None:
         """Hook invoked after a *new* (non-duplicate) message is written."""
 
@@ -138,6 +146,8 @@ class WebSocketStream:
                     await on_connect()
                 async for message in ws:
                     for raw in self.decode(message):
+                        if not self.should_record(raw):
+                            continue
                         if self.writer.write(self.stream, raw):
                             self.on_written(raw)
             finally:

@@ -1,8 +1,15 @@
 """RTDS comment stream consumer.
 
-Connects to Polymarket's Real-Time Data Service, subscribes to the ``comments``
-topic filtered to one Event, and records every comment/reaction. See
-``PROTOCOL.md`` §1 for the verified subscribe frame and keepalive.
+Connects to Polymarket's Real-Time Data Service ``comments`` topic and records
+the comments/reactions for one Event.
+
+**Filtering is client-side.** Live testing (2026-06-15) showed the server-side
+per-event ``filters`` field returns *zero* messages for every format tried
+(stringified int/string and object), while the unfiltered firehose delivers the
+event's comments normally. So polytape subscribes to the firehose and keeps only
+messages belonging to its event: comments by ``parentEntityID``, and reactions
+(which carry no ``parentEntityID``) by ``commentID`` against the comments seen
+this session. See ``PROTOCOL.md`` §1 and Open Question #3.
 """
 
 from __future__ import annotations
@@ -24,31 +31,25 @@ _PING_TEXT = "ping"
 _PING_INTERVAL = 5.0
 
 
-def comment_subscribe_frame(event_id: str | int) -> str:
-    """Build the RTDS subscribe frame for one event's comments.
+def comment_subscribe_frame() -> str:
+    """Build the RTDS subscribe frame for the (unfiltered) comments firehose.
 
-    ``filters`` is a *stringified* JSON object (RTDS quirk), and
-    ``parentEntityID`` must be the numeric event id. A non-numeric id (only
-    possible under ``--dry-run``) is passed through as-is.
+    No ``filters`` field: the server-side filter was found to drop all messages,
+    so filtering happens client-side in :meth:`CommentStream.should_record`.
     """
-    entity_id: int | str
-    try:
-        entity_id = int(event_id)
-    except (TypeError, ValueError):
-        entity_id = str(event_id)
-    inner = json.dumps({"parentEntityID": entity_id, "parentEntityType": "Event"})
     frame = {
         "action": "subscribe",
-        "subscriptions": [{"topic": "comments", "type": "*", "filters": inner}],
+        "subscriptions": [{"topic": "comments", "type": "*"}],
     }
     return json.dumps(frame)
 
 
 class CommentStream(WebSocketStream):
-    """Records the RTDS ``comments`` topic for a single event.
+    """Records the RTDS ``comments`` topic for a single event (client-filtered).
 
     Tracks :attr:`last_comment_id` (the latest *comment* id, ignoring reactions)
-    so the supervisor can resume comment backfill after a disconnect.
+    so the supervisor can resume comment backfill after a disconnect, and the set
+    of comment ids seen this session so reactions can be attributed.
     """
 
     stream = STREAM_COMMENTS
@@ -66,17 +67,38 @@ class CommentStream(WebSocketStream):
         )
         self.event_id = str(event_id)
         self.last_comment_id: str | None = None
+        self._known_comment_ids: set[str] = set()
 
     def subscribe_frames(self) -> list[str]:
-        return [comment_subscribe_frame(self.event_id)]
+        return [comment_subscribe_frame()]
+
+    @staticmethod
+    def _core(raw: dict[str, Any]) -> dict[str, Any]:
+        payload = raw.get("payload")
+        return payload if isinstance(payload, dict) else raw
+
+    def should_record(self, raw: dict[str, Any]) -> bool:
+        """Keep only this event's comments/reactions from the firehose.
+
+        Comments are matched by ``parentEntityID``. Reactions carry no
+        ``parentEntityID``, so they are matched by ``commentID`` against the
+        comments already seen this session (reactions to comments we never saw,
+        e.g. older ones, are not attributable and are dropped).
+        """
+        core = self._core(raw)
+        parent = core.get("parentEntityID")
+        if parent is not None:
+            return str(parent) == self.event_id
+        comment_id = core.get("commentID")
+        if comment_id is not None:
+            return str(comment_id) in self._known_comment_ids
+        return False
 
     def on_written(self, raw: dict[str, Any]) -> None:
-        """Advance the comment-backfill cursor for comment (not reaction) messages."""
-        msg_type = raw.get("type", "")
-        if msg_type and not msg_type.startswith("comment"):
-            return  # reactions have their own ids; backfill keys on comment ids
-        payload = raw.get("payload")
-        core = payload if isinstance(payload, dict) else raw
-        cid = core.get("id")
+        """Track the latest comment id (backfill cursor) and seen comment ids."""
+        if raw.get("type", "").startswith("reaction"):
+            return  # reactions don't move the cursor or seed attribution
+        cid = self._core(raw).get("id")
         if cid is not None:
             self.last_comment_id = str(cid)
+            self._known_comment_ids.add(str(cid))

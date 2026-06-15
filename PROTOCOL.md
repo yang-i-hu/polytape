@@ -72,6 +72,15 @@ README messages-hierarchy table and `examples/quick-connection.ts` show
 `filters: {"parentEntityID":20200,"parentEntityType":"Event"}`. **Source/repo wins — per-event
 filtering is supported.** (Still flagged in OPEN QUESTIONS to verify live, since it is the load-bearing assumption for the whole recorder.)
 
+> **⚠️ LIVE FINDING (2026-06-15) — server-side filtering does NOT work.** A controlled
+> same-window test (one unfiltered firehose vs. three filtered connections: `filters` as a
+> stringified int, a stringified string, and a raw object) found the firehose received the
+> event's comments while **all three filtered connections received zero messages**. Setting
+> any `filters` field appears to suppress all delivery. **polytape therefore subscribes to the
+> unfiltered comment firehose and filters client-side** by `parentEntityID` (reactions, which
+> carry no `parentEntityID`, are matched by `commentID` against comments seen in the session).
+> Global comment volume is low, so the firehose overhead is negligible.
+
 ### 1.4 Keepalive / ping (confirmed from source)
 
 - Application-level **text** keepalive — NOT a WebSocket-protocol ping opcode, NOT a JSON

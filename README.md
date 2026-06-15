@@ -202,9 +202,14 @@ recovery relies on that snapshot rather than REST backfill.
 ### Streams
 
 - **Comments (RTDS).** Connects to `wss://ws-live-data.polymarket.com`, subscribes
-  to the `comments` topic filtered to the Event (`filters` is a stringified
-  `{"parentEntityID":<event id>,"parentEntityType":"Event"}`), keeps the socket
-  alive with lowercase `ping`, and records each comment/reaction.
+  to the `comments` topic, keeps the socket alive with lowercase `ping`, and
+  records the event's comments/reactions. **Filtering is client-side:** live
+  testing (2026-06-15) found the documented server-side `filters` field delivers
+  *zero* messages for every format tried, so polytape subscribes to the comment
+  firehose and keeps only this event's messages — comments by `parentEntityID`,
+  and reactions (which carry no `parentEntityID`) by `commentID` matched against
+  comments seen in the session. Global comment volume is low, so the firehose
+  overhead is negligible.
 - **Order book (CLOB).** Connects to
   `wss://ws-subscriptions-clob.polymarket.com/ws/market`, subscribes to the
   event's CLOB token IDs (`{"assets_ids":[...],"type":"market"}`), keeps the
