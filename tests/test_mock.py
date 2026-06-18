@@ -27,11 +27,16 @@ async def test_dry_run_full_pipeline(make_config):
     assert meta["hashing"]["enabled"] is True
     assert len(meta["gaps"]) == 1 and meta["gaps"][0]["backfilled"] == 1
     assert meta["stopped_at"]
+    assert meta["holdings_captured"] is True
 
     # hashing applied to comment identifiers
     first = json.loads(comments[0])
     assert first["raw"]["payload"]["userAddress"] != "0xUSER0"
     assert first["raw"]["payload"]["profile"]["name"] != "user0"
+    # holdings (positions) captured verbatim — not hashed away
+    assert first["raw"]["payload"]["profile"]["positions"] == [
+        {"tokenId": "100", "positionSize": "1000000"}
+    ]
 
 
 async def test_dry_run_comments_only(make_config):

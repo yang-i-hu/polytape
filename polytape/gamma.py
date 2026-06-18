@@ -448,12 +448,16 @@ class GammaClient:
         limit: int = 100,
         offset: int = 0,
         ascending: bool = True,
+        get_positions: bool = True,
     ) -> list[dict[str, Any]]:
         """Fetch a single page of comments for a parent entity.
 
         Mirrors ``GET /comments?parent_entity_type=<type>&parent_entity_id=...``.
         ``parent_entity_type`` is ``"Event"`` by default, or ``"Series"`` for the
-        parent league/tournament chat.
+        parent league/tournament chat. With ``get_positions`` (the default), each
+        comment's ``profile`` carries the author's holdings
+        (``positions: [{tokenId, positionSize}]``) — the position the app shows
+        next to each user.
         """
         params = {
             "parent_entity_type": parent_entity_type,
@@ -463,6 +467,8 @@ class GammaClient:
             "limit": str(limit),
             "offset": str(offset),
         }
+        if get_positions:
+            params["get_positions"] = "true"
         data = await self._get("/comments", params=params)
         if not isinstance(data, list):
             raise GammaError(f"unexpected /comments response type: {type(data).__name__}")
@@ -476,6 +482,7 @@ class GammaClient:
         parent_entity_type: str = "Event",
         page_size: int = 100,
         max_pages: int = 50,
+        get_positions: bool = True,
     ) -> list[dict[str, Any]]:
         """Fetch comments for a parent entity created since ``last_seen_id`` (exclusive).
 
@@ -490,6 +497,10 @@ class GammaClient:
             parent_entity_type: ``"Event"`` (default) or ``"Series"``.
             page_size: Comments per page.
             max_pages: Safety bound on pages walked.
+            get_positions: Request author holdings inline (default on). **Note:**
+                backfilled holdings reflect *fetch* time, not the comment's original
+                post time — see the ``ts_recv`` snapshot note in ``README.md`` /
+                ``PROTOCOL.md`` (holdings change over a match).
 
         Returns:
             Missed comments in chronological (oldest-first) order. Downstream
@@ -504,6 +515,7 @@ class GammaClient:
                 limit=page_size,
                 offset=page * page_size,
                 ascending=False,
+                get_positions=get_positions,
             )
             if not batch:
                 break

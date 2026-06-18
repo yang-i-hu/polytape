@@ -340,6 +340,41 @@ Pass `--include-series-comments` to also record the event's parent-series commen
   default (event-only) behavior is unchanged unless you pass the flag. Backfill on
   reconnect covers each parent (event and series) independently.
 
+### Holdings (positions) on comments
+
+Each comment also carries the author's **holdings** — the position the app renders
+next to each user, and what makes one shared series chat *look* like a distinct
+per-match room. polytape requests them with `get_positions=true`, so a comment's
+`raw…profile.positions` is an array of `{tokenId, positionSize}`:
+
+```json
+"profile": { "pseudonym": "<hashed>", "positions": [ { "tokenId": "5699…0447", "positionSize": "144532000" } ] }
+```
+
+- **`positionSize` is 1e6-scaled** USDC-share units — divide by 1,000,000 for the
+  share count (`144532000` → 144.532 shares).
+- **Attributing a holding to a specific match:** a commenter's `positions` span
+  *every* market they hold in the series, not just one match. Intersect each
+  `positions[].tokenId` with that event's `clob_token_ids` (in `meta.json`) to keep
+  only the holdings for the match you care about; the outcome label comes from which
+  token matched (a market's `outcomes` are index-aligned with its `clobTokenIds`).
+- **Identity is hashed; holdings are not.** With hashing on (default), the
+  `name`/`pseudonym`/wallet fields inside `profile` are hashed, but `positions` are
+  kept verbatim. Set a stable `POLYTAPE_SALT` to correlate a user's holdings across
+  comments without de-anonymizing them.
+- `meta.json` records `"holdings_captured": true` when the comment stream is on.
+
+> **Holdings change over a match — each comment is a point-in-time snapshot.** A
+> comment's `positions` are the author's holdings *as of that record's `ts_recv`*,
+> not a static attribute. For **live** comments that is the post time; for comments
+> recovered by **backfill** it is the *fetch* time (the Gamma API returns current
+> positions, so a backfilled comment's holdings are a later snapshot than its
+> `ts_server`/`createdAt`). You therefore get an irregular time series of holdings,
+> sampled whenever a user comments — not a continuous position history. (To track a
+> user's holdings continuously you'd poll
+> `data-api.polymarket.com/positions?user=<wallet>&eventId=<id>` on a timer; that's
+> out of scope for the passive recorder.)
+
 ### Reconnect + backfill
 
 Each stream runs under a supervisor that reconnects with exponential backoff on
