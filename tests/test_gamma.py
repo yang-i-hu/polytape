@@ -220,6 +220,35 @@ async def test_fetch_comments_series_parent():
     await g.aclose()
 
 
+async def test_fetch_comments_requests_holdings_by_default():
+    seen: dict[str, str] = {}
+
+    def handler(req):
+        seen.clear()
+        seen.update(dict(req.url.params))
+        return httpx.Response(200, json=[])
+
+    g = _client(handler)
+    await g.fetch_comments("11433", parent_entity_type="Series")
+    assert seen.get("get_positions") == "true"  # holdings requested by default
+    await g.fetch_comments("11433", parent_entity_type="Series", get_positions=False)
+    assert "get_positions" not in seen  # opt-out drops the param
+    await g.aclose()
+
+
+async def test_backfill_threads_get_positions():
+    seen: dict[str, str] = {}
+
+    def handler(req):
+        seen.update(dict(req.url.params))
+        return httpx.Response(200, json=[])
+
+    g = _client(handler)
+    await g.backfill_since("11433", parent_entity_type="Series", max_pages=1)
+    assert seen.get("get_positions") == "true"
+    await g.aclose()
+
+
 async def test_backfill_since_stops_at_last_seen():
     newest_first = [{"id": f"c{i}", "createdAt": f"t{i}"} for i in (5, 4, 3, 2, 1)]
 

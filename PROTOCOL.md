@@ -174,6 +174,32 @@ createdAt    string
 - **Username/identifier to hash:** `payload.userAddress` (the wallet). Hash this for privacy.
 - **Always add your own client receive timestamp** — the envelope timestamp unit is unconfirmed.
 
+### 1.9 Holdings (positions) on comments (verified live 2026-06-15)
+
+`GET /comments?...&get_positions=true` (and the live `comment_created` payload, when the
+server includes it) decorate each comment's `profile` with the author's holdings:
+
+```
+profile.positions  array of { tokenId: string (a CLOB clobTokenId), positionSize: string }
+```
+
+- `positionSize` is **1e6-scaled** USDC-share units (`144532000` → 144.532 shares); verified
+  to match `data-api.polymarket.com/positions`.
+- `positions` is **absent** when `get_positions` is off or the user holds nothing.
+- **Per-match attribution:** intersect `positions[].tokenId` with the event's
+  `markets[].clobTokenIds`; a commenter's `positions` span all of their series holdings, so this
+  is how the app renders the position for the specific match being viewed.
+- **Time-varying — snapshot as of `ts_recv`.** Holdings change over a match. The embedded
+  positions are the author's holdings *at capture time*: post time for live frames, **fetch
+  time** for backfilled comments (the REST endpoint returns *current* positions, so a backfilled
+  comment's holdings are newer than its `createdAt`). Treat them as an irregular per-comment
+  snapshot, not a continuous position history.
+- polytape requests `get_positions=true` in `gamma.fetch_comments`/`backfill_since` and stores
+  `profile` verbatim, so holdings are captured for every backfill target (event and series).
+- **Note:** `data-api.polymarket.com` rejects the default Python/urllib User-Agent with HTTP 403
+  — send a browser `User-Agent` if querying positions directly. `gamma-api` (which serves the
+  inline `profile.positions`) accepts polytape's UA fine.
+
 ---
 
 ## 2. CLOB book stream
@@ -393,7 +419,8 @@ Params:
 - `order` (comma-separated field names, e.g. `createdAt`), `ascending` (bool). Use
   `order=createdAt&ascending=true` for oldest→newest. (`order` only works once parent params
   are present; bare `order` also 422s.)
-- Optional: `get_positions` (bool), `holders_only` (bool).
+- Optional: `get_positions` (bool — adds each author's holdings to `profile.positions`; see
+  §1.9), `holders_only` (bool). polytape sends `get_positions=true` by default.
 
 **Resume-since-last-seen:** there is **NO `after=<commentId>` or `since=<ts>` cursor**. Paging
 is `limit`/`offset` + `order`/`ascending` only. Implement resume client-side: sort
