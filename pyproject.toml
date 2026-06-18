@@ -27,8 +27,10 @@ dependencies = [
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
-  "ruff>=0.5",
-  "black>=24.0",
+  # Pinned exactly: ruff's lint AND format output can shift between releases, so a
+  # floating version would make CI nondeterministic ("passes locally, fails in CI").
+  # Bump this deliberately and reformat in the same commit. ruff also replaces black.
+  "ruff==0.15.17",
 ]
 
 [project.scripts]
@@ -44,10 +46,6 @@ packages = ["polytape"]
 # Ship the dashboard HTML (a non-Python file) inside the package so the monitor
 # works from an installed wheel as well as the source tree.
 artifacts = ["polytape/monitor/index.html"]
-
-[tool.black]
-line-length = 100
-target-version = ["py310"]
 
 [tool.ruff]
 line-length = 100

@@ -59,8 +59,7 @@ class Config:
             raise ValueError(f"entity_type must be 'Event' or 'Series', got {self.entity_type!r}")
         if not self.comments and not self.book:
             raise ValueError(
-                "at least one stream must be enabled "
-                "(do not combine --no-comments with --no-book)"
+                "at least one stream must be enabled (do not combine --no-comments with --no-book)"
             )
         if not self.dry_run and not str(self.event_id).isdigit():
             raise ValueError(

@@ -19,13 +19,13 @@ def _index_html() -> str:
 def test_active_chat_feature_is_wired():
     html = _index_html()
     required = [
-        'id="activechatbtn"',          # the button exists
-        "findActiveChat",              # fetches /api/active-chat
-        "renderActiveChat",            # renders the ranked list
-        "/api/active-chat",            # hits the endpoint
-        "data-chatrec",                # Record button carries the id
-        "data-chattype",               # ...and the entity type (Event/Series)
-        "entity_type",                 # ...which is sent on the start request
+        'id="activechatbtn"',  # the button exists
+        "findActiveChat",  # fetches /api/active-chat
+        "renderActiveChat",  # renders the ranked list
+        "/api/active-chat",  # hits the endpoint
+        "data-chatrec",  # Record button carries the id
+        "data-chattype",  # ...and the entity type (Event/Series)
+        "entity_type",  # ...which is sent on the start request
     ]
     missing = [tok for tok in required if tok not in html]
     assert not missing, f"dashboard is missing active-chat wiring: {missing}"
