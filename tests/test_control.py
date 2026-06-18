@@ -348,8 +348,14 @@ def test_active_chat_over_http(control_server, monkeypatch):
             "total_events": 1,
             "total_comments": 3,
             "events": [
-                {"event_id": "11433", "parent_entity_type": "Event", "comments": 3,
-                 "reactions": 1, "sample": "lets go", "title": "Some Event"}
+                {
+                    "event_id": "11433",
+                    "parent_entity_type": "Event",
+                    "comments": 3,
+                    "reactions": 1,
+                    "sample": "lets go",
+                    "title": "Some Event",
+                }
             ],
         },
     )

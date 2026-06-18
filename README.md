@@ -1,5 +1,7 @@
 # polytape
 
+[![CI](https://github.com/yang-i-hu/polytape/actions/workflows/ci.yml/badge.svg)](https://github.com/yang-i-hu/polytape/actions/workflows/ci.yml)
+
 Record two of Polymarket's public, real-time feeds during a live event — the
 **comment stream** (RTDS websocket) and the **order book** (CLOB websocket) — to
 timestamped JSONL for later research.
@@ -39,7 +41,7 @@ applicable laws when recording and using this data.
 - Python 3.10+
 - Runtime dependencies: [`websockets`](https://pypi.org/project/websockets/),
   [`httpx`](https://pypi.org/project/httpx/)
-- Dev dependencies: `pytest`, `ruff`, `black`
+- Dev dependencies: `pytest`, `ruff`
 
 ## Install
 
@@ -406,10 +408,14 @@ the capture path can be exercised and tested with zero network access.
 
 ```bash
 pip install -e ".[dev]"
-pytest            # unit tests, fully offline (no network required)
-ruff check .
-black .
+pytest                 # unit tests, fully offline (no network required)
+ruff check .           # lint
+ruff format --check .  # style (drop --check to auto-format)
 ```
+
+These are exactly the checks CI runs on every push and pull request to `main`
+(across Python 3.10–3.14). `ruff` is pinned in the `dev` extra so local results
+match CI; bump it deliberately and reformat in the same commit.
 
 ### Smoke test (manual, requires network + a live event)
 

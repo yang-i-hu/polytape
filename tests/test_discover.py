@@ -49,8 +49,13 @@ def test_ranks_events_by_comment_volume(monkeypatch):
         _comment(100, "again"),
         _comment(100, "third"),
         # a reaction carries no parentEntityID -> ignored for ranking
-        json.dumps({"topic": "comments", "type": "reaction_created",
-                    "payload": {"commentID": 9, "reactionType": "HEART"}}),
+        json.dumps(
+            {
+                "topic": "comments",
+                "type": "reaction_created",
+                "payload": {"commentID": 9, "reactionType": "HEART"},
+            }
+        ),
     ]
     ws = _WS(frames)
     monkeypatch.setattr(discover.websockets, "connect", lambda *a, **k: _CM(ws))
