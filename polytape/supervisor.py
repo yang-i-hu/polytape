@@ -41,6 +41,7 @@ class StreamSupervisor:
         *,
         writer: CaptureWriter,
         backfill: BackfillCallback | None = None,
+        initial_backfill: bool = False,
         base_delay: float = 1.0,
         max_delay: float = 30.0,
         reset_after: float = 15.0,
@@ -51,6 +52,7 @@ class StreamSupervisor:
         self._stream = stream
         self._writer = writer
         self._backfill = backfill
+        self._initial_backfill = initial_backfill
         self._base_delay = base_delay
         self._max_delay = max_delay
         self._reset_after = reset_after
@@ -108,12 +110,28 @@ class StreamSupervisor:
         """
         attempt = 0
         pending_disconnect: str | None = None
+        did_initial = False
 
         async def _on_connect() -> None:
-            nonlocal pending_disconnect
+            nonlocal pending_disconnect, did_initial
             if pending_disconnect is not None:
                 await self._handle_reconnect(pending_disconnect)
                 pending_disconnect = None
+            elif self._initial_backfill and not did_initial and self._backfill is not None:
+                # Pull the *existing* messages (e.g. the chat already posted) once
+                # on first connect, so the capture isn't empty until something new
+                # arrives. Not a gap — no meta gap entry is recorded.
+                did_initial = True
+                try:
+                    recovered = await self._backfill()
+                    if recovered:
+                        logger.info(
+                            "%s: initial backfill recovered %d message(s)", self._name, recovered
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("%s: initial backfill failed", self._name)
 
         while not self._stop.is_set():
             started = self._monotonic()
@@ -156,11 +174,14 @@ def make_comment_backfill(
     """
 
     async def _backfill() -> int:
-        missed = await gamma.backfill_since(stream.event_id, stream.last_comment_id)
         count = 0
-        for comment in missed:
-            if writer.write(stream.stream, comment):
-                count += 1
+        for parent_type, parent_id in stream.backfill_targets():
+            missed = await gamma.backfill_since(
+                parent_id, stream.cursor_for(parent_id), parent_entity_type=parent_type
+            )
+            for comment in missed:
+                if writer.write(stream.stream, comment):
+                    count += 1
         if count:
             logger.info("%s: backfilled %d missed comment(s)", stream.stream, count)
         return count

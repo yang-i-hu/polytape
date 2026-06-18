@@ -61,6 +61,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write usernames/identifiers verbatim instead of salted-hashing them.",
     )
     parser.add_argument(
+        "--include-series-comments",
+        action="store_true",
+        help="Also record comments on the event's parent series (e.g. a sports "
+        "league/tournament chat, where sports comments live rather than on the match).",
+    )
+    parser.add_argument(
+        "--entity-type",
+        default="Event",
+        choices=("Event", "Series"),
+        help="Parent entity type of --event-id. 'Series' records a parent-series "
+        "chat directly by its series id (comments only; no markets/book).",
+    )
+    parser.add_argument(
         "--market-id",
         action="append",
         metavar="ID",
@@ -104,6 +117,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         market_ids=tuple(args.market_id or ()),
         dry_run=args.dry_run,
         log_level=args.log_level,
+        include_series_comments=args.include_series_comments,
+        entity_type=args.entity_type,
     )
 
 

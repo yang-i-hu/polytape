@@ -64,6 +64,13 @@ def test_cli_log_level_uppercased():
     assert parse_args(["--event-id", "1", "--log-level", "debug"]).log_level == "DEBUG"
 
 
+def test_cli_include_series_comments_flag():
+    assert parse_args(["--event-id", "1"]).include_series_comments is False
+    assert (
+        parse_args(["--event-id", "1", "--include-series-comments"]).include_series_comments is True
+    )
+
+
 def test_cli_missing_event_id_exits():
     with pytest.raises(SystemExit):
         parse_args([])

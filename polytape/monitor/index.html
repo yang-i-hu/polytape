@@ -1,0 +1,765 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>polytape monitor</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #121722;
+    --panel-2: #161c28;
+    --line: #243044;
+    --txt: #e6edf3;
+    --muted: #8b98ad;
+    --dim: #5c6b80;
+    --green: #3fb950;
+    --amber: #d29922;
+    --blue: #58a6ff;
+    --grey: #6e7b8f;
+    --red: #f85149;
+    --comments: #58a6ff;
+    --book: #3fb950;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font-family: var(--sans); font-size: 14px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--blue); }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px 20px 60px; }
+
+  header.top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand h1 { font-size: 18px; margin: 0; letter-spacing: .2px; cursor: pointer; }
+  .brand h1:hover { color: var(--blue); }
+  .brand .dot { color: var(--dim); }
+  .brand .title { color: var(--muted); font-weight: 500; }
+  .head-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: flex-end; }
+  select {
+    background: var(--panel-2); color: var(--txt); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 9px; font-family: var(--sans); font-size: 13px;
+  }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; font-weight: 600; font-size: 12px;
+    letter-spacing: .6px; text-transform: uppercase; padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2);
+  }
+  .pill .led { width: 8px; height: 8px; border-radius: 50%; background: var(--grey); }
+  .pill[data-s="live"] { color: var(--green); border-color: #1c3a24; background: #0f1f14; }
+  .pill[data-s="live"] .led { background: var(--green); box-shadow: 0 0 0 0 rgba(63,185,80,.7); animation: pulse 1.6s infinite; }
+  .pill[data-s="idle"] { color: var(--amber); border-color: #3a3115; background: #1c1808; }
+  .pill[data-s="idle"] .led { background: var(--amber); }
+  .pill[data-s="starting"] { color: var(--blue); } .pill[data-s="starting"] .led { background: var(--blue); }
+  .pill[data-s="stopped"], .pill[data-s="no-data"] { color: var(--muted); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(63,185,80,.6);} 70% { box-shadow: 0 0 0 7px rgba(63,185,80,0);} 100% { box-shadow: 0 0 0 0 rgba(63,185,80,0);} }
+
+  .meta-line { color: var(--muted); font-size: 12.5px; margin-top: 6px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .meta-line b { color: var(--txt); font-weight: 600; }
+  .badge { font-size: 11px; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.on { color: var(--green); border-color: #1c3a24; }
+  .badge.off { color: var(--amber); border-color: #3a3115; }
+
+  .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .stat .k { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px; }
+  .stat .v { font-family: var(--mono); font-size: 26px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 13px; color: var(--muted); }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+  .card h2 { font-size: 13px; margin: 0 0 2px; text-transform: uppercase; letter-spacing: .6px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .swatch { width: 9px; height: 9px; border-radius: 2px; }
+  .card .sub { color: var(--dim); font-size: 11.5px; }
+  .bignum { font-family: var(--mono); font-size: 38px; font-variant-numeric: tabular-nums; margin: 8px 0 2px; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 8px; }
+  .kv { font-size: 12px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  canvas.spark { width: 100%; height: 46px; display: block; margin-top: 12px; }
+
+  .mix { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .mix .bar { display: grid; grid-template-columns: 120px 1fr 52px; align-items: center; gap: 10px; font-size: 12px; }
+  .mix .bar .lbl { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mix .bar .track { height: 7px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  .mix .bar .fill { height: 100%; border-radius: 4px; }
+  .mix .bar .n { font-family: var(--mono); text-align: right; color: var(--txt); font-variant-numeric: tabular-nums; }
+
+  section.block { margin-top: 16px; }
+  section.block h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+  td.mono, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .empty { color: var(--dim); padding: 10px; font-size: 13px; }
+  .empty.hint { color: var(--muted); line-height: 1.55; border-left: 2px solid var(--blue);
+    padding: 10px 12px; background: rgba(80,140,220,.06); border-radius: 0 6px 6px 0; }
+  .empty.hint b { color: var(--txt); }
+
+  .ticker { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; max-height: 240px; overflow: auto; }
+  .ticker .item { display: grid; grid-template-columns: 64px 1fr auto auto; gap: 12px; padding: 7px 14px; border-bottom: 1px solid var(--line); font-size: 12.5px; align-items: center; }
+  .ticker .item:last-child { border-bottom: 0; }
+  .tag { font-size: 10.5px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); }
+  .tag.comments { color: var(--comments); border-color: #1d3a5c; }
+  .tag.book { color: var(--book); border-color: #1c3a24; }
+  .ticker .type { color: var(--txt); } .ticker .delay, .ticker .ago { color: var(--muted); font-family: var(--mono); }
+
+  footer { margin-top: 26px; color: var(--dim); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  footer .conn { display: inline-flex; align-items: center; gap: 6px; }
+  footer .conn .led { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+  footer .conn.down .led { background: var(--red); }
+
+  .splash { text-align: center; padding: 80px 20px; color: var(--muted); }
+  .splash code { background: var(--panel-2); padding: 2px 7px; border-radius: 6px; color: var(--txt); }
+
+  /* buttons + controls */
+  .btn { font: inherit; font-size: 13px; cursor: pointer; border-radius: 7px; padding: 7px 13px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--txt); transition: border-color .15s, background .15s; }
+  .btn:hover:not(:disabled) { border-color: #36507a; }
+  .btn:disabled { opacity: .5; cursor: progress; }
+  .btn.primary { background: #14304a; border-color: #1d5fa6; color: #cfe5ff; }
+  .btn.primary:hover:not(:disabled) { background: #173b5e; }
+  .btn.danger { color: #ffb3ae; border-color: #5c2420; background: #2a1311; }
+  .btn.danger:hover:not(:disabled) { background: #3a1916; }
+  .btn.ghost { background: transparent; }
+  .btn.sm { padding: 4px 10px; font-size: 12px; }
+
+  .recorder { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin: 18px 0 0; }
+  .recorder h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+    margin: 0 0 11px; display: flex; align-items: center; gap: 8px; }
+  .recorder .note { color: var(--dim); font-size: 11.5px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .form { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .seg button { font: inherit; font-size: 12.5px; padding: 6px 12px; background: var(--panel-2); color: var(--muted); border: 0; cursor: pointer; }
+  .seg button.active { background: #14304a; color: #cfe5ff; }
+  .field { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+  .field input { background: var(--bg); border: 1px solid var(--line); color: var(--txt);
+    border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 13px; width: 130px; }
+  .field input[type=number] { width: 72px; }
+  .check { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+  .rec-list { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .rec-list:empty { display: none; }
+  .rec-row { display: flex; align-items: center; gap: 11px; padding: 8px 11px; background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; font-size: 12.5px; }
+  .rec-row .led { width: 8px; height: 8px; border-radius: 50%; background: var(--grey); flex: none; }
+  .rec-row.running .led { background: var(--green); box-shadow: 0 0 0 0 rgba(63,185,80,.7); animation: pulse 1.6s infinite; }
+  .rec-row .eid { font-family: var(--mono); }
+  .rec-row .spacer { flex: 1; }
+  .kind { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; padding: 2px 7px;
+    border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
+
+  .ev-row { display: flex; align-items: center; gap: 11px; padding: 8px 11px; background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; font-size: 12.5px; cursor: pointer; transition: border-color .12s; }
+  .ev-row:hover { border-color: #36507a; }
+  .ev-row.sel { border-color: #1d5fa6; background: #11202f; }
+  .ev-row .led { width: 8px; height: 8px; border-radius: 50%; background: var(--grey); flex: none; }
+  .ev-row .led[data-s="live"], .ev-row .led[data-s="recording"] { background: var(--green); box-shadow: 0 0 0 0 rgba(63,185,80,.7); animation: pulse 1.6s infinite; }
+  .ev-row .led[data-s="idle"] { background: var(--amber); }
+  .ev-row .eid { font-family: var(--mono); color: var(--txt); }
+  .ev-row .etitle { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 340px; }
+  .ev-row .estatus { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); }
+  .ev-row.sel .estatus { color: var(--blue); }
+  .ev-row .spacer { flex: 1; }
+
+  .related { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
+  .related .rel-head { padding: 8px 12px; font-size: 11.5px; color: var(--muted); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 8px; }
+  .related .rel-scroll { max-height: 260px; overflow: auto; }
+  .rel-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; font-size: 12.5px; cursor: pointer;
+    border-bottom: 1px solid var(--line); }
+  .rel-row:last-child { border-bottom: 0; }
+  .rel-row:hover { background: #11202f; }
+  .rel-row.src { border-left: 2px solid var(--blue); }
+  .rel-row .rtitle { color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rel-row .rid { font-family: var(--mono); color: var(--dim); font-size: 11px; }
+  .rel-row .spacer { flex: 1; }
+  #activechat .rel-row { flex-wrap: wrap; }
+  .rel-row .chat-count { font-family: var(--mono); color: var(--dim); font-size: 11px; white-space: nowrap; }
+  .rel-row .chat-sample { flex-basis: 100%; color: var(--muted); font-size: 11.5px; font-style: italic;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 2px; }
+
+  .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  .toast { background: var(--panel-2); border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px;
+    padding: 10px 14px; font-size: 13px; max-width: 360px; box-shadow: 0 6px 20px rgba(0,0,0,.4);
+    animation: slidein .2s ease; transition: opacity .25s; }
+  .toast.ok { border-left-color: var(--green); }
+  .toast.err { border-left-color: var(--red); color: #ffb3ae; }
+  @keyframes slidein { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  @media (max-width: 760px) { .summary { grid-template-columns: 1fr 1fr; } .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <div class="brand">
+        <h1 id="brand" title="Home — all events">polytape</h1><span class="dot">•</span><span class="title" id="title">monitor</span>
+      </div>
+      <div class="meta-line" id="metaline"></div>
+    </div>
+    <div class="head-right">
+      <button class="btn ghost sm" id="pausebtn" title="Pause / resume live updates">⏸ Pause</button>
+      <span class="pill" id="status" data-s="no-data"><span class="led"></span><span id="statustxt">…</span></span>
+    </div>
+  </header>
+
+  <section class="recorder" id="recorder" style="display:none">
+    <h3>New recording <span class="note">launch a capture — it opens in its own tab/session; localhost only</span></h3>
+    <div class="form">
+      <div class="seg" id="modeseg">
+        <button class="active" data-mode="live">Live event</button>
+        <button data-mode="demo">Demo feed</button>
+      </div>
+      <span class="field"><label for="in-eventid">event</label><input type="text" id="in-eventid" style="width:280px" placeholder="id, slug, or paste a polymarket.com URL" /></span>
+      <button class="btn ghost sm" id="relatedbtn" title="List the other events in this one's series (e.g. all matches in the tournament)">Find related ↦</button>
+      <button class="btn ghost sm" id="activechatbtn" title="Sample the live comment feed and list the events with the busiest chat right now">⚡ Live chat now</button>
+      <label class="check" id="f-comments"><input type="checkbox" id="in-comments" checked /> comments</label>
+      <label class="check" id="f-book"><input type="checkbox" id="in-book" checked /> book</label>
+      <label class="check" id="f-hash"><input type="checkbox" id="in-hash" checked /> hash usernames</label>
+      <label class="check" id="f-series" title="Also record the parent league/tournament chat (where sports comments live). Tournament-wide."><input type="checkbox" id="in-series" /> series chat</label>
+      <span class="field" id="f-rate" style="display:none"><label for="in-rate">rate /s</label><input type="number" id="in-rate" value="8" min="1" max="200" /></span>
+      <label class="check" id="f-newtab" title="Open the new recording in its own browser tab/session"><input type="checkbox" id="in-newtab" checked /> open in new tab</label>
+      <button class="btn primary" id="startbtn">Start recording</button>
+    </div>
+    <div class="related" id="related" style="display:none"></div>
+    <div class="related" id="activechat" style="display:none"></div>
+  </section>
+
+  <section class="recorder" id="events" style="display:none">
+    <h3>Events &amp; sessions <span class="note">click a row to view it here · Open ↗ for its own tab</span></h3>
+    <div class="rec-list" id="eventlist"></div>
+  </section>
+
+  <div id="content" style="display:none">
+    <div class="summary">
+      <div class="stat"><div class="k">Total messages</div><div class="v" id="t-total">0</div></div>
+      <div class="stat"><div class="k">Combined rate</div><div class="v" id="t-rate">0 <small>/s</small></div></div>
+      <div class="stat"><div class="k">Uptime</div><div class="v" id="t-uptime">—</div></div>
+      <div class="stat"><div class="k">Disconnects</div><div class="v" id="t-gaps">0</div></div>
+    </div>
+
+    <div class="grid2" id="cards"></div>
+
+    <section class="block">
+      <h3>Disconnects &amp; backfill</h3>
+      <div class="card" style="padding:0;overflow:auto">
+        <table id="gaps"><thead><tr><th>Stream</th><th>Down at</th><th>Back at</th><th class="mono">Downtime</th><th class="mono">Backfilled</th><th>Note</th></tr></thead><tbody></tbody></table>
+      </div>
+    </section>
+
+    <section class="block">
+      <h3>Recent activity <span style="color:var(--dim);text-transform:none;letter-spacing:0">— message metadata only, no payload content</span></h3>
+      <div class="ticker" id="ticker"></div>
+    </section>
+  </div>
+
+  <div id="home" style="display:none">
+    <div class="splash" style="padding:44px 20px">
+      <p>Pick an event from <b>Events &amp; sessions</b> above to view its live data — or start a <b>new recording</b>.</p>
+      <p style="font-size:13px">Each recording opens in its own tab, so this stays a clean home.</p>
+    </div>
+  </div>
+
+  <div class="splash" id="splash">
+    <p>Waiting for a capture under <code id="watchdir">./data</code> …</p>
+    <p style="font-size:13px" id="splashhint">Start one with the <b>Recorder</b> above, or run
+       <code>python -m polytape --event-id &lt;ID&gt;</code></p>
+  </div>
+
+  <footer>
+    <span class="conn" id="conn"><span class="led"></span><span id="conntxt">connecting…</span></span>
+    <span id="watching"></span>
+    <span id="updated"></span>
+  </footer>
+</div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+"use strict";
+const POLL_MS = 1000;
+const $ = (id) => document.getElementById(id);
+const COLORS = { comments: getCss("--comments"), book: getCss("--book") };
+function getCss(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || "#58a6ff"; }
+
+let selectedEvent = new URLSearchParams(location.search).get("event") || null;
+let timer = null, lastOk = 0, paused = false;
+
+function fmt(n) { return (n ?? 0).toLocaleString("en-US"); }
+function fmtRate(r) { r = r || 0; return r >= 100 ? Math.round(r) : r.toFixed(r >= 10 ? 1 : 2); }
+function dur(s) {
+  if (s == null) return "—";
+  s = Math.round(s);
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  const h = Math.floor(s/3600); return h + "h " + Math.floor((s%3600)/60) + "m";
+}
+function ago(s) {
+  if (s == null) return "—";
+  if (s < 1) return "now";
+  if (s < 60) return Math.round(s) + "s ago";
+  if (s < 3600) return Math.floor(s/60) + "m ago";
+  return Math.floor(s/3600) + "h ago";
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+
+function drawSpark(canvas, data, color) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 300, h = canvas.clientHeight || 46;
+  if (canvas.width !== w*dpr) { canvas.width = w*dpr; canvas.height = h*dpr; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  if (!data || !data.length) return;
+  const max = Math.max(1, ...data);
+  const n = data.length, step = w/(n-1 || 1), pad = 3;
+  const y = v => h - pad - (v/max)*(h - pad*2);
+  ctx.beginPath();
+  data.forEach((v,i) => { const x=i*step; i?ctx.lineTo(x,y(v)):ctx.moveTo(x,y(v)); });
+  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = color + "22"; ctx.fill();
+  ctx.beginPath();
+  data.forEach((v,i) => { const x=i*step; i?ctx.lineTo(x,y(v)):ctx.moveTo(x,y(v)); });
+  ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.lineJoin = "round"; ctx.stroke();
+}
+
+function streamCard(name, s) {
+  const color = COLORS[name] || "#8b98ad";
+  const d = s.delay_ms || {};
+  const fresh = s.seconds_since_last;
+  const freshCls = fresh != null && fresh <= 20 ? "var(--green)" : "var(--muted)";
+  const total = Object.values(s.types || {}).reduce((a,b)=>a+b,0) || 1;
+  const bars = Object.entries(s.types || {}).slice(0,6).map(([k,v]) => `
+    <div class="bar"><span class="lbl" title="${esc(k)}">${esc(k)}</span>
+      <span class="track"><span class="fill" style="width:${(v/total*100).toFixed(1)}%;background:${color}"></span></span>
+      <span class="n">${fmt(v)}</span></div>`).join("");
+  // Comments are bursty + far sparser than trades, so a 0 here is usually "nobody
+  // typed yet", not a fault. Explain it and point at the fix (sports/market chat
+  // usually lives on the parent SERIES, not the single event).
+  const emptyMsg = name === "comments"
+    ? `<div class="empty hint">No chat on this event <i>yet</i> — it appears here live the moment someone posts. Comments are far sparser than trades (which is why <b>book</b> can race ahead while this stays at 0).<br><br>Sports &amp; market chat usually lives on the parent <b>series</b>, not the single event. Turn on <b>series chat</b> when you start, or hit <b>⚡ Live chat now</b> to jump to an event that's actively chatting.</div>`
+    : `<div class="empty">no messages yet</div>`;
+  const mix = bars || emptyMsg;
+  return `
+  <div class="card">
+    <h2><span class="swatch" style="background:${color}"></span>${esc(name)}</h2>
+    <div class="sub">${s.exists ? "" : "file not created yet · "}${fmt(s.with_server_ts)} with server time</div>
+    <div class="bignum" style="color:${color}">${fmt(s.count)}</div>
+    <div class="row">
+      <span class="kv"><span class="k">rate</span> <span class="v">${fmtRate(s.rate_per_sec)}/s</span></span>
+      <span class="kv"><span class="k">last</span> <span class="v" style="color:${freshCls}">${ago(fresh)}</span></span>
+      <span class="kv"><span class="k">malformed</span> <span class="v">${fmt(s.malformed)}</span></span>
+    </div>
+    <div class="row">
+      <span class="kv"><span class="k">delay p50</span> <span class="v">${d.p50 ?? "—"} ms</span></span>
+      <span class="kv"><span class="k">p95</span> <span class="v">${d.p95 ?? "—"} ms</span></span>
+      <span class="kv"><span class="k">max</span> <span class="v">${d.max ?? "—"} ms</span></span>
+    </div>
+    <div class="mix">${mix}</div>
+    <canvas class="spark" data-stream="${esc(name)}"></canvas>
+  </div>`;
+}
+
+function render(d) {
+  $("splash").style.display = "none";
+  $("content").style.display = "block";
+
+  // status pill
+  const st = d.status || "no-data";
+  const labels = { live:"live", idle:"idle", stopped:"stopped", starting:"starting", "no-data":"no data" };
+  $("status").dataset.s = st;
+  $("statustxt").textContent = labels[st] || st;
+
+  // title + meta line
+  const m = d.meta || {};
+  $("title").textContent = m.title || m.slug || ("event " + (d.selected_event || "?"));
+  const hashing = m.hashing || {};
+  const hashBadge = hashing.enabled === false
+    ? `<span class="badge off" title="usernames written verbatim">hashing off</span>`
+    : `<span class="badge on" title="identifiers salted+hashed">hashing on</span>`;
+  $("metaline").innerHTML = [
+    `event <b>${esc(d.selected_event || "?")}</b>`,
+    m.slug ? `<span>${esc(m.slug)}</span>` : "",
+    `<span>streams <b>${esc((m.streams||[]).join(", ") || "—")}</b></span>`,
+    hashBadge,
+    m.polytape_version ? `<span class="badge">v${esc(m.polytape_version)}</span>` : "",
+  ].filter(Boolean).join("");
+
+  // summary
+  const t = d.totals || {};
+  $("t-total").textContent = fmt(t.count);
+  $("t-rate").innerHTML = fmtRate(t.rate_per_sec) + ' <small>/s</small>';
+  $("t-uptime").textContent = dur(d.uptime_seconds);
+  $("t-gaps").textContent = fmt((d.gaps || []).length);
+
+  // stream cards (stable order: comments, book, then any others)
+  const order = ["comments", "book"];
+  const names = Object.keys(d.streams || {}).sort((a,b) => (order.indexOf(a)+1||9) - (order.indexOf(b)+1||9));
+  $("cards").innerHTML = names.map(n => streamCard(n, d.streams[n])).join("") || `<div class="empty">no streams</div>`;
+  document.querySelectorAll("canvas.spark").forEach(c => {
+    const n = c.dataset.stream; drawSpark(c, (d.streams[n]||{}).spark, COLORS[n] || "#8b98ad");
+  });
+
+  // gaps
+  const gb = $("gaps").querySelector("tbody");
+  const gaps = (d.gaps || []).slice().reverse();
+  gb.innerHTML = gaps.length ? gaps.map(g => `<tr>
+    <td>${esc(g.stream)}</td><td class="mono">${esc((g.disconnected_at||"").slice(11,23))}</td>
+    <td class="mono">${esc((g.reconnected_at||"").slice(11,23))}</td>
+    <td class="mono">${g.downtime_seconds ?? "—"}s</td><td class="mono">${fmt(g.backfilled)}</td>
+    <td>${esc(g.note||"")}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="empty">no disconnects recorded — clean run</td></tr>`;
+
+  // recent activity ticker
+  $("ticker").innerHTML = (d.recent || []).length ? d.recent.map(r => `
+    <div class="item">
+      <span class="tag ${esc(r.stream)}">${esc(r.stream)}</span>
+      <span class="type">${esc(r.type)}</span>
+      <span class="delay">${r.delay_ms != null ? r.delay_ms + " ms" : ""}</span>
+      <span class="ago">${esc((r.ts||"").slice(11,19))}</span>
+    </div>`).join("") : `<div class="empty">no messages yet</div>`;
+
+  // footer
+  $("watching").textContent = "watching " + (d.out_dir || "");
+  $("watchdir").textContent = d.out_dir || "./data";
+}
+
+// ---- control plane (start / stop recordings) ------------------------------
+let currentMode = "live";
+
+function setMode(mode) {
+  currentMode = mode;
+  document.querySelectorAll("#modeseg button").forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
+  const live = mode === "live";
+  $("f-comments").style.display = live ? "" : "none";
+  $("f-book").style.display = live ? "" : "none";
+  $("f-hash").style.display = live ? "" : "none";
+  $("f-series").style.display = live ? "" : "none";
+  $("relatedbtn").style.display = live ? "" : "none";
+  $("activechatbtn").style.display = live ? "" : "none";
+  if (!live) { $("related").style.display = "none"; $("activechat").style.display = "none"; }
+  $("f-rate").style.display = live ? "none" : "";
+  $("in-eventid").placeholder = live ? "id, slug, or paste a polymarket.com URL" : "demo";
+}
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Polytape-Control": "1" },
+    body: JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+function toast(msg, kind) {
+  const el = document.createElement("div");
+  el.className = "toast " + (kind || "");
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 250); }, 4200);
+}
+
+function renderControl(d) {
+  const ctrl = (d && d.control) || {};
+  $("recorder").style.display = ctrl.enabled ? "" : "none";  // start form: control only
+  renderEvents(d, ctrl);
+}
+
+// All discovered events + sessions, with status, merged with this dashboard's
+// managed recordings (so we can offer Stop on the ones we launched).
+function renderEvents(d, ctrl) {
+  const events = (d && d.events) || [];
+  const managed = {};
+  ((ctrl && ctrl.recordings) || []).forEach(r => { managed[r.event_id] = r; });
+  const el = $("eventlist");
+  if (!events.length) { $("events").style.display = "none"; el.innerHTML = ""; return; }
+  $("events").style.display = "";
+  el.innerHTML = events.map(e => {
+    const m = managed[e.event_id];
+    const recording = !!(m && m.running);
+    const dot = recording ? "recording" : (e.status || "no-data");
+    const label = recording ? "recording"
+      : (m && !m.running) ? ("exited" + (m.returncode != null ? " (" + esc(m.returncode) + ")" : ""))
+      : (e.status || "");
+    const sel = e.event_id === selectedEvent;
+    return `<div class="ev-row ${sel ? "sel" : ""}" data-view="${esc(e.event_id)}" title="View event ${esc(e.event_id)} here">
+      <span class="led" data-s="${esc(dot)}"></span>
+      <span class="eid">${esc(e.event_id)}</span>
+      <span class="etitle">${esc(e.title || "")}</span>
+      <span class="spacer"></span>
+      <span class="estatus">${esc(label)}</span>
+      <button class="btn ghost sm" data-open="${esc(e.event_id)}" title="Open this event in its own tab">Open ↗</button>
+      ${recording ? `<button class="btn danger sm" data-stop="${esc(e.event_id)}">Stop</button>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function openEventTab(id) {
+  const w = window.open("/?event=" + encodeURIComponent(id), "_blank");
+  if (!w) selectEvent(id);  // popup blocked -> at least switch here
+}
+
+function liveBody(eventId) {
+  return { mode: "live", event_id: eventId, comments: $("in-comments").checked,
+    book: $("in-book").checked, hash: $("in-hash").checked, series_comments: $("in-series").checked };
+}
+
+// Post a start request; opens the new recording in its own tab (per the checkbox).
+async function doStart(body, label) {
+  // Open the session tab synchronously (within the click gesture) so it isn't popup-blocked.
+  let sessionTab = $("in-newtab").checked ? window.open("about:blank", "_blank") : null;
+  try {
+    const r = await post("/api/recordings/start", body);
+    const id = r.recording.event_id;
+    toast((label || "Recording") + " started for event " + id, "ok");
+    if (sessionTab) { sessionTab.location = "/?event=" + encodeURIComponent(id); sessionTab = null; }
+    else { selectEvent(id); }
+    poll();
+    return id;
+  } catch (err) {
+    if (sessionTab) sessionTab.close();
+    toast(err.message, "err");
+    return null;
+  }
+}
+
+async function startRecording() {
+  const eventId = $("in-eventid").value.trim();
+  const demo = currentMode === "demo";
+  const body = demo
+    ? { mode: "demo", event_id: eventId || "demo", rate: Number($("in-rate").value) || 8 }
+    : liveBody(eventId);
+  const btn = $("startbtn");
+  btn.disabled = true;
+  try { await doStart(body, demo ? "Demo feed" : "Recording"); }
+  finally { btn.disabled = false; }
+}
+
+// ---- related events (parse a URL -> the tournament's other matches) --------
+async function findRelated() {
+  const ref = $("in-eventid").value.trim();
+  if (!ref) { toast("Paste a URL or event id first", "err"); return; }
+  const box = $("related");
+  box.style.display = "";
+  box.innerHTML = `<div class="rel-head">finding related events …</div>`;
+  $("relatedbtn").disabled = true;
+  try {
+    renderRelated(await post("/api/related", { ref }));
+  } catch (err) {
+    box.innerHTML = `<div class="rel-head">${esc(err.message)}</div>`;
+  } finally {
+    $("relatedbtn").disabled = false;
+  }
+}
+
+function renderRelated(d) {
+  const events = d.events || [];
+  const box = $("related");
+  box.style.display = "";
+  const head = `<div class="rel-head"><b>${events.length}</b> related event(s)`
+    + (d.series_title ? " in " + esc(d.series_title) : "")
+    + ` — click a row to use it, or <b>Record ▶</b> to capture it</div>`;
+  if (!events.length) { box.innerHTML = head + `<div class="empty">none found</div>`; return; }
+  const rows = events.map(e => `
+    <div class="rel-row ${e.event_id === d.source_event_id ? "src" : ""}" data-pick="${esc(e.event_id)}" title="Use event ${esc(e.event_id)}">
+      <span class="rtitle">${esc(e.title || e.slug || e.event_id)}</span>
+      <span class="rid">${esc(e.event_id)}</span>
+      <span class="spacer"></span>
+      ${e.closed ? `<span class="badge off">closed</span>` : ``}
+      <button class="btn primary sm" data-record="${esc(e.event_id)}">Record ▶</button>
+    </div>`).join("");
+  box.innerHTML = head + `<div class="rel-scroll">${rows}</div>`;
+}
+
+// ---- active chat (sample the firehose -> events with the busiest chat now) --
+async function findActiveChat() {
+  const box = $("activechat");
+  box.style.display = "";
+  box.innerHTML = `<div class="rel-head">sampling the live comment feed (~8s) …</div>`;
+  $("activechatbtn").disabled = true;
+  try {
+    renderActiveChat(await post("/api/active-chat", { seconds: 8 }));
+  } catch (err) {
+    box.innerHTML = `<div class="rel-head">${esc(err.message)}</div>`;
+  } finally {
+    $("activechatbtn").disabled = false;
+  }
+}
+
+function renderActiveChat(d) {
+  const events = d.events || [];
+  const box = $("activechat");
+  box.style.display = "";
+  const head = `<div class="rel-head">busiest chat in the last <b>${esc(d.sampled_seconds ?? 0)}s</b>`
+    + ` — ${esc(d.total_comments ?? 0)} comment(s) across ${esc(d.total_events ?? 0)} event(s)`
+    + ` · <b>Record ▶</b> captures that chat (comments only)</div>`;
+  if (!events.length) {
+    box.innerHTML = head + `<div class="empty">no chat anywhere right now — try again during a live match/event</div>`;
+    return;
+  }
+  const rows = events.map(e => {
+    const isSeries = e.parent_entity_type === "Series";
+    const name = e.title || e.slug || ((isSeries ? "series " : "event ") + e.event_id);
+    const sample = e.sample ? `<div class="chat-sample">${esc(e.last_author ? e.last_author + ": " : "")}${esc(e.sample)}</div>` : "";
+    return `<div class="rel-row" data-pick="${esc(e.event_id)}" data-picktype="${esc(e.parent_entity_type || "Event")}" title="Use ${esc(e.event_id)}">
+      <span class="rtitle">${esc(name)}${isSeries ? ` <span class="badge">series</span>` : ""}</span>
+      <span class="rid">${esc(e.event_id)}</span>
+      <span class="chat-count" title="comments seen in the sample">💬 ${esc(e.comments ?? 0)}</span>
+      <span class="spacer"></span>
+      <button class="btn primary sm" data-chatrec="${esc(e.event_id)}" data-chattype="${esc(e.parent_entity_type || "Event")}">Record ▶</button>
+      ${sample}
+    </div>`;
+  }).join("");
+  box.innerHTML = head + `<div class="rel-scroll">${rows}</div>`;
+}
+
+async function stopRecording(eventId, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await post("/api/recordings/stop", { event_id: eventId });
+    toast("Stopping event " + eventId + " …", "ok");
+  } catch (err) {
+    toast(err.message, "err");
+  }
+  poll();
+}
+
+function updateUrlEvent(id) {
+  const u = new URL(location);
+  if (id) u.searchParams.set("event", id); else u.searchParams.delete("event");
+  history.replaceState(null, "", u);
+}
+
+function selectEvent(id) {
+  selectedEvent = id;
+  updateUrlEvent(id);
+  poll();
+}
+
+function goHome() {
+  selectedEvent = null;
+  updateUrlEvent(null);
+  poll();
+}
+
+// Reset the header to the neutral "home" state (no event selected).
+function resetHeader() {
+  $("title").textContent = "monitor";
+  $("metaline").innerHTML = "";
+  $("status").style.display = "none";
+}
+
+function show(which) {  // which of: content | home | splash
+  $("content").style.display = which === "content" ? "block" : "none";
+  $("home").style.display = which === "home" ? "block" : "none";
+  $("splash").style.display = which === "splash" ? "block" : "none";
+}
+
+// ---- polling --------------------------------------------------------------
+async function poll() {
+  try {
+    const q = selectedEvent ? "?event=" + encodeURIComponent(selectedEvent) : "";
+    const res = await fetch("/api/stats" + q, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const d = await res.json();
+    renderControl(d);
+    $("watching").textContent = "watching " + (d.out_dir || "");
+    $("watchdir").textContent = d.out_dir || "./data";
+
+    const events = d.events || [];
+    // A selected event that no longer exists -> drop back to home.
+    if (selectedEvent && !events.some(e => e.event_id === selectedEvent)) { selectedEvent = null; updateUrlEvent(null); }
+
+    if (selectedEvent) {
+      $("status").style.display = "";
+      show("content");
+      render(d);  // detail view for the selected event
+    } else if (events.length === 0) {
+      resetHeader();
+      show("splash");  // nothing captured yet
+    } else {
+      resetHeader();
+      show("home");  // clean landing: pick from the list or start a new one
+    }
+    lastOk = Date.now();
+    setConn(true);
+  } catch (e) {
+    setConn(false, e.message);
+  }
+}
+
+function setConn(ok, msg) {
+  const c = $("conn");
+  c.classList.toggle("down", !ok);
+  $("conntxt").textContent = ok ? "connected" : ("disconnected" + (msg ? " — " + msg : ""));
+  if (lastOk) $("updated").textContent = "updated " + ago((Date.now()-lastOk)/1000);
+}
+
+// ---- live-view pause ------------------------------------------------------
+function setPaused(p) {
+  paused = p;
+  const b = $("pausebtn");
+  b.innerHTML = p ? "▶ Resume" : "⏸ Pause";
+  b.classList.toggle("primary", p);
+  if (p) stopPolling(); else startPolling();
+}
+
+function startPolling() { if (!timer) { poll(); timer = setInterval(poll, POLL_MS); } }
+function stopPolling() { clearInterval(timer); timer = null; }
+
+// ---- wiring ---------------------------------------------------------------
+$("brand").addEventListener("click", goHome);
+$("modeseg").addEventListener("click", (e) => { if (e.target.dataset.mode) setMode(e.target.dataset.mode); });
+$("startbtn").addEventListener("click", startRecording);
+$("in-eventid").addEventListener("keydown", (e) => { if (e.key === "Enter") startRecording(); });
+$("relatedbtn").addEventListener("click", findRelated);
+$("activechatbtn").addEventListener("click", findActiveChat);
+$("related").addEventListener("click", (e) => {
+  const recId = e.target.closest("[data-record]")?.getAttribute("data-record");
+  if (recId) { const b = e.target; b.disabled = true; doStart(liveBody(recId), "Recording").finally(() => { b.disabled = false; }); return; }
+  const pickId = e.target.closest("[data-pick]")?.getAttribute("data-pick");
+  if (pickId) { $("in-eventid").value = pickId; $("related").style.display = "none"; }
+});
+$("activechat").addEventListener("click", (e) => {
+  // Record straight from a busy event: chat only (comments), book off. entity_type
+  // carries Event vs Series so the recorder filters/backfills the right namespace
+  // (a Series id is a parent-league/tournament chat, not an /events/ id).
+  const recBtn = e.target.closest("[data-chatrec]");
+  if (recBtn) {
+    const b = e.target; b.disabled = true;
+    const body = { mode: "live", event_id: recBtn.getAttribute("data-chatrec"),
+      comments: true, book: false, hash: $("in-hash").checked, series_comments: false,
+      entity_type: recBtn.getAttribute("data-chattype") || "Event" };
+    doStart(body, "Chat recording").finally(() => { b.disabled = false; });
+    return;
+  }
+  const pickRow = e.target.closest("[data-pick]");
+  if (pickRow) {
+    $("in-eventid").value = pickRow.getAttribute("data-pick");
+    $("in-book").checked = false;  // a chat id usually has no book; default it off
+  }
+});
+$("pausebtn").addEventListener("click", () => setPaused(!paused));
+$("eventlist").addEventListener("click", (e) => {
+  const openId = e.target.closest("[data-open]")?.getAttribute("data-open");
+  if (openId) { openEventTab(openId); return; }
+  const stopId = e.target.closest("[data-stop]")?.getAttribute("data-stop");
+  if (stopId) { stopRecording(stopId, e.target); return; }
+  const viewId = e.target.closest("[data-view]")?.getAttribute("data-view");
+  if (viewId) selectEvent(viewId);
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopPolling(); else if (!paused) startPolling();
+});
+setInterval(() => { if (lastOk) $("updated").textContent = "updated " + ago((Date.now()-lastOk)/1000); }, 1000);
+startPolling();
+</script>
+</body>
+</html>

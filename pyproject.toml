@@ -33,6 +33,7 @@ dev = [
 
 [project.scripts]
 polytape = "polytape.cli:main"
+polytape-monitor = "polytape.monitor.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/polytape/polytape"
@@ -40,6 +41,9 @@ Source = "https://github.com/polytape/polytape"
 
 [tool.hatch.build.targets.wheel]
 packages = ["polytape"]
+# Ship the dashboard HTML (a non-Python file) inside the package so the monitor
+# works from an installed wheel as well as the source tree.
+artifacts = ["polytape/monitor/index.html"]
 
 [tool.black]
 line-length = 100
