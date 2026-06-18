@@ -41,7 +41,15 @@ is `{ subscriptions: [ ... ] }`. The outer frame has exactly two keys: `action` 
 Per-subscription object keys (`src/model.ts`): `topic` (req), `type` (req), `filters`
 (optional **string**), `clob_auth` (optional), `gamma_auth` (optional).
 
-**Subscribe to one Event's comments (the frame polytape sends):**
+**The frame polytape actually sends** (the unfiltered firehose — see the LIVE FINDING in
+§1.3; server-side `filters` suppresses all delivery, so polytape filters client-side):
+
+```json
+{"action":"subscribe","subscriptions":[{"topic":"comments","type":"*"}]}
+```
+
+**What the reference client documents but does NOT work live** (a per-event `filters` string —
+kept here only to explain why it is *absent* above):
 
 ```json
 {"action":"subscribe","subscriptions":[{"topic":"comments","type":"*","filters":"{\"parentEntityID\":20200,\"parentEntityType\":\"Event\"}"}]}
@@ -64,7 +72,9 @@ Per-subscription object keys (`src/model.ts`): `topic` (req), `type` (req), `fil
 - `type` selects the subtype: `"*"` for all four, or one of
   `comment_created` / `comment_removed` / `reaction_created` / `reaction_removed`.
 - Empty `filters` (`""`) or omitting it = **no filtering** (all comments platform-wide).
-  polytape MUST set the filter, or it will record the entire firehose.
+  This is what polytape relies on: per the LIVE FINDING below, setting `filters` suppresses
+  all delivery, so polytape deliberately records the unfiltered firehose and filters
+  client-side (by `(parentEntityType, parentEntityID)`).
 
 **[CROSS-CHECK — docs vs source]** Polymarket's prose docs page at one point implied comments
 **cannot** be filtered to a single event. The official client repo contradicts this: the
@@ -432,10 +442,12 @@ address). The human handle is `profile.name` (fallback `profile.pseudonym`);
 2. **CLOB WS:** connect to `wss://ws-subscriptions-clob.polymarket.com/ws/market`, send
    `{"assets_ids":[...all token ids...],"type":"market"}`, then send text `PING` every 10 s.
    Record `book` (seed), apply `price_change`, log `last_trade_price` / `tick_size_change`.
-3. **RTDS WS:** connect to `wss://ws-live-data.polymarket.com`, send
-   `{"action":"subscribe","subscriptions":[{"topic":"comments","type":"*","filters":"{\"parentEntityID\":<event.id>,\"parentEntityType\":\"Event\"}"}]}`,
+3. **RTDS WS:** connect to `wss://ws-live-data.polymarket.com`, send the **unfiltered**
+   subscribe (server-side `filters` suppresses all delivery — see §1.3 LIVE FINDING):
+   `{"action":"subscribe","subscriptions":[{"topic":"comments","type":"*"}]}`,
    then send text `ping` every 5 s. Record `comment_*` / `reaction_*` payloads, dedup on
-   `payload.id`.
+   `payload.id`, and **keep only this capture's `(parentEntityType, parentEntityID)`**
+   client-side (`Event`+event id, or `Series`+series id for a parent-league chat).
 4. **Gamma backfill:** on startup / after gaps, page
    `GET /comments?parent_entity_type=Event&parent_entity_id=<event.id>&order=createdAt&ascending=true&limit=100&offset=N`
    until you reach the last recorded comment id. Dedup on `id` against the live stream.
@@ -491,3 +503,38 @@ before relying on them:
     `market`). `Event` confirmed working live; the lowercase `market` value is untested here.
 14. **Gamma `/events?id=` multi-id batching.** `id` is array-typed in docs but only verified
     live with a single id.
+
+---
+
+## 6. US mobile-app "live chat" — what it is, and the boundary of that claim
+
+The Polymarket **US mobile app**'s live chat (typed messages, bursty — several per second on a
+marquee live event) is the **RTDS `comments` topic documented in §1** — the same public,
+anonymous feed polytape records. The dashboard's "⚡ Live chat now" button samples this firehose
+(`polytape/streams/discover.py`) to find which events are actively chatting, so a capture is
+pointed at a busy event rather than a dead one.
+
+**Verified live (2026-06-16):** `wss://ws-live-data.polymarket.com`, subscribe
+`{"action":"subscribe","subscriptions":[{"topic":"comments","type":"*"}]}`, anonymous —
+delivers real typed comments (`body` + `parentEntityID` + `parentEntityType` + `profile` +
+`userAddress`) and reactions, captured end-to-end through polytape's production pipeline. This
+matches the envelope the US app uses internally (a `ClientWSLiveDataSubscriptionMessage`:
+`{action, subscriptions:[{topic, type, filters}], channelKey}`), decoded by static analysis of
+the app's native lib `libPolymarketUI.so`.
+
+**Negative results (recorded so the boundary is auditable):**
+- The app's **private** gateway `wss://gateway-ws-markets.polymarket.us/v1/ws/subscriptions`
+  rejected every reconstructed subscribe envelope with `{"error":"invalid_message"}`; its
+  `subscriptionType` enum is market-data only (`marketData`/`marketDataLite`/`trade`/`order`/
+  `position`/`accountBalance`) — **no comment type**.
+- `wss://sports-api.polymarket.com/ws` (subscribe `{"channel":"comments"|"prices"|...}`)
+  carries **live game scores only**, not chat.
+- Running the app in an emulator to capture its real traffic was **impossible on the dev host**
+  (x86_64 Windows): Android Emulator v36 refuses arm64 AVDs ("not supported by QEMU2 on x86_64
+  host") and the x86 image can't install the ARM-only app (`INSTALL_FAILED_NO_MATCHING_ABIS`).
+
+**NOT proven:** that the installed US app's *private* socket is byte-for-byte identical to the
+public `.com` feed (it was never observed on the wire — the emulator was unavailable). The
+grounded, reproducible claim is narrow: the **public** Polymarket RTDS `comments` topic carries
+the typed chat, and Gamma `/comments` backfill agrees on `id`/`userAddress`. polytape records
+that public feed; for shared events that is the same comment corpus the app surfaces.

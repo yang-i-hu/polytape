@@ -31,6 +31,12 @@ class _Recorder:
         if self._raises:
             raise RuntimeError("boom")
 
+    def backfill_targets(self):
+        return [("Event", self.event_id)]
+
+    def cursor_for(self, parent_id):
+        return self.last_comment_id
+
 
 def test_backoff_curve():
     s = StreamSupervisor.__new__(StreamSupervisor)
@@ -52,7 +58,7 @@ async def test_reconnect_records_gaps_and_backfills(make_config):
         def __init__(self):
             self.n = 0
 
-        async def backfill_since(self, event_id, last):
+        async def backfill_since(self, parent_id, last, *, parent_entity_type="Event"):
             self.n += 1
             return [{"id": f"bf{self.n}-{k}"} for k in (1, 2)]
 
@@ -100,8 +106,14 @@ async def test_comment_backfill_dedups_overlap(make_config):
             event_id = "20200"
             last_comment_id = "live1"
 
+            def backfill_targets(self):
+                return [("Event", self.event_id)]
+
+            def cursor_for(self, parent_id):
+                return self.last_comment_id
+
         class _Gamma:
-            async def backfill_since(self, event_id, last):
+            async def backfill_since(self, parent_id, last, *, parent_entity_type="Event"):
                 return [{"id": "live1"}, {"id": "bf1"}, {"id": "bf2"}]
 
         backfill = make_comment_backfill(_Stream(), _Gamma(), w)

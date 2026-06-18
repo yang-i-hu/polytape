@@ -34,6 +34,11 @@ class Config:
             market in the event. Empty means "auto-resolve from the event".
         dry_run: Feed synthetic messages through the pipeline with no network.
         log_level: Python logging level name (upper-case).
+        include_series_comments: Also record comments on the event's parent
+            series (e.g. a sports league/tournament chat). Off by default.
+        entity_type: The parent entity type of ``event_id`` — ``"Event"``
+            (default) or ``"Series"``. ``"Series"`` records a parent-series chat
+            directly by its series id (no markets/book; not an ``/events/`` id).
     """
 
     event_id: str
@@ -44,10 +49,14 @@ class Config:
     market_ids: tuple[str, ...] = ()
     dry_run: bool = False
     log_level: str = "INFO"
+    include_series_comments: bool = False
+    entity_type: str = "Event"
 
     def __post_init__(self) -> None:
         if not str(self.event_id).strip():
             raise ValueError("event_id must be a non-empty string")
+        if self.entity_type not in ("Event", "Series"):
+            raise ValueError(f"entity_type must be 'Event' or 'Series', got {self.entity_type!r}")
         if not self.comments and not self.book:
             raise ValueError(
                 "at least one stream must be enabled "
