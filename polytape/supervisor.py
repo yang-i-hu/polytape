@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from polytape.envelope import utc_now_iso
+from polytape.writer import FatalRecorderError
 
 if TYPE_CHECKING:
     from polytape.gamma import GammaClient
@@ -91,6 +92,8 @@ class StreamSupervisor:
                 backfilled = await self._backfill()
             except asyncio.CancelledError:
                 raise
+            except FatalRecorderError:
+                raise  # disk full while backfilling: surface it, don't swallow
             except Exception:
                 logger.exception("%s: backfill failed on reconnect", self._name)
         self._writer.record_gap(
@@ -121,6 +124,8 @@ class StreamSupervisor:
                 await self._stream.run_once(on_connect=_on_connect)
             except asyncio.CancelledError:
                 raise
+            except FatalRecorderError:
+                raise  # disk full / unrecoverable: do NOT reconnect, stop the process
             except Exception as exc:
                 logger.warning("%s: connection error: %s", self._name, exc)
             else:

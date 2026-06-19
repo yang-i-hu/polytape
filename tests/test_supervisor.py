@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from polytape.supervisor import StreamSupervisor, make_comment_backfill
-from polytape.writer import CaptureWriter
+from polytape.writer import CaptureWriter, FatalRecorderError
 
 
 class _Recorder:
@@ -107,3 +109,26 @@ async def test_comment_backfill_dedups_overlap(make_config):
         backfill = make_comment_backfill(_Stream(), _Gamma(), w)
         assert await backfill() == 2  # live1 overlaps -> not re-counted
         assert w.counts["comments"] == 3
+
+
+class _FatalStream:
+    """A stream stub whose session raises a fatal (unrecoverable) error."""
+
+    stream = "comments"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run_once(self, *, on_connect=None):
+        self.calls += 1
+        raise FatalRecorderError("disk full")
+
+
+async def test_supervisor_reraises_fatal_without_looping(make_config):
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+        stream = _FatalStream()
+        sup = StreamSupervisor(stream, writer=w, base_delay=0.001, max_delay=0.002, jitter=0.0)
+        with pytest.raises(FatalRecorderError):
+            await asyncio.wait_for(sup.run(), timeout=2.0)
+        assert stream.calls == 1  # fatal stops immediately; no reconnect loop

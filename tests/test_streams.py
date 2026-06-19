@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
-from polytape.streams.base import WebSocketStream
+import pytest
+
+from polytape.streams.base import StreamInactivityError, WebSocketStream
 from polytape.streams.clob import BookStream, book_subscribe_frame
 from polytape.streams.rtds import CommentStream, comment_subscribe_frame
 from polytape.writer import CaptureWriter
@@ -97,3 +100,27 @@ async def test_book_stream_ids(make_config, make_connect):
 
 def test_book_stream_empty_tokens_no_frame():
     assert BookStream(token_ids=[], writer=None).subscribe_frames() == []
+
+
+async def test_watchdog_raises_on_inactivity(make_config, make_connect):
+    # Socket open but no frame ever arrives (a silent freeze / migration blackout):
+    # the read deadline must fire so the supervisor reconnects and records a gap.
+    cfg = make_config(book=False)
+    connect = make_connect([], blocking=True)
+    with CaptureWriter(cfg) as w:
+        cs = CommentStream(event_id="20200", writer=w, connect=connect)
+        cs.read_timeout = 0.05
+        with pytest.raises(StreamInactivityError):
+            await asyncio.wait_for(cs.run_once(), timeout=2.0)
+
+
+async def test_watchdog_does_not_trip_while_data_flows(make_config, make_connect):
+    # A frame within the deadline must not trip the watchdog; a clean close returns.
+    cfg = make_config(book=False)
+    c = {"type": "comment_created", "payload": {"id": "c1", "parentEntityID": 20200}}
+    connect = make_connect([json.dumps(c)])
+    with CaptureWriter(cfg) as w:
+        cs = CommentStream(event_id="20200", writer=w, connect=connect)
+        cs.read_timeout = 0.5
+        await asyncio.wait_for(cs.run_once(), timeout=2.0)
+        assert w.counts["comments"] == 1

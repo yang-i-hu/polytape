@@ -36,6 +36,11 @@ CLOB_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 _PING_TEXT = "PING"
 _PING_INTERVAL = 5.0
 
+# Read deadline: the CLOB book channel is busy and replies to our PING with a text
+# PONG every ~5s, so a 20s deadline never false-fires on a healthy link but catches
+# a true freeze (e.g. a GCP live-migration network blackout) within seconds.
+_READ_TIMEOUT = 20.0
+
 
 def book_subscribe_frame(token_ids: list[str] | tuple[str, ...]) -> str:
     """Build the CLOB market-channel subscribe frame for the given token ids."""
@@ -53,15 +58,19 @@ class BookStream(WebSocketStream):
         token_ids: list[str] | tuple[str, ...],
         writer: Any,
         connect: Any = None,
+        on_activity: Any = None,
     ) -> None:
         kwargs: dict[str, Any] = {}
         if connect is not None:
             kwargs["connect"] = connect
+        if on_activity is not None:
+            kwargs["on_activity"] = on_activity
         super().__init__(
             url=CLOB_URL,
             writer=writer,
             ping_text=_PING_TEXT,
             ping_interval=_PING_INTERVAL,
+            read_timeout=_READ_TIMEOUT,
             **kwargs,
         )
         self.token_ids = tuple(token_ids)

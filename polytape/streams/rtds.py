@@ -30,6 +30,12 @@ RTDS_URL = "wss://ws-live-data.polymarket.com"
 _PING_TEXT = "ping"
 _PING_INTERVAL = 5.0
 
+# Read deadline: the comments firehose is global (all events) and thus rarely idle,
+# so a generous 120s deadline avoids any false trip on a quiet stretch while still
+# bounding a true silent freeze. (RTDS may answer keepalive with a protocol-level
+# pong that never surfaces here, so we rely on firehose traffic, not PONGs.)
+_READ_TIMEOUT = 120.0
+
 
 def comment_subscribe_frame() -> str:
     """Build the RTDS subscribe frame for the (unfiltered) comments firehose.
@@ -54,15 +60,20 @@ class CommentStream(WebSocketStream):
 
     stream = STREAM_COMMENTS
 
-    def __init__(self, *, event_id: str | int, writer: Any, connect: Any = None) -> None:
+    def __init__(
+        self, *, event_id: str | int, writer: Any, connect: Any = None, on_activity: Any = None
+    ) -> None:
         kwargs: dict[str, Any] = {}
         if connect is not None:
             kwargs["connect"] = connect
+        if on_activity is not None:
+            kwargs["on_activity"] = on_activity
         super().__init__(
             url=RTDS_URL,
             writer=writer,
             ping_text=_PING_TEXT,
             ping_interval=_PING_INTERVAL,
+            read_timeout=_READ_TIMEOUT,
             **kwargs,
         )
         self.event_id = str(event_id)

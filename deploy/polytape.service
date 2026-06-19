@@ -1,0 +1,44 @@
+# polytape recorder — systemd unit (Phase 0 deploy).
+#
+# Install on the recorder VM:
+#   sudo cp deploy/polytape.service /etc/systemd/system/polytape.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now polytape
+#   sudo journalctl -u polytape -f
+#
+# Secrets/config live in /etc/polytape/polytape.env (mode 0600), e.g.:
+#   POLYTAPE_SALT=<32+ random chars; stable so hashes correlate across restarts>
+#   POLYTAPE_HEARTBEAT_URL=https://hc-ping.com/<uuid>
+#   POLYTAPE_EVENT_ID=<numeric Polymarket event id>
+#
+# Restart=always recovers crashes and the post-migration reconnect; on a
+# *persistent* fatal (e.g. disk full -> exit 2) the process keeps dying, no data is
+# written, and the external heartbeat stays dead -> healthchecks.io alerts. systemd
+# alone would loop forever silently, which is why the heartbeat is the real backstop.
+
+[Unit]
+Description=polytape Polymarket recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polytape
+Group=polytape
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/polytape/polytape.env
+ExecStart=/opt/polytape/venv/bin/polytape --event-id ${POLYTAPE_EVENT_ID} --out /data --log-level INFO
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polytape
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/data
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

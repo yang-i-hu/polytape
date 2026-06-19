@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -25,6 +26,23 @@ if TYPE_CHECKING:
     from polytape.gamma import EventInfo
 
 logger = logging.getLogger("polytape.writer")
+
+# Cap the per-stream in-memory dedup set so a long high-volume capture cannot grow
+# it without bound (a 12h busy book feed could otherwise reach multiple GB and OOM
+# a small VM). Real duplicates are recency-bounded — the CLOB resends the book
+# snapshot only on reconnect, and comment backfill overlaps just the last page — so
+# an oldest-first eviction at this size never drops an id that could still recur.
+_SEEN_CAP = 500_000
+
+
+class FatalRecorderError(Exception):
+    """An unrecoverable I/O error (e.g. disk full) — stop the process, do not reconnect.
+
+    Distinct from a transient connection error: the supervisor re-raises this past
+    its reconnect loop so the process exits non-zero, surfacing via systemd's
+    restart and the dead external heartbeat instead of looping silently while data
+    is dropped.
+    """
 
 
 def _downtime_seconds(start_iso: str, end_iso: str) -> float | None:
@@ -58,7 +76,7 @@ class CaptureWriter:
         self._now = now
         self._dir: Path = config.event_dir
         self._files: dict[str, TextIO] = {}
-        self._seen: dict[str, set[str]] = {}
+        self._seen: dict[str, OrderedDict[str, None]] = {}
         self._counts: dict[str, int] = {}
         self._gaps: list[dict[str, Any]] = []
         self._started_at: str | None = None
@@ -85,7 +103,7 @@ class CaptureWriter:
             # Append-only so an existing capture is never clobbered; dedup is
             # per-run (in-memory), per the spec.
             self._files[stream] = open(path, "a", encoding="utf-8", newline="\n")
-            self._seen[stream] = set()
+            self._seen[stream] = OrderedDict()
             self._counts.setdefault(stream, 0)
         self._open = True
         self._write_meta()
@@ -105,7 +123,12 @@ class CaptureWriter:
             except OSError:
                 logger.exception("error closing %s file", stream)
         self._open = False
-        self._write_meta()
+        # Best-effort on shutdown: if the disk is full we cannot finalize meta.json,
+        # but that must not mask the original cause or crash the cleanup path.
+        try:
+            self._write_meta()
+        except FatalRecorderError:
+            logger.exception("could not finalize meta.json on close")
         logger.info("capture stopped; counts: %s", dict(self._counts))
 
     # -- writing ------------------------------------------------------------ #
@@ -127,9 +150,14 @@ class CaptureWriter:
         seen = self._seen[stream]
         if message_id in seen:
             return False
-        seen.add(message_id)
-        handle.write(json.dumps(envelope, ensure_ascii=False) + "\n")
-        handle.flush()
+        seen[message_id] = None
+        if len(seen) > _SEEN_CAP:
+            seen.popitem(last=False)  # evict oldest; the dedup window stays recency-bounded
+        try:
+            handle.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+            handle.flush()
+        except OSError as exc:
+            raise FatalRecorderError(f"write to {stream!r} failed: {exc}") from exc
         self._counts[stream] += 1
         return True
 
@@ -209,11 +237,20 @@ class CaptureWriter:
         }
 
     def _write_meta(self) -> None:
-        """Atomically (temp file + replace) write ``meta.json``."""
-        self._dir.mkdir(parents=True, exist_ok=True)
-        path = self._dir / "meta.json"
-        tmp = self._dir / "meta.json.tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(self._meta(), handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        os.replace(tmp, path)
+        """Atomically (temp file + replace) write ``meta.json``.
+
+        Raises :class:`FatalRecorderError` on an I/O error (e.g. disk full) so a
+        failure while recording a gap stops the process rather than being swallowed
+        into a silent reconnect loop. :meth:`close` guards its own call so shutdown
+        stays best-effort.
+        """
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            path = self._dir / "meta.json"
+            tmp = self._dir / "meta.json.tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(self._meta(), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            raise FatalRecorderError(f"writing meta.json failed: {exc}") from exc
