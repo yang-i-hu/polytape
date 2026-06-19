@@ -295,3 +295,21 @@ def test_systemctl_cached_once_per_tick(tmp_path):
     r.status()
     assert calls[0] == 1  # status() reads the cache, never re-spawns
     assert r.status()["recorder"]["active"] == "active"
+
+
+def test_consume_reads_in_bounded_chunks(tmp_path):
+    # A small read cap forces multi-tick catch-up: the first scan must NOT load the
+    # whole file at once (the OOM bug), but the backlog still drains fully over ticks.
+    (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1") for _ in range(20)])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    size = (tmp_path / "book.jsonl").stat().st_size
+    cap = max(size // 6, 250)  # ~6 chunks, but always larger than one record line
+    r = RunReader(tmp_path, env_file=tmp_path / "x.env", max_read_bytes=cap)
+    r.update()
+    first = r.status()["records"]["book"]
+    assert 0 < first < 20  # bounded — not all 20 consumed in one read
+    for _ in range(20):  # plenty of ticks to drain the backlog
+        r.update()
+    assert r.status()["records"]["book"] == 20  # fully caught up
+    assert r._offsets["book"] == size  # offset reached EOF

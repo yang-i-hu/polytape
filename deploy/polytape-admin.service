@@ -65,6 +65,10 @@ LogsDirectoryMode=0700
 UMask=0077
 ProtectHome=true
 PrivateTmp=true
+# Hard memory cap: the sidecar's bounded reads sit well under this; the cap means a
+# runaway scan gets cgroup-killed in isolation and can NEVER OOM the recorder.
+MemoryHigh=512M
+MemoryMax=768M
 
 [Install]
 WantedBy=multi-user.target

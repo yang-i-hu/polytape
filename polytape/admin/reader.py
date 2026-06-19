@@ -22,6 +22,13 @@ from typing import Any
 
 from polytape.envelope import iso_to_datetime, utc_now_iso
 
+# Bound the bytes read per _consume call. Without this, the FIRST scan of a
+# multi-GB book.jsonl does handle.read() of the whole file — ~1.5 GB of bytes + a
+# decoded str + a million-element line list at once — which OOM-kills the sidecar on
+# a small VM. With the cap, a large backlog simply catches up over several update()
+# ticks (the recorder appends far slower than a 64 MiB/tick read drains it).
+_MAX_READ_BYTES = 64 * 1024 * 1024  # 64 MiB
+
 
 def _slug_date(slug: str | None) -> str | None:
     """Trailing ``YYYY-MM-DD`` in a ``fifwc-...-2026-06-19`` slug, if present."""
@@ -55,6 +62,7 @@ class RunReader:
         peek: int = 60,
         now: Callable[[], str] = utc_now_iso,
         mono: Callable[[], float] = time.monotonic,
+        max_read_bytes: int = _MAX_READ_BYTES,
     ) -> None:
         self._dir = Path(run_dir)
         self._unit = unit
@@ -64,6 +72,7 @@ class RunReader:
         self._price_history = price_history
         self._now = now
         self._mono = mono
+        self._max_read = max_read_bytes
         self._offsets: dict[str, int] = {}
         self._counts: dict[str, int] = {"comments": 0, "book": 0}
         self._by_event: dict[str, dict[str, int]] = {}
@@ -174,12 +183,12 @@ class RunReader:
         try:
             with open(path, "rb") as handle:
                 handle.seek(off)
-                data = handle.read()
+                data = handle.read(self._max_read)  # bounded; a big backlog drains over ticks
         except OSError:
             return
         nl = data.rfind(b"\n")
         if nl == -1:
-            return  # no complete new line yet
+            return  # no complete new line in this chunk yet (records are << the cap)
         self._offsets[stream] = off + nl + 1
         for line in data[: nl + 1].decode("utf-8", "replace").splitlines():
             if not line:
