@@ -36,9 +36,14 @@ fi
 if [ "$NEW_IDS" != "$CUR_IDS" ]; then
     n=$("$PY" -c "import json;print(len(json.load(open('$NEW'))))")
     install -o polytape -g polytape -m 0644 "$NEW" "$CUR"
-    # Serialize the restart against the admin control helper (shared lock) so an
-    # operator action and this timer can never restart the recorder simultaneously.
-    ( flock -w 30 9 && systemctl restart polytape ) 9>/run/polytape-control.lock
+    # Serialize the restart against the admin control helper (shared lock). When the
+    # helper invoked us it ALREADY holds that lock (POLYTAPE_HELD_LOCK=1) — re-grabbing
+    # it would self-deadlock, so in that case restart directly.
+    if [ -n "${POLYTAPE_HELD_LOCK:-}" ]; then
+        systemctl restart polytape
+    else
+        ( flock -w 30 9 && systemctl restart polytape ) 9>/run/polytape-control.lock
+    fi
     log "open match set changed -> regenerated ($n matches) + restarted polytape"
 else
     log "no change ($(echo "$CUR_IDS" | tr ',' '\n' | grep -c .) matches)"

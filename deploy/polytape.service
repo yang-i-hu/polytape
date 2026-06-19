@@ -5,10 +5,14 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now polytape
 #   sudo journalctl -u polytape -f
 #
-# Secrets/config live in /etc/polytape/polytape.env (mode 0600), e.g.:
+# Secrets live in /etc/polytape/polytape.env (mode 0600, owner polytape), e.g.:
 #   POLYTAPE_SALT=<32+ random chars; stable so hashes correlate across restarts>
-#   POLYTAPE_HEARTBEAT_URL=https://hc-ping.com/<uuid>   (optional; arms the watchdog)
 #   POLYTAPE_EVENT_ID=<numeric id; legacy single-event ExecStart only>
+# The heartbeat URL is kept SEPARATELY in /etc/polytape/heartbeat.env (0640
+# root:polytape) so the admin sidecar can read its armed state (via group polytape)
+# WITHOUT seeing the salt, and the control plane can rewrite it with no risk to the
+# salt at all:
+#   POLYTAPE_HEARTBEAT_URL=https://hc-ping.com/<uuid>   (optional; arms the watchdog)
 #
 # This is the PRODUCTION multi-event unit: it records ALL open World Cup match
 # moneylines in one process via the discovery file into /data/run-wc. Keep this
@@ -30,6 +34,7 @@ User=polytape
 Group=polytape
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/polytape/polytape.env
+EnvironmentFile=-/etc/polytape/heartbeat.env
 ExecStart=/opt/polytape/venv/bin/polytape --matches-file /etc/polytape/wc_matches.json --open-only --run-name wc --out /data --log-level INFO
 # Legacy single-event mode (writes /data/event-<id>); swap the ExecStart above for:
 #   ExecStart=/opt/polytape/venv/bin/polytape --event-id ${POLYTAPE_EVENT_ID} --out /data --log-level INFO

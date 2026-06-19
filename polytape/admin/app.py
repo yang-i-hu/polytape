@@ -59,6 +59,7 @@ def create_app(
     if controls_on:
         sessions = sessions or control.Sessions()
         rate_limiter = rate_limiter or control.RateLimiter()
+        login_throttle = control.LoginThrottle()
         if audit is None:
             audit = control.AuditLog(
                 os.environ.get("POLYTAPE_AUDIT_DIR", "/var/log/polytape-admin/audit.jsonl")
@@ -116,6 +117,13 @@ def create_app(
     def _source(request: Request) -> str:
         return request.client.host if request.client else "?"
 
+    def _json_request(request: Request) -> bool:
+        # CSRF defense: a cross-site HTML form cannot send application/json without a
+        # CORS preflight we never grant, so requiring it (plus the SameSite cookie)
+        # stops a forged cross-origin POST from riding the session cookie.
+        ct = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        return ct == "application/json"
+
     @app.get("/api/session")
     async def session(request: Request) -> JSONResponse:
         authed = controls_on and sessions.valid(request.cookies.get("polytape_admin"))
@@ -123,7 +131,7 @@ def create_app(
             {
                 "controls_enabled": controls_on,
                 "authed": bool(authed),
-                "actions": sorted(control.ACTIONS),
+                "actions": sorted(control.ACTIONS) if authed else [],
             }
         )
 
@@ -131,13 +139,23 @@ def create_app(
     async def login(request: Request) -> JSONResponse:
         if not controls_on:
             return JSONResponse({"error": "controls disabled"}, status_code=503)
+        if not _json_request(request):
+            return JSONResponse({"error": "application/json required"}, status_code=415)
+        if login_throttle.locked():
+            audit.write(action="login", result="lockedout", source=_source(request))
+            return JSONResponse({"error": "too many attempts; wait a minute"}, status_code=429)
         try:
             body = await request.json()
         except Exception:
             body = {}
+        if not isinstance(body, dict):
+            body = {}
         if not control.token_ok(body.get("token"), admin_token):
+            login_throttle.record_failure()
+            await asyncio.sleep(0.25)  # fixed per-failure delay blunts brute force
             audit.write(action="login", result="denied", source=_source(request))
             return JSONResponse({"error": "invalid token"}, status_code=403)
+        login_throttle.record_success()
         sid = sessions.mint()
         audit.write(
             action="login",
@@ -154,7 +172,15 @@ def create_app(
     @app.post("/api/logout")
     async def logout(request: Request) -> JSONResponse:
         if controls_on:
-            sessions.drop(request.cookies.get("polytape_admin"))
+            sid = request.cookies.get("polytape_admin")
+            if sessions.valid(sid):
+                audit.write(
+                    action="logout",
+                    result="ok",
+                    source=_source(request),
+                    session_fp=control.fingerprint(sid),
+                )
+            sessions.drop(sid)
         resp = JSONResponse({"ok": True})
         resp.delete_cookie("polytape_admin", path="/")
         return resp
@@ -163,6 +189,8 @@ def create_app(
     async def do_control(action: str, request: Request) -> JSONResponse:
         if not controls_on:
             return JSONResponse({"error": "controls disabled"}, status_code=503)
+        if not _json_request(request):
+            return JSONResponse({"error": "application/json required"}, status_code=415)
         src = _source(request)
         sid = request.cookies.get("polytape_admin")
         if not sessions.valid(sid):
@@ -176,6 +204,8 @@ def create_app(
         try:
             body = await request.json()
         except Exception:
+            body = {}
+        if not isinstance(body, dict):
             body = {}
         if body.get("confirm") != policy["confirm"]:  # re-verified server-side
             audit.write(action=action, result="bad-confirm", source=src, session_fp=fp)

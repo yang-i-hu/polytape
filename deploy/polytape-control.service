@@ -8,8 +8,11 @@ Description=polytape control-plane helper (privileged, intent-driven)
 [Service]
 Type=oneshot
 ExecStart=/opt/polytape/polytape-control.sh
-# Hardening: it needs root + write to /etc/polytape and /run, but nothing else.
+# Hardening: needs root to restart the recorder, but a minimal write surface —
+# only the env dir, the admin spool, and the shared restart lock.
 ProtectSystem=strict
-ReadWritePaths=/etc/polytape /run
+ReadWritePaths=/etc/polytape /run/polytape-admin /run/polytape-control.lock
 ProtectHome=true
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true

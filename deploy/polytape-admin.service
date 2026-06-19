@@ -15,16 +15,17 @@
 #
 # ── control-plane setup (run as root; verify on the VM before trusting) ──────
 #   useradd --system --no-create-home --shell /usr/sbin/nologin polytape-admin
-#   usermod -aG polytape polytape-admin                 # so it can READ the env file
-#   chmod 0640 /etc/polytape/polytape.env               # group(polytape)-readable, not world
-#   # the secret (NOT in this unit text, NOT readable by the recorder 'polytape'):
+#   usermod -aG polytape polytape-admin                 # ONLY to read heartbeat.env (group polytape)
+#   # Heartbeat URL in its OWN file so the admin reads armed-state but NEVER the salt;
+#   # leave /etc/polytape/polytape.env at 0600 owner polytape (admin must not read it):
+#   install -m 0640 -o root -g polytape /dev/null /etc/polytape/heartbeat.env
+#   # The admin secret (NOT in this unit text, NOT readable by the recorder 'polytape'):
 #   install -m 0600 -o polytape-admin -g polytape-admin /dev/null /etc/polytape/admin.env
 #   printf 'POLYTAPE_ADMIN_TOKEN=%s\n' "$(openssl rand -base64 32)" > /etc/polytape/admin.env
 #   cp deploy/polytape-admin.tmpfiles.conf /etc/tmpfiles.d/polytape-admin.conf
-#   systemd-tmpfiles --create /etc/tmpfiles.d/polytape-admin.conf   # /run/polytape-admin{,/intent}
+#   systemd-tmpfiles --create /etc/tmpfiles.d/polytape-admin.conf   # /run/polytape-admin{,/intent} + lock
 #   install -m 0755 deploy/polytape-control.sh /opt/polytape/polytape-control.sh
 #   cp deploy/polytape-control.service deploy/polytape-control.path /etc/systemd/system/
-#   chown -R polytape-admin:polytape-admin /var/log/polytape-admin 2>/dev/null || true
 #   systemctl daemon-reload
 #   systemctl enable --now polytape-control.path
 #   systemctl restart polytape-admin
@@ -43,7 +44,8 @@ SupplementaryGroups=polytape
 Environment=PYTHONUNBUFFERED=1
 Environment=POLYTAPE_RUN_DIR=/data/run-wc
 Environment=POLYTAPE_UNIT=polytape
-Environment=POLYTAPE_ENV_FILE=/etc/polytape/polytape.env
+# Read heartbeat-armed state from the salt-free heartbeat.env, NOT polytape.env.
+Environment=POLYTAPE_ENV_FILE=/etc/polytape/heartbeat.env
 Environment=POLYTAPE_MATCHES_FILE=/etc/polytape/wc_matches.json
 Environment=POLYTAPE_INTENT_DIR=/run/polytape-admin/intent
 Environment=POLYTAPE_AUDIT_DIR=/var/log/polytape-admin/audit.jsonl
@@ -59,6 +61,8 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/run/polytape-admin
 LogsDirectory=polytape-admin
+LogsDirectoryMode=0700
+UMask=0077
 ProtectHome=true
 PrivateTmp=true
 

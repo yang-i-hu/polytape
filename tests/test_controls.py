@@ -80,6 +80,28 @@ def test_rate_limiter_min_interval_per_action():
     assert rl.allow("refresh", 30.0)  # independent per action
 
 
+def test_login_throttle_locks_out_then_recovers():
+    clock = [0.0]
+    t = control.LoginThrottle(max_fails=3, window_s=60.0, mono=lambda: clock[0])
+    assert not t.locked()
+    t.record_failure()
+    t.record_failure()
+    assert not t.locked()  # 2 < 3
+    t.record_failure()
+    assert t.locked()  # 3rd failure trips the lockout
+    clock[0] = 61.0
+    assert not t.locked()  # lockout window elapsed
+
+
+def test_login_throttle_success_resets_failures():
+    clock = [0.0]
+    t = control.LoginThrottle(max_fails=2, window_s=60.0, mono=lambda: clock[0])
+    t.record_failure()
+    t.record_success()  # clears the counter
+    t.record_failure()
+    assert not t.locked()  # only 1 failure since the reset
+
+
 def test_audit_log_appends_jsonl(tmp_path):
     path = tmp_path / "logs" / "audit.jsonl"  # parent dir created on demand
     a = control.AuditLog(path, now=lambda: "2026-06-19T00:00:00.000000Z")
@@ -218,3 +240,45 @@ def test_endpoint_rate_limited(tmp_path):
             c.post("/api/control/refresh", json={"confirm": "refresh"}).status_code == 429
         )  # too soon
         assert broker.calls == [("refresh", None)]  # only the first dispatched
+
+
+def test_endpoint_rejects_non_json_content_type(tmp_path):
+    # CSRF defense: a text/plain body (what a cross-site form can send) is refused
+    # even with a valid session, so a forged cross-origin POST cannot dispatch.
+    app, broker, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/api/login", json={"token": "s3cr3t"})
+        r = c.post(
+            "/api/control/restart",
+            content='{"confirm": "polytape"}',
+            headers={"content-type": "text/plain"},
+        )
+        assert r.status_code == 415 and broker.calls == []
+
+
+def test_endpoint_login_brute_force_is_throttled(tmp_path):
+    app, _, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        codes = [c.post("/api/login", json={"token": "nope"}).status_code for _ in range(6)]
+    assert 429 in codes  # locks out after repeated failures (no infinite brute force)
+
+
+def test_endpoint_non_dict_body_is_clean_not_500(tmp_path):
+    app, broker, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        assert c.post("/api/login", json=[1, 2, 3]).status_code == 403  # not 500, audited
+        c.post("/api/login", json={"token": "s3cr3t"})
+        assert c.post("/api/control/restart", json=[1, 2, 3]).status_code == 400  # not 500
+        assert broker.calls == []
+
+
+def test_endpoint_session_hides_actions_until_authed(tmp_path):
+    app, _, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        assert c.get("/api/session").json()["actions"] == []  # nothing leaked pre-auth
+        c.post("/api/login", json={"token": "s3cr3t"})
+        assert sorted(c.get("/api/session").json()["actions"]) == [
+            "arm-heartbeat",
+            "refresh",
+            "restart",
+        ]
