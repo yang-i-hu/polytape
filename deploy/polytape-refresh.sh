@@ -36,7 +36,9 @@ fi
 if [ "$NEW_IDS" != "$CUR_IDS" ]; then
     n=$("$PY" -c "import json;print(len(json.load(open('$NEW'))))")
     install -o polytape -g polytape -m 0644 "$NEW" "$CUR"
-    systemctl restart polytape
+    # Serialize the restart against the admin control helper (shared lock) so an
+    # operator action and this timer can never restart the recorder simultaneously.
+    ( flock -w 30 9 && systemctl restart polytape ) 9>/run/polytape-control.lock
     log "open match set changed -> regenerated ($n matches) + restarted polytape"
 else
     log "no change ($(echo "$CUR_IDS" | tr ',' '\n' | grep -c .) matches)"

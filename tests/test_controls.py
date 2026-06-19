@@ -119,3 +119,102 @@ def test_intent_broker_rejects_unknown_action(tmp_path):
     b = control.IntentBroker(tmp_path / "intent")
     with pytest.raises(ValueError):
         b.dispatch("stop")  # not in ACTIONS
+
+
+# --- endpoint-level tests (require fastapi; installed via the dev extra) ------- #
+
+pytest.importorskip("fastapi")
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from polytape.admin.app import create_app  # noqa: E402
+from polytape.admin.reader import RunReader  # noqa: E402
+
+
+class _FakeBroker:
+    """Records dispatch calls instead of writing real intent files / running systemctl."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    def dispatch(self, action: str, *, url: str | None = None) -> None:
+        self.calls.append((action, url))
+
+
+def _reader(tmp_path):
+    (tmp_path / "meta.json").write_text(
+        json.dumps({"started_at": "2026-06-19T00:00:00Z", "events": []}), encoding="utf-8"
+    )
+    return RunReader(tmp_path, env_file=tmp_path / "x.env", matches_file=tmp_path / "x.json")
+
+
+def _app(tmp_path, *, secret="s3cr3t"):
+    broker = _FakeBroker()
+    audit = control.AuditLog(tmp_path / "audit.jsonl")
+    app = create_app(
+        _reader(tmp_path), poll_interval=3600, admin_token=secret, broker=broker, audit=audit
+    )
+    return app, broker, audit
+
+
+def test_endpoint_controls_disabled_without_secret(tmp_path):
+    app = create_app(_reader(tmp_path), poll_interval=3600, admin_token=None, broker=_FakeBroker())
+    with TestClient(app) as c:
+        assert c.get("/api/session").json()["controls_enabled"] is False
+        assert c.post("/api/control/restart", json={"confirm": "polytape"}).status_code == 503
+
+
+def test_endpoint_requires_login_then_succeeds(tmp_path):
+    app, broker, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        assert (
+            c.post("/api/control/restart", json={"confirm": "polytape"}).status_code == 403
+        )  # no login
+        assert c.post("/api/login", json={"token": "nope"}).status_code == 403  # bad secret
+        assert c.post("/api/login", json={"token": "s3cr3t"}).status_code == 200  # good -> cookie
+        assert c.get("/api/session").json()["authed"] is True
+        assert c.post("/api/control/restart", json={}).status_code == 400  # missing confirm
+        r = c.post("/api/control/restart", json={"confirm": "polytape"})
+        assert r.status_code == 200 and r.json()["action"] == "restart"
+        assert broker.calls == [("restart", None)]
+
+
+def test_endpoint_stop_is_unknown_action(tmp_path):
+    app, broker, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/api/login", json={"token": "s3cr3t"})
+        assert c.post("/api/control/stop", json={"confirm": "polytape"}).status_code == 404
+        assert broker.calls == []  # operator-stop is not reachable via the API
+
+
+def test_endpoint_arm_heartbeat_url_validation(tmp_path):
+    app, broker, _ = _app(tmp_path)
+    good = "https://hc-ping.com/abc-123"
+    with TestClient(app) as c:
+        c.post("/api/login", json={"token": "s3cr3t"})
+        assert (
+            c.post(
+                "/api/control/arm-heartbeat", json={"confirm": "arm", "url": "http://x/y"}
+            ).status_code
+            == 400
+        )
+        inj = "https://hc-ping.com/x\nPOLYTAPE_SALT=evil"
+        assert (
+            c.post("/api/control/arm-heartbeat", json={"confirm": "arm", "url": inj}).status_code
+            == 400
+        )
+        r = c.post("/api/control/arm-heartbeat", json={"confirm": "arm", "url": good})
+        assert r.status_code == 200 and broker.calls == [("arm-heartbeat", good)]
+    text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert good not in text and "url_fp" in text  # audit carries a fingerprint, not the URL
+
+
+def test_endpoint_rate_limited(tmp_path):
+    app, broker, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/api/login", json={"token": "s3cr3t"})
+        assert c.post("/api/control/refresh", json={"confirm": "refresh"}).status_code == 200
+        assert (
+            c.post("/api/control/refresh", json={"confirm": "refresh"}).status_code == 429
+        )  # too soon
+        assert broker.calls == [("refresh", None)]  # only the first dispatched

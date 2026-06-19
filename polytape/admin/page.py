@@ -54,11 +54,11 @@ PAGE = """<!doctype html>
 
   <div class="controls">
     <button id="livebtn" style="cursor:pointer;opacity:1" onclick="toggleLive()">&#9654; live tail</button>
-    <button title="needs security sign-off" disabled>restart</button>
-    <button title="needs security sign-off" disabled>refresh match set</button>
-    <button title="needs security sign-off" disabled>arm heartbeat</button>
-    <button title="needs security sign-off" disabled>stop</button>
-    <span class="note">live tail is read-only &middot; mutating controls pending security sign-off</span>
+    <button id="ctl-restart" onclick="askControl('restart')" disabled>restart</button>
+    <button id="ctl-refresh" onclick="askControl('refresh')" disabled>refresh match set</button>
+    <button id="ctl-arm-heartbeat" onclick="askControl('arm-heartbeat')" disabled>arm heartbeat</button>
+    <button id="authbtn" style="display:none;cursor:pointer;opacity:1" onclick="authClick()">log in</button>
+    <span class="note" id="ctlnote">checking controls&hellip;</span>
   </div>
 
   <h2 id="mtitle">matches</h2>
@@ -70,6 +70,7 @@ PAGE = """<!doctype html>
   <div id="preview" style="display:none;margin-top:18px"></div>
   <div id="live" style="display:none;margin-top:18px"></div>
 </div>
+<div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10;align-items:center;justify-content:center"></div>
 
 <script>
 const n = x => (x==null?'—':x.toLocaleString());
@@ -137,6 +138,65 @@ function renderLive(d){
     '<table><thead><tr><th style="width:16%">age</th><th style="width:16%">stream</th><th style="width:28%">kind</th><th>match</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
+// --- guarded controls: session state + typed-confirm modal -----------------
+var SESSION={controls_enabled:false,authed:false,actions:[]};
+async function refreshSession(){
+  try{ SESSION=await fetch('/api/session').then(function(r){return r.json();}); }
+  catch(e){ SESSION={controls_enabled:false,authed:false,actions:[]}; }
+  var on=SESSION.controls_enabled, authed=SESSION.authed;
+  ['restart','refresh','arm-heartbeat'].forEach(function(a){
+    var b=document.getElementById('ctl-'+a); if(!b) return;
+    var en=on&&authed; b.disabled=!en; b.style.cursor=en?'pointer':'not-allowed'; b.style.opacity=en?'1':'.6';
+  });
+  var ab=document.getElementById('authbtn');
+  ab.style.display=on?'inline-block':'none'; ab.textContent=authed?'log out':'log in';
+  document.getElementById('ctlnote').textContent =
+    !on ? 'controls disabled — no admin secret configured'
+    : authed ? 'controls unlocked · every action is audited'
+    : 'controls locked — log in to enable';
+}
+function authClick(){
+  if(SESSION.authed){ fetch('/api/logout',{method:'POST'}).then(refreshSession); return; }
+  var t=prompt('Admin secret:'); if(!t) return;
+  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})})
+    .then(function(r){ if(!r.ok) alert('login failed'); return refreshSession(); });
+}
+function closeModal(){ var m=document.getElementById('modal'); m.style.display='none'; m.innerHTML=''; }
+var CONFIRM={restart:'polytape',refresh:'refresh','arm-heartbeat':'arm'};
+var WARN={
+  restart:'Restart drops the live sockets briefly — the order-book gap during reconnect is permanent (book does not backfill).',
+  refresh:'Re-discovers the open match set; restarts the recorder only if the set changed.',
+  'arm-heartbeat':'Writes POLYTAPE_HEARTBEAT_URL into the recorder env and restarts it.'
+};
+function askControl(action){
+  if(!SESSION.authed){ alert('log in first'); return; }
+  var needsUrl=(action==='arm-heartbeat'), phrase=CONFIRM[action];
+  var m=document.getElementById('modal');
+  m.innerHTML='<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:430px;width:90%">'+
+    '<div style="font-weight:600;font-size:16px;margin-bottom:8px">'+action+'</div>'+
+    '<div style="color:var(--muted);font-size:13px;margin-bottom:12px">'+WARN[action]+'</div>'+
+    (needsUrl?'<input id="m-url" placeholder="https://hc-ping.com/…" style="width:100%;padding:8px;margin-bottom:8px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font:inherit">':'')+
+    '<div style="color:var(--muted);font-size:13px;margin-bottom:6px">type <b style="color:var(--text)">'+phrase+'</b> to confirm</div>'+
+    '<input id="m-confirm" autocomplete="off" style="width:100%;padding:8px;margin-bottom:12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font:inherit">'+
+    '<div style="display:flex;gap:8px;justify-content:flex-end"><button id="m-cancel" style="cursor:pointer;opacity:1">cancel</button>'+
+    '<button id="m-go" style="cursor:pointer;opacity:1;background:var(--blue);color:#0b0d12;border-color:var(--blue);font-weight:600">confirm</button></div>'+
+    '<div id="m-err" class="bad" style="font-size:12px;margin-top:8px"></div></div>';
+  m.style.display='flex';
+  document.getElementById('m-cancel').onclick=closeModal;
+  document.getElementById('m-go').onclick=function(){ submitControl(action, needsUrl); };
+  setTimeout(function(){ var f=document.getElementById(needsUrl?'m-url':'m-confirm'); if(f) f.focus(); },40);
+}
+async function submitControl(action,needsUrl){
+  var body={confirm:(document.getElementById('m-confirm')||{}).value||''};
+  if(needsUrl) body.url=(document.getElementById('m-url')||{}).value||'';
+  try{
+    var r=await fetch('/api/control/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var d=await r.json().catch(function(){return {};});
+    if(r.ok){ closeModal(); refreshSession(); }
+    else { var e=document.getElementById('m-err'); if(e) e.textContent=d.error||('error '+r.status); }
+  }catch(e){ var el=document.getElementById('m-err'); if(el) el.textContent='request failed'; }
+}
+
 async function tick(){
   try{
     const [st, ms] = await Promise.all([
@@ -177,6 +237,7 @@ async function tick(){
 }
 document.getElementById('rows').onclick=function(e){ var tr=e.target.closest('tr'); if(tr&&tr.dataset.eid) openMatch(tr.dataset.eid); };
 tick(); setInterval(tick, 3000);
+refreshSession(); setInterval(refreshSession, 20000);
 </script>
 </body>
 </html>

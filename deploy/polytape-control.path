@@ -1,0 +1,14 @@
+# Watches the admin's intent spool and triggers the root control helper.
+# The unprivileged polytape-admin sidecar drops an allow-listed file into
+# /run/polytape-admin/intent/; this fires polytape-control.service (root), which
+# re-validates and acts. This is the NNP-safe privilege bridge: no sudo, and the
+# admin unit keeps NoNewPrivileges=true.
+[Unit]
+Description=Watch polytape admin control intents
+
+[Path]
+DirectoryNotEmpty=/run/polytape-admin/intent
+Unit=polytape-control.service
+
+[Install]
+WantedBy=multi-user.target
