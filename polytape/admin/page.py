@@ -66,6 +66,7 @@ PAGE = """<!doctype html>
     <tbody id="rows"><tr><td colspan="6" style="color:var(--dim)">loading…</td></tr></tbody>
   </table>
   <div class="footer" id="footer"></div>
+  <div id="preview" style="display:none;margin-top:18px"></div>
 </div>
 
 <script>
@@ -73,6 +74,32 @@ const n = x => (x==null?'—':x.toLocaleString());
 function age(s){ if(s==null) return '—'; if(s<1) return Math.round(s*1000)+'ms';
   if(s<90) return Math.round(s)+'s'; if(s<5400) return Math.round(s/60)+'m'; return Math.round(s/3600)+'h'; }
 function freshClass(s){ if(s==null) return 'bad'; if(s<=60) return 'ok'; if(s<=600) return 'warn'; return 'bad'; }
+function fmt(x){ return x==null?'—':(+x).toFixed(3); }
+function ladder(levels,col){ var ls=(levels&&levels.length)?levels:[]; return ls.map(function(l){
+  return '<div style="display:flex;justify-content:space-between;color:'+col+'"><span>'+fmt(l.price)+'</span><span>'+l.size+'</span></div>'; }).join('') || '<div style="color:var(--dim)">—</div>'; }
+function spark(h){ if(!h||h.length<2) return '<div style="height:46px"></div>';
+  var ps=h.map(function(d){return d.p;}); var mn=Math.min.apply(null,ps),mx=Math.max.apply(null,ps),rg=(mx-mn)||1;
+  var pts=h.map(function(d,i){ return (2+i/(h.length-1)*236).toFixed(1)+','+(42-((d.p-mn)/rg)*38).toFixed(1); }).join(' ');
+  return '<svg viewBox="0 0 240 46" width="100%" height="46" preserveAspectRatio="none"><polyline fill="none" stroke="var(--green)" stroke-width="1.5" points="'+pts+'"/></svg>'; }
+function closePreview(){ document.getElementById('preview').style.display='none'; }
+function renderPreview(m){
+  var cards=m.markets.map(function(mk){ return '<div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 12px">'+
+    '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px"><span style="font-weight:500">'+mk.label+'</span><span style="font-family:var(--mono);font-size:18px">'+fmt(mk.mid)+'</span></div>'+
+    spark(mk.price_hist)+
+    '<div style="font-family:var(--mono);font-size:12px;margin-top:6px">'+ladder((mk.asks||[]).slice(0,3).reverse(),'var(--red)')+
+    '<div style="border-top:1px solid var(--border);border-bottom:1px solid var(--border);color:var(--muted);padding:2px 0;display:flex;justify-content:space-between"><span>mid</span><span>'+fmt(mk.mid)+'</span></div>'+
+    ladder((mk.bids||[]).slice(0,3),'var(--green)')+'</div>'+
+    (mk.last_trade?'<div style="font-size:11px;color:var(--dim);margin-top:6px">last '+fmt(mk.last_trade.price)+' × '+mk.last_trade.size+'</div>':'')+
+    '</div>'; }).join('');
+  return '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-weight:500;font-size:16px">'+m.title+'  <span class="sub">'+(m.date||'')+'</span></span><button style="cursor:pointer;opacity:1" onclick="closePreview()">close</button></div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px">'+cards+'</div>';
+}
+async function openMatch(id){
+  var el=document.getElementById('preview'); el.style.display='block';
+  el.innerHTML='<div style="color:var(--muted)">loading preview…</div>';
+  try{ var m=await fetch('/api/matches/'+id).then(function(r){return r.json();}); el.innerHTML=renderPreview(m); }
+  catch(e){ el.innerHTML='<div class="bad">failed to load preview</div>'; }
+}
 
 async function tick(){
   try{
@@ -100,7 +127,7 @@ async function tick(){
 
     document.getElementById('mtitle').textContent = 'matches · '+ms.length+' open';
     document.getElementById('rows').innerHTML = ms.map(m=>
-      '<tr><td>'+m.title+'</td><td class="num">'+(m.date||'—')+'</td>'+
+      '<tr data-eid="'+m.event_id+'" style="cursor:pointer"><td>'+m.title+'</td><td class="num">'+(m.date||'—')+'</td>'+
       '<td class="num">'+n(m.counts?.book||0)+'</td>'+
       '<td class="num">'+n(m.counts?.comments||0)+'</td>'+
       '<td class="num '+freshClass(m.last_seen_age_s)+'">'+age(m.last_seen_age_s)+'</td>'+
@@ -112,6 +139,7 @@ async function tick(){
     document.getElementById('recdot').style.background = 'var(--red)';
   }
 }
+document.getElementById('rows').onclick=function(e){ var tr=e.target.closest('tr'); if(tr&&tr.dataset.eid) openMatch(tr.dataset.eid); };
 tick(); setInterval(tick, 3000);
 </script>
 </body>

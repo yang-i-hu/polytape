@@ -61,6 +61,10 @@ def create_app(reader: RunReader, *, poll_interval: float = 2.0):
     async def matches() -> JSONResponse:
         return JSONResponse(reader.matches())
 
+    @app.get("/api/matches/{event_id}")
+    async def match(event_id: str) -> JSONResponse:
+        return JSONResponse(reader.match_view(event_id))
+
     return app
 
 

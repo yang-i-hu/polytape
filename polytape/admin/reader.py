@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -47,13 +48,17 @@ class RunReader:
         *,
         unit: str = "polytape",
         env_file: str | Path = "/etc/polytape/polytape.env",
+        matches_file: str | Path = "/etc/polytape/wc_matches.json",
         live_window_s: float = 60.0,
+        price_history: int = 120,
         now: Callable[[], str] = utc_now_iso,
     ) -> None:
         self._dir = Path(run_dir)
         self._unit = unit
         self._env_file = Path(env_file)
+        self._matches_file = Path(matches_file)
         self._live_window = live_window_s
+        self._price_history = price_history
         self._now = now
         self._offsets: dict[str, int] = {}
         self._counts: dict[str, int] = {"comments": 0, "book": 0}
@@ -67,6 +72,16 @@ class RunReader:
         self._event_ids: list[str] = []
         self._markets_total: set[str] = set()
         self._started_at: str | None = None
+        # Per-market metadata: condition id -> yes token; token -> condition id;
+        # event -> its condition ids; condition id -> outcome label (from labels file).
+        self._market_yes: dict[str, str] = {}
+        self._asset_cond: dict[str, str] = {}
+        self._event_conds: dict[str, list[str]] = {}
+        self._market_label: dict[str, str] = {}
+        # Reconstructed L2 book + last trade + price history, keyed by token (asset_id).
+        self._book: dict[str, dict[str, dict[str, str]]] = {}
+        self._last_trade: dict[str, dict[str, Any]] = {}
+        self._price_hist: dict[str, deque] = {}
 
     # -- file helpers ------------------------------------------------------- #
 
@@ -84,18 +99,50 @@ class RunReader:
         date: dict[str, str | None] = {}
         ids: list[str] = []
         markets: set[str] = set()
+        yes: dict[str, str] = {}
+        asset_cond: dict[str, str] = {}
+        event_conds: dict[str, list[str]] = {}
         for event in meta.get("events") or []:
             eid = str(event.get("id"))
             ids.append(eid)
             title[eid] = (event.get("title") or "").strip()
             date[eid] = _slug_date(event.get("slug"))
+            conds: list[str] = []
             for market in event.get("markets") or []:
                 cond = market.get("conditionId")
-                if cond:
-                    cond2event[cond] = eid
-                    markets.add(cond)
+                if not cond:
+                    continue
+                cond2event[cond] = eid
+                markets.add(cond)
+                conds.append(cond)
+                tokens = [str(t) for t in (market.get("clobTokenIds") or [])]
+                if tokens:
+                    yes[cond] = tokens[0]  # [0] = YES token (probability of the outcome)
+                for tok in tokens:
+                    asset_cond[tok] = cond
+            event_conds[eid] = conds
         self._cond2event, self._event_title, self._event_date = cond2event, title, date
         self._event_ids, self._markets_total = ids, markets
+        self._market_yes, self._asset_cond, self._event_conds = yes, asset_cond, event_conds
+
+    def _load_labels(self) -> None:
+        """Outcome labels (e.g. 'Brazil', 'Draw') per condition id, from the matches file.
+
+        Best-effort: meta.json carries the markets but not the human label, so we pull
+        ``groupItemTitle`` from the discovery file. Missing file -> labels fall back to
+        a short condition id.
+        """
+        try:
+            data = json.loads(self._matches_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        labels: dict[str, str] = {}
+        for match in data:
+            for market in match.get("moneyline_markets") or []:
+                cond = market.get("conditionId")
+                if cond:
+                    labels[cond] = market.get("groupItemTitle") or cond
+        self._market_label = labels
 
     def _consume(self, stream: str, event_of: Callable[[dict[str, Any]], str | None]) -> None:
         path = self._file(stream)
@@ -139,12 +186,96 @@ class RunReader:
                 market = raw.get("market")
                 if market:
                     self._markets_seen.add(str(market))
+                self._apply_book(raw, rec.get("ts_recv"))
+
+    def _apply_book(self, raw: dict[str, Any], ts: str | None) -> None:
+        """Reconstruct the per-token L2 book / last trade / price series from a record."""
+        et = raw.get("event_type")
+        if et == "book":  # full snapshot replaces the token's book
+            asset = str(raw.get("asset_id"))
+            self._book[asset] = {
+                "bids": {
+                    str(lvl.get("price")): str(lvl.get("size"))
+                    for lvl in raw.get("bids") or []
+                    if str(lvl.get("size")) != "0"
+                },
+                "asks": {
+                    str(lvl.get("price")): str(lvl.get("size"))
+                    for lvl in raw.get("asks") or []
+                    if str(lvl.get("size")) != "0"
+                },
+            }
+        elif et == "price_change":  # per-level delta (size 0 removes the level)
+            for change in raw.get("price_changes") or []:
+                asset = str(change.get("asset_id"))
+                side = "bids" if change.get("side") == "BUY" else "asks"
+                book = self._book.setdefault(asset, {"bids": {}, "asks": {}})
+                price, size = str(change.get("price")), str(change.get("size"))
+                if size == "0":
+                    book[side].pop(price, None)
+                else:
+                    book[side][price] = size
+        elif et == "last_trade_price":
+            asset = str(raw.get("asset_id"))
+            self._last_trade[asset] = {
+                "price": raw.get("price"),
+                "size": raw.get("size"),
+                "side": raw.get("side"),
+                "ts": ts,
+            }
+            try:
+                price = float(raw.get("price"))
+            except (TypeError, ValueError):
+                return
+            self._price_hist.setdefault(asset, deque(maxlen=self._price_history)).append(
+                (ts, price)
+            )
 
     def update(self) -> None:
-        """Refresh meta + ingest any newly-appended JSONL records."""
+        """Refresh meta + labels, then ingest any newly-appended JSONL records."""
         self._load_meta()
+        self._load_labels()
         self._consume("book", lambda raw: self._cond2event.get(str(raw.get("market"))))
         self._consume("comments", _comment_event)
+
+    def match_view(self, event_id: str) -> dict[str, Any]:
+        """Reconstructed preview for one match: each outcome's book, last trade, price line."""
+        event_id = str(event_id)
+        markets: list[dict[str, Any]] = []
+        for cond in self._event_conds.get(event_id, []):
+            token = self._market_yes.get(cond, "")
+            book = self._book.get(token, {"bids": {}, "asks": {}})
+            bids = sorted(((float(p), float(s)) for p, s in book["bids"].items()), reverse=True)[:8]
+            asks = sorted((float(p), float(s)) for p, s in book["asks"].items())[:8]
+            best_bid = bids[0][0] if bids else None
+            best_ask = asks[0][0] if asks else None
+            if best_bid is not None and best_ask is not None:
+                mid: float | None = round((best_bid + best_ask) / 2, 4)
+            else:
+                mid = best_bid if best_bid is not None else best_ask
+            hist = list(self._price_hist.get(token, ()))
+            if len(hist) > 60:  # downsample for the sparkline
+                step = len(hist) // 60 + 1
+                hist = hist[::step]
+            markets.append(
+                {
+                    "conditionId": cond,
+                    "label": self._market_label.get(cond, cond[:10]),
+                    "mid": mid,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "bids": [{"price": round(p, 4), "size": round(s, 2)} for p, s in bids],
+                    "asks": [{"price": round(p, 4), "size": round(s, 2)} for p, s in asks],
+                    "last_trade": self._last_trade.get(token),
+                    "price_hist": [{"t": t, "p": round(p, 4)} for t, p in hist],
+                }
+            )
+        return {
+            "event_id": event_id,
+            "title": self._event_title.get(event_id, event_id),
+            "date": self._event_date.get(event_id),
+            "markets": markets,
+        }
 
     # -- environment probes (best-effort; degrade gracefully) --------------- #
 

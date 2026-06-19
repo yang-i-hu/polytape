@@ -126,3 +126,77 @@ def test_heartbeat_armed_from_env_file(tmp_path):
     assert RunReader(tmp_path, env_file=env).status()["heartbeat_armed"] is True
     env.write_text("POLYTAPE_SALT=s\n", encoding="utf-8")
     assert RunReader(tmp_path, env_file=env).status()["heartbeat_armed"] is False
+
+
+def test_match_view_reconstructs_book(tmp_path):
+    meta = {
+        "started_at": "2026-06-19T16:20:00.000000Z",
+        "events": [
+            {
+                "id": "1001",
+                "title": "A vs. B",
+                "slug": "fifwc-a-b-2026-06-19",
+                "markets": [{"id": "m", "conditionId": "0xA1", "clobTokenIds": ["YT", "NT"]}],
+            }
+        ],
+    }
+    (tmp_path / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    def rec(i, raw):
+        ts = utc_now_iso()
+        return {"stream": "book", "id": str(i), "ts_recv": ts, "ts_server": ts, "raw": raw}
+
+    recs = [
+        rec(
+            0,
+            {
+                "event_type": "book",
+                "market": "0xA1",
+                "asset_id": "YT",
+                "bids": [{"price": "0.88", "size": "100"}, {"price": "0.87", "size": "50"}],
+                "asks": [{"price": "0.92", "size": "80"}],
+            },
+        ),
+        rec(
+            1,
+            {
+                "event_type": "price_change",
+                "market": "0xA1",
+                "price_changes": [{"asset_id": "YT", "price": "0.89", "size": "40", "side": "BUY"}],
+            },
+        ),
+        rec(
+            2,
+            {
+                "event_type": "price_change",
+                "market": "0xA1",
+                "price_changes": [{"asset_id": "YT", "price": "0.87", "size": "0", "side": "BUY"}],
+            },
+        ),
+        rec(
+            3,
+            {
+                "event_type": "last_trade_price",
+                "market": "0xA1",
+                "asset_id": "YT",
+                "price": "0.905",
+                "size": "10",
+                "side": "BUY",
+            },
+        ),
+    ]
+    _write_jsonl(tmp_path / "book.jsonl", recs)
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    r = RunReader(tmp_path, env_file=tmp_path / "x.env", matches_file=tmp_path / "x.json")
+    r.update()
+    view = r.match_view("1001")
+    assert view["title"] == "A vs. B"
+    mk = view["markets"][0]
+    assert mk["best_bid"] == 0.89 and mk["best_ask"] == 0.92 and mk["mid"] == 0.905
+    prices = [b["price"] for b in mk["bids"]]
+    assert (
+        0.89 in prices and 0.88 in prices and 0.87 not in prices
+    )  # delta added 0.89, removed 0.87
+    assert mk["asks"][0]["price"] == 0.92
+    assert mk["last_trade"]["price"] == "0.905"
+    assert len(mk["price_hist"]) == 1 and mk["price_hist"][0]["p"] == 0.905
