@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -67,17 +68,28 @@ class CaptureWriter:
         config: Config,
         *,
         event_info: EventInfo | None = None,
+        event_infos: Sequence[EventInfo] | None = None,
         hasher: Hasher | None = None,
         now: Any = utc_now_iso,
     ) -> None:
         self._config = config
-        self._event_info = event_info
+        if event_infos is not None:
+            self._event_infos = tuple(event_infos)
+        elif event_info is not None:
+            self._event_infos = (event_info,)
+        else:
+            self._event_infos = ()
+        # Primary event kept for back-compat single-event meta fields.
+        self._event_info = self._event_infos[0] if self._event_infos else None
         self._hasher = hasher
         self._now = now
         self._dir: Path = config.event_dir
         self._files: dict[str, TextIO] = {}
         self._seen: dict[str, OrderedDict[str, None]] = {}
         self._counts: dict[str, int] = {}
+        # Per-event, per-stream written counts (multi-event runs). Records still go
+        # to the shared per-stream files; this is just accounting for meta.json.
+        self._counts_by_event: dict[str, dict[str, int]] = {}
         self._gaps: list[dict[str, Any]] = []
         self._started_at: str | None = None
         self._stopped_at: str | None = None
@@ -133,10 +145,20 @@ class CaptureWriter:
 
     # -- writing ------------------------------------------------------------ #
 
-    def write(self, stream: str, raw: dict[str, Any]) -> bool:
-        """Envelope and write a raw message. Returns ``False`` if it was a duplicate."""
+    def write(self, stream: str, raw: dict[str, Any], *, event_id: str | None = None) -> bool:
+        """Envelope and write a raw message. Returns ``False`` if it was a duplicate.
+
+        ``event_id`` (keyword-only, optional) attributes the message to an event for
+        per-event counts in ``meta.json``. It is **not** stored in the envelope — the
+        record stays the documented 5-key shape; the event is recoverable from
+        ``raw`` (``parentEntityID`` for comments, ``market`` for book).
+        """
         envelope = build_envelope(stream, raw, hasher=self._hasher, ts_recv=self._now())
-        return self.write_envelope(envelope)
+        wrote = self.write_envelope(envelope)
+        if wrote and event_id is not None:
+            per_event = self._counts_by_event.setdefault(str(event_id), {})
+            per_event[stream] = per_event.get(stream, 0) + 1
+        return wrote
 
     def write_envelope(self, envelope: dict[str, Any]) -> bool:
         """Write a pre-built envelope, de-duplicating by id within the stream."""
@@ -202,10 +224,8 @@ class CaptureWriter:
 
     # -- meta.json ---------------------------------------------------------- #
 
-    def _event_snapshot(self) -> dict[str, Any] | None:
-        event = self._event_info
-        if event is None:
-            return None
+    @staticmethod
+    def _snapshot(event: EventInfo) -> dict[str, Any]:
         return {
             "id": event.event_id,
             "title": event.title,
@@ -216,13 +236,17 @@ class CaptureWriter:
             ],
         }
 
+    def _event_snapshot(self) -> dict[str, Any] | None:
+        return self._snapshot(self._event_info) if self._event_info else None
+
     def _meta(self) -> dict[str, Any]:
-        event = self._event_info
         return {
             "polytape_version": __version__,
             "event_id": self._config.event_id,
-            "market_ids": list(event.condition_ids) if event else [],
-            "clob_token_ids": list(event.clob_token_ids) if event else [],
+            "event_ids": list(self._config.event_ids),
+            "run_name": self._config.run_name,
+            "market_ids": [c for e in self._event_infos for c in e.condition_ids],
+            "clob_token_ids": [t for e in self._event_infos for t in e.clob_token_ids],
             "streams": list(self._config.enabled_streams),
             "out_dir": self._dir.as_posix(),
             "hashing": {
@@ -232,7 +256,9 @@ class CaptureWriter:
             "started_at": self._started_at,
             "stopped_at": self._stopped_at,
             "counts": dict(self._counts),
+            "counts_by_event": {k: dict(v) for k, v in self._counts_by_event.items()},
             "event": self._event_snapshot(),
+            "events": [self._snapshot(e) for e in self._event_infos],
             "gaps": list(self._gaps),
         }
 

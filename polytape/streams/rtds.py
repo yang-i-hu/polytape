@@ -61,7 +61,13 @@ class CommentStream(WebSocketStream):
     stream = STREAM_COMMENTS
 
     def __init__(
-        self, *, event_id: str | int, writer: Any, connect: Any = None, on_activity: Any = None
+        self,
+        *,
+        event_id: str | int | None = None,
+        event_ids: set[str] | None = None,
+        writer: Any,
+        connect: Any = None,
+        on_activity: Any = None,
     ) -> None:
         kwargs: dict[str, Any] = {}
         if connect is not None:
@@ -76,9 +82,27 @@ class CommentStream(WebSocketStream):
             read_timeout=_READ_TIMEOUT,
             **kwargs,
         )
-        self.event_id = str(event_id)
-        self.last_comment_id: str | None = None
-        self._known_comment_ids: set[str] = set()
+        ids = (
+            event_ids if event_ids is not None else ({event_id} if event_id is not None else set())
+        )
+        self.event_ids: set[str] = {str(e) for e in ids}
+        # Primary id (single-event convenience / back-compat); None for multi-event.
+        self.event_id: str | None = next(iter(self.event_ids)) if len(self.event_ids) == 1 else None
+        # Per-event backfill cursor: latest comment id seen for each event.
+        self._last_comment_id: dict[str, str] = {}
+        # commentID -> event id, so reactions (which carry no parentEntityID) route.
+        self._comment_to_event: dict[str, str] = {}
+
+    @property
+    def last_comment_id(self) -> str | None:
+        """Backfill cursor for a single-event stream (``None`` for multi-event)."""
+        if len(self.event_ids) == 1:
+            return self._last_comment_id.get(next(iter(self.event_ids)))
+        return None
+
+    def last_comment_id_for(self, event_id: str) -> str | None:
+        """Backfill cursor for a specific event (used by the multi-event backfill)."""
+        return self._last_comment_id.get(str(event_id))
 
     def subscribe_frames(self) -> list[str]:
         return [comment_subscribe_frame()]
@@ -89,27 +113,43 @@ class CommentStream(WebSocketStream):
         return payload if isinstance(payload, dict) else raw
 
     def should_record(self, raw: dict[str, Any]) -> bool:
-        """Keep only this event's comments/reactions from the firehose.
+        """Keep only this run's events' comments/reactions from the firehose.
 
-        Comments are matched by ``parentEntityID``. Reactions carry no
-        ``parentEntityID``, so they are matched by ``commentID`` against the
-        comments already seen this session (reactions to comments we never saw,
-        e.g. older ones, are not attributable and are dropped).
+        Comments are matched by ``parentEntityID`` against the SET of recorded
+        events. Reactions carry no ``parentEntityID``, so they are matched by
+        ``commentID`` against comments already seen this session (reactions to
+        comments we never saw are not attributable and are dropped).
         """
         core = self._core(raw)
         parent = core.get("parentEntityID")
         if parent is not None:
-            return str(parent) == self.event_id
+            return str(parent) in self.event_ids
         comment_id = core.get("commentID")
         if comment_id is not None:
-            return str(comment_id) in self._known_comment_ids
+            return str(comment_id) in self._comment_to_event
         return False
 
+    def resolve_event_id(self, raw: dict[str, Any]) -> str | None:
+        """Event id for a message: ``parentEntityID`` (comment); a reaction routes
+        via the ``commentID`` -> event map seeded by comments seen this session."""
+        core = self._core(raw)
+        parent = core.get("parentEntityID")
+        if parent is not None:
+            return str(parent)
+        comment_id = core.get("commentID")
+        if comment_id is not None:
+            return self._comment_to_event.get(str(comment_id))
+        return None
+
     def on_written(self, raw: dict[str, Any]) -> None:
-        """Track the latest comment id (backfill cursor) and seen comment ids."""
+        """Advance the per-event cursor and seed reaction attribution for a comment."""
         if raw.get("type", "").startswith("reaction"):
             return  # reactions don't move the cursor or seed attribution
-        cid = self._core(raw).get("id")
-        if cid is not None:
-            self.last_comment_id = str(cid)
-            self._known_comment_ids.add(str(cid))
+        core = self._core(raw)
+        cid = core.get("id")
+        parent = core.get("parentEntityID")
+        if cid is None or parent is None:
+            return
+        event_id = str(parent)
+        self._last_comment_id[event_id] = str(cid)
+        self._comment_to_event[str(cid)] = event_id

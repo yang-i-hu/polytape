@@ -107,6 +107,15 @@ class WebSocketStream:
     def on_written(self, raw: dict[str, Any]) -> None:
         """Hook invoked after a *new* (non-duplicate) message is written."""
 
+    def resolve_event_id(self, raw: dict[str, Any]) -> str | None:
+        """Return the event id a message belongs to, for per-event accounting.
+
+        Default ``None`` (single-event / untagged). The comment stream returns the
+        ``parentEntityID`` (or a reaction's resolved event); the book stream maps
+        the top-level ``market`` (condition id) to its event.
+        """
+        return None
+
     # -- message decoding -------------------------------------------------- #
 
     def decode(self, message: str | bytes) -> list[dict[str, Any]]:
@@ -179,7 +188,7 @@ class WebSocketStream:
                     for raw in self.decode(message):
                         if not self.should_record(raw):
                             continue
-                        if self.writer.write(self.stream, raw):
+                        if self.writer.write(self.stream, raw, event_id=self.resolve_event_id(raw)):
                             self.on_written(raw)
             except websockets.ConnectionClosedOK:
                 pass  # clean close -> return normally (supervisor logs "session ended")

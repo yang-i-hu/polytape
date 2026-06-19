@@ -18,11 +18,15 @@ class _Recorder:
 
     def __init__(self, *, stop_after, raises=False):
         self.event_id = "20200"
+        self.event_ids = {"20200"}
         self.last_comment_id = None
         self.calls = 0
         self.sup: StreamSupervisor | None = None
         self._stop_after = stop_after
         self._raises = raises
+
+    def last_comment_id_for(self, event_id):
+        return self.last_comment_id
 
     async def run_once(self, *, on_connect=None):
         self.calls += 1
@@ -99,8 +103,10 @@ async def test_comment_backfill_dedups_overlap(make_config):
 
         class _Stream:
             stream = "comments"
-            event_id = "20200"
-            last_comment_id = "live1"
+            event_ids = {"20200"}
+
+            def last_comment_id_for(self, event_id):
+                return "live1"
 
         class _Gamma:
             async def backfill_since(self, event_id, last):

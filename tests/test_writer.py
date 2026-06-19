@@ -137,3 +137,20 @@ def test_seen_set_is_bounded(make_config, monkeypatch):
         assert w.write("comments", {"payload": {"id": "c0"}}) is True
         # a still-recent id is correctly rejected as a duplicate
         assert w.write("comments", {"payload": {"id": "c4"}}) is False
+
+
+def test_multi_event_counts_and_envelope_shape(make_config):
+    cfg = make_config()
+    with CaptureWriter(cfg) as w:
+        assert w.write("comments", {"payload": {"id": "a"}}, event_id="1001") is True
+        assert w.write("comments", {"payload": {"id": "b"}}, event_id="1002") is True
+        assert w.write("book", {"event_type": "book", "hash": "0xH"}, event_id="1001") is True
+    rec = json.loads(_read(cfg.event_dir / "comments.jsonl")[0])
+    # the documented 5-key envelope contract survives the multi-event path
+    assert set(rec) == {"stream", "id", "ts_recv", "ts_server", "raw"}
+    meta = json.loads((cfg.event_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["counts"] == {"comments": 2, "book": 1}
+    assert meta["counts_by_event"] == {
+        "1001": {"comments": 1, "book": 1},
+        "1002": {"comments": 1},
+    }

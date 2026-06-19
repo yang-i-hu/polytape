@@ -161,11 +161,14 @@ def make_comment_backfill(
     """
 
     async def _backfill() -> int:
-        missed = await gamma.backfill_since(stream.event_id, stream.last_comment_id)
         count = 0
-        for comment in missed:
-            if writer.write(stream.stream, comment):
-                count += 1
+        # One firehose, N events: page each event from its own cursor and tag the
+        # recovered comments with that event id (dedup guards against overlap).
+        for event_id in stream.event_ids:
+            missed = await gamma.backfill_since(event_id, stream.last_comment_id_for(event_id))
+            for comment in missed:
+                if writer.write(stream.stream, comment, event_id=event_id):
+                    count += 1
         if count:
             logger.info("%s: backfilled %d missed comment(s)", stream.stream, count)
         return count

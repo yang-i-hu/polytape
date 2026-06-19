@@ -40,7 +40,9 @@ PAGE_DELAY = 0.25
 
 def _get(path: str, params: dict[str, object]) -> object:
     url = f"{GAMMA}{path}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    req = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+    )
     with urllib.request.urlopen(req, timeout=40) as resp:
         return json.load(resp)
 
@@ -72,7 +74,12 @@ def fetch_all_events(closed: bool) -> list[dict]:
         batch = _as_list(
             _get(
                 "/events",
-                {"tag_slug": TAG_SLUG, "closed": str(closed).lower(), "limit": PAGE, "offset": offset},
+                {
+                    "tag_slug": TAG_SLUG,
+                    "closed": str(closed).lower(),
+                    "limit": PAGE,
+                    "offset": offset,
+                },
             )
         )
         if not batch:
@@ -129,8 +136,12 @@ def extract_match(ev: dict) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="List World Cup match (win/tie/lose) events.")
-    ap.add_argument("--out", default="wc_matches.json", help="Output JSON path (default: wc_matches.json)")
-    ap.add_argument("--open-only", action="store_true", help="Only open events (skip closed/resolved)")
+    ap.add_argument(
+        "--out", default="wc_matches.json", help="Output JSON path (default: wc_matches.json)"
+    )
+    ap.add_argument(
+        "--open-only", action="store_true", help="Only open events (skip closed/resolved)"
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -163,7 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 64)
     for m in matches:
         status = "closed" if m["closed"] else ("active" if m["active"] else "open")
-        print(f"{(m['match_date'] or '?'):<12} {status:<8} {len(m['moneyline_markets']):>4}  {m['title']}")
+        n_mkt = len(m["moneyline_markets"])
+        print(f"{(m['match_date'] or '?'):<12} {status:<8} {n_mkt:>4}  {m['title']}")
     return 0
 
 
