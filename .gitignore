@@ -1,6 +1,9 @@
 # Captured recordings — never commit data
 data/
 
+# Generated snapshot of live Polymarket data (regenerable via scripts/list_wc_matches.py)
+wc_matches.json
+
 # Claude Code (personal / machine-specific — keep out of version control)
 .claude/settings.local.json
 CLAUDE.local.md
