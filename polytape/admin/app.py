@@ -1,9 +1,11 @@
 """FastAPI sidecar serving the read-only polytape admin dashboard.
 
-Endpoints (all read-only in this phase):
-- ``GET /``            -> the dashboard page
-- ``GET /api/status``  -> recorder health, freshness, coverage, disk, counts
-- ``GET /api/matches`` -> per-match counts, recency, and live/quiet status
+Endpoints (all read-only):
+- ``GET /``                    -> the dashboard page
+- ``GET /api/status``          -> recorder health, freshness, coverage, disk, counts, gaps
+- ``GET /api/matches``         -> per-match counts, recency, and live/quiet status
+- ``GET /api/matches/{id}``    -> one match's reconstructed L2 book / mid / last trade
+- ``GET /api/live``            -> records/sec, most-recent records, recent gaps (poll)
 
 Binds to localhost by default — reach it through an SSH tunnel
 (``gcloud compute ssh polytape-rec -- -L 8080:localhost:8080``), so there is no
@@ -64,6 +66,12 @@ def create_app(reader: RunReader, *, poll_interval: float = 2.0):
     @app.get("/api/matches/{event_id}")
     async def match(event_id: str) -> JSONResponse:
         return JSONResponse(reader.match_view(event_id))
+
+    @app.get("/api/live")
+    async def live() -> JSONResponse:
+        # Poll-based live view (rates + recent records + gaps). Cheap: it reads
+        # only state the update() loop already maintains, so no file I/O per request.
+        return JSONResponse(reader.live())
 
     return app
 

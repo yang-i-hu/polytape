@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -51,7 +52,9 @@ class RunReader:
         matches_file: str | Path = "/etc/polytape/wc_matches.json",
         live_window_s: float = 60.0,
         price_history: int = 120,
+        peek: int = 60,
         now: Callable[[], str] = utc_now_iso,
+        mono: Callable[[], float] = time.monotonic,
     ) -> None:
         self._dir = Path(run_dir)
         self._unit = unit
@@ -60,11 +63,22 @@ class RunReader:
         self._live_window = live_window_s
         self._price_history = price_history
         self._now = now
+        self._mono = mono
         self._offsets: dict[str, int] = {}
         self._counts: dict[str, int] = {"comments": 0, "book": 0}
         self._by_event: dict[str, dict[str, int]] = {}
         self._last_ts: dict[str, str] = {}
         self._markets_seen: set[str] = set()
+        # Live view (poll-based, no SSE): a bounded ring of the most recent records,
+        # records/sec computed from per-tick count snapshots, and the meta gap list.
+        # All derived from the SAME per-tick parse the reader already does — no extra I/O.
+        self._peek: deque = deque(maxlen=peek)
+        self._gaps: list[dict[str, Any]] = []
+        self._rates: dict[str, Any] = {}
+        self._rate_prev: tuple[float, dict[str, int], dict[str, dict[str, int]]] | None = None
+        # _systemctl() spawns a subprocess; cache it per update() tick so status()
+        # never blocks the event loop with a subprocess on every request.
+        self._recorder_cache: dict[str, Any] | None = None
         # Derived from meta.json (refreshed each update; the open set changes on roll-out/in).
         self._cond2event: dict[str, str] = {}
         self._event_title: dict[str, str] = {}
@@ -94,6 +108,7 @@ class RunReader:
         except (OSError, json.JSONDecodeError):
             return
         self._started_at = meta.get("started_at")
+        self._gaps = list(meta.get("gaps") or [])
         cond2event: dict[str, str] = {}
         title: dict[str, str] = {}
         date: dict[str, str | None] = {}
@@ -176,6 +191,15 @@ class RunReader:
             raw = rec.get("raw") or {}
             self._counts[stream] = self._counts.get(stream, 0) + 1
             ev = event_of(raw)
+            self._peek.append(
+                {
+                    "ts": rec.get("ts_recv"),
+                    "stream": stream,
+                    "kind": raw.get("event_type") if stream == "book" else raw.get("type"),
+                    "eid": ev,
+                    "title": self._event_title.get(ev) if ev else None,
+                }
+            )
             if ev:
                 bucket = self._by_event.setdefault(ev, {})
                 bucket[stream] = bucket.get(stream, 0) + 1
@@ -232,11 +256,46 @@ class RunReader:
             )
 
     def update(self) -> None:
-        """Refresh meta + labels, then ingest any newly-appended JSONL records."""
+        """Refresh meta + labels, ingest newly-appended records, refresh live snapshots."""
         self._load_meta()
         self._load_labels()
         self._consume("book", lambda raw: self._cond2event.get(str(raw.get("market"))))
         self._consume("comments", _comment_event)
+        # Refresh the cached recorder state once per tick (not once per /api/status
+        # request) and compute records/sec from the count delta since the last tick.
+        self._recorder_cache = self._systemctl()
+        self._compute_rates()
+
+    def _compute_rates(self) -> None:
+        """records/sec per stream and per active event, over the gap since the last tick."""
+        now_t = self._mono()
+        if self._rate_prev is not None:
+            prev_t, prev_counts, prev_by_event = self._rate_prev
+            dt = now_t - prev_t
+            if dt > 0:
+                by_stream = {
+                    s: round(max(0.0, (self._counts.get(s, 0) - prev_counts.get(s, 0)) / dt), 3)
+                    for s in self._counts
+                }
+                by_event: dict[str, dict[str, float]] = {}
+                for eid, counts in self._by_event.items():
+                    prev = prev_by_event.get(eid, {})
+                    ev_rates = {
+                        s: round(max(0.0, (counts.get(s, 0) - prev.get(s, 0)) / dt), 3)
+                        for s in counts
+                    }
+                    if any(v > 0 for v in ev_rates.values()):  # only events ticking now
+                        by_event[eid] = ev_rates
+                self._rates = {
+                    "by_stream": by_stream,
+                    "by_event": by_event,
+                    "window_s": round(dt, 2),
+                }
+        self._rate_prev = (
+            now_t,
+            dict(self._counts),
+            {eid: dict(counts) for eid, counts in self._by_event.items()},
+        )
 
     def match_view(self, event_id: str) -> dict[str, Any]:
         """Reconstructed preview for one match: each outcome's book, last trade, price line."""
@@ -336,8 +395,11 @@ class RunReader:
     def status(self) -> dict[str, Any]:
         freshest = max(self._last_ts.values(), default=None)
         seen = len(self._markets_seen & self._markets_total)
+        # Prefer the per-tick cached recorder state; fall back for a status() before
+        # the first update() (e.g. the heartbeat-armed unit test).
+        recorder = self._recorder_cache if self._recorder_cache is not None else self._systemctl()
         return {
-            "recorder": self._systemctl(),
+            "recorder": recorder,
             "started_at": self._started_at,
             "last_record_age_s": self._age_s(freshest),
             "records": dict(self._counts),
@@ -345,6 +407,22 @@ class RunReader:
             "coverage": {"seen": seen, "total": len(self._markets_total)},
             "disk_percent": self._disk_percent(),
             "heartbeat_armed": self._heartbeat_armed(),
+            "gaps": len(self._gaps),
+            "as_of": self._now(),
+        }
+
+    def live(self) -> dict[str, Any]:
+        """Poll-based live view: records/sec, the most-recent records, and recent gaps.
+
+        Everything here is read straight from state the :meth:`update` loop already
+        maintains — no file I/O, so it is cheap to poll every couple of seconds.
+        """
+        freshest = max(self._last_ts.values(), default=None)
+        return {
+            "rates": self._rates,
+            "recent": list(self._peek),
+            "gaps": self._gaps[-25:],
+            "freshest_age_s": self._age_s(freshest),
             "as_of": self._now(),
         }
 

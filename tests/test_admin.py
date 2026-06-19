@@ -200,3 +200,98 @@ def test_match_view_reconstructs_book(tmp_path):
     assert mk["asks"][0]["price"] == 0.92
     assert mk["last_trade"]["price"] == "0.905"
     assert len(mk["price_hist"]) == 1 and mk["price_hist"][0]["p"] == 0.905
+
+
+def test_gaps_surfaced_in_status_and_live(tmp_path):
+    meta = _meta()
+    meta["gaps"] = [
+        {
+            "stream": "book",
+            "disconnected_at": "2026-06-19T16:00:00Z",
+            "reconnected_at": "2026-06-19T16:00:03Z",
+            "downtime_seconds": 3.0,
+            "backfilled": 0,
+            "note": "reconnect",
+        },
+        {
+            "stream": "comments",
+            "disconnected_at": "2026-06-19T16:10:00Z",
+            "reconnected_at": "2026-06-19T16:10:01Z",
+            "downtime_seconds": 1.0,
+            "backfilled": 2,
+            "note": "reconnect",
+        },
+    ]
+    (tmp_path / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1")])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    r = RunReader(tmp_path, env_file=tmp_path / "missing.env")
+    r.update()
+    assert r.status()["gaps"] == 2
+    gaps = r.live()["gaps"]
+    assert len(gaps) == 2 and gaps[0]["stream"] == "book" and gaps[1]["backfilled"] == 2
+
+
+def test_rates_computed_from_count_deltas(tmp_path):
+    clock = [100.0]
+    (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    book = tmp_path / "book.jsonl"
+    _write_jsonl(book, [_book("0xA1"), _book("0xA1")])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    r = RunReader(tmp_path, env_file=tmp_path / "missing.env", mono=lambda: clock[0])
+    r.update()  # first tick sets the baseline; no rate yet
+    assert r.live()["rates"] == {}
+    with open(book, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(_book("0xA1")) + "\n")  # event 1001
+        fh.write(json.dumps(_book("0xB1")) + "\n")  # event 1002
+    clock[0] = 102.0  # 2s later
+    r.update()
+    rates = r.live()["rates"]
+    assert rates["window_s"] == 2.0
+    assert rates["by_stream"]["book"] == 1.0  # 2 new book records / 2s
+    assert rates["by_event"]["1001"]["book"] == 0.5 and rates["by_event"]["1002"]["book"] == 0.5
+
+
+def test_peek_ring_holds_recent_records(tmp_path):
+    (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1"), _book("0xB1")])
+    _write_jsonl(tmp_path / "comments.jsonl", [_comment(1001, "c1")])
+    r = RunReader(tmp_path, env_file=tmp_path / "missing.env", peek=10)
+    r.update()
+    recent = r.live()["recent"]
+    assert len(recent) == 3  # 2 book (consumed first) + 1 comment
+    book_rec = next(x for x in recent if x["stream"] == "book")
+    assert book_rec["kind"] == "book" and book_rec["eid"] in ("1001", "1002")
+    comment_rec = next(x for x in recent if x["stream"] == "comments")
+    assert comment_rec["kind"] == "comment_created"
+    assert comment_rec["eid"] == "1001" and comment_rec["title"] == "A vs. B"
+
+
+def test_peek_ring_capped(tmp_path):
+    (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1"), _book("0xA1"), _book("0xA1")])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    r = RunReader(tmp_path, env_file=tmp_path / "missing.env", peek=2)
+    r.update()
+    assert len(r.live()["recent"]) == 2  # oldest evicted (FIFO)
+
+
+def test_systemctl_cached_once_per_tick(tmp_path):
+    (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1")])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    r = RunReader(tmp_path, env_file=tmp_path / "missing.env")
+    calls = [0]
+
+    def fake():
+        calls[0] += 1
+        return {"active": "active", "restarts": 0, "since": None}
+
+    r._systemctl = fake  # type: ignore[method-assign]
+    r.update()
+    assert calls[0] == 1  # one subprocess per update() tick
+    r.status()
+    r.status()
+    r.status()
+    assert calls[0] == 1  # status() reads the cache, never re-spawns
+    assert r.status()["recorder"]["active"] == "active"

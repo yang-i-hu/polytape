@@ -53,11 +53,12 @@ PAGE = """<!doctype html>
   <div class="cards" id="cards"></div>
 
   <div class="controls">
-    <button title="Phase 2">restart</button>
-    <button title="Phase 2">refresh match set</button>
-    <button title="Phase 2">arm heartbeat</button>
-    <button title="Phase 2">stop</button>
-    <span class="note">read-only overview · controls land in a later phase</span>
+    <button id="livebtn" style="cursor:pointer;opacity:1" onclick="toggleLive()">&#9654; live tail</button>
+    <button title="needs security sign-off" disabled>restart</button>
+    <button title="needs security sign-off" disabled>refresh match set</button>
+    <button title="needs security sign-off" disabled>arm heartbeat</button>
+    <button title="needs security sign-off" disabled>stop</button>
+    <span class="note">live tail is read-only &middot; mutating controls pending security sign-off</span>
   </div>
 
   <h2 id="mtitle">matches</h2>
@@ -67,6 +68,7 @@ PAGE = """<!doctype html>
   </table>
   <div class="footer" id="footer"></div>
   <div id="preview" style="display:none;margin-top:18px"></div>
+  <div id="live" style="display:none;margin-top:18px"></div>
 </div>
 
 <script>
@@ -99,6 +101,40 @@ async function openMatch(id){
   el.innerHTML='<div style="color:var(--muted)">loading preview…</div>';
   try{ var m=await fetch('/api/matches/'+id).then(function(r){return r.json();}); el.innerHTML=renderPreview(m); }
   catch(e){ el.innerHTML='<div class="bad">failed to load preview</div>'; }
+}
+
+function isoAge(ts){ if(!ts) return null; var t=Date.parse(ts); return isNaN(t)?null:(Date.now()-t)/1000; }
+function rateChip(label,v){ return '<span class="pill">'+label+' <b style="color:var(--blue)">'+(v==null?'—':(+v).toFixed(1))+'/s</b></span>'; }
+var liveTimer=null;
+function toggleLive(){
+  var el=document.getElementById('live'), btn=document.getElementById('livebtn');
+  if(liveTimer){ clearInterval(liveTimer); liveTimer=null; el.style.display='none'; btn.innerHTML='&#9654; live tail'; return; }
+  el.style.display='block'; el.innerHTML='<div style="color:var(--muted)">starting live view…</div>';
+  btn.innerHTML='&#9632; live tail'; liveTick(); liveTimer=setInterval(liveTick, 2000);
+}
+async function liveTick(){
+  try{ var d=await fetch('/api/live').then(function(r){return r.json();}); document.getElementById('live').innerHTML=renderLive(d); }
+  catch(e){ document.getElementById('live').innerHTML='<div class="bad">live view unavailable</div>'; }
+}
+function renderLive(d){
+  var rs=d.rates||{}, bs=rs.by_stream||{}, fresh=d.freshest_age_s;
+  var head='<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'+
+    rateChip('book',bs.book)+rateChip('comments',bs.comments)+
+    '<span class="pill"><span class="dot" style="background:'+(fresh!=null&&fresh<=60?'var(--green)':'var(--amber)')+'"></span>freshest '+age(fresh)+'</span>'+
+    (rs.window_s?'<span class="note">rate over '+rs.window_s+'s</span>':'')+'</div>';
+  var gaps=d.gaps||[], gapHtml='';
+  if(gaps.length){
+    gapHtml='<h2>recent gaps</h2><div style="margin-bottom:12px">'+gaps.slice().reverse().map(function(g){
+      var perm=(g.stream==='book'), col=perm?'var(--red)':'var(--amber)', dn=(g.downtime_seconds!=null?g.downtime_seconds:'?');
+      return '<div style="font-family:var(--mono);font-size:12px;color:'+col+'">'+g.stream+' &middot; down '+dn+'s &middot; '+(g.reconnected_at||g.disconnected_at||'')+' &middot; '+(perm?'book loss (no backfill)':'backfilled '+(g.backfilled!=null?g.backfilled:'?'))+'</div>';
+    }).join('')+'</div>';
+  }
+  var recent=d.recent||[];
+  var rows=recent.slice().reverse().map(function(r){
+    return '<tr><td class="num '+freshClass(isoAge(r.ts))+'">'+age(isoAge(r.ts))+'</td><td>'+r.stream+'</td><td class="num">'+(r.kind||'')+'</td><td>'+(r.title||r.eid||'—')+'</td></tr>';
+  }).join('') || '<tr><td colspan="4" style="color:var(--dim)">no records yet</td></tr>';
+  return head+gapHtml+'<h2>recent records · '+recent.length+'</h2>'+
+    '<table><thead><tr><th style="width:16%">age</th><th style="width:16%">stream</th><th style="width:28%">kind</th><th>match</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
 async function tick(){

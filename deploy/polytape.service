@@ -7,8 +7,12 @@
 #
 # Secrets/config live in /etc/polytape/polytape.env (mode 0600), e.g.:
 #   POLYTAPE_SALT=<32+ random chars; stable so hashes correlate across restarts>
-#   POLYTAPE_HEARTBEAT_URL=https://hc-ping.com/<uuid>
-#   POLYTAPE_EVENT_ID=<numeric Polymarket event id>
+#   POLYTAPE_HEARTBEAT_URL=https://hc-ping.com/<uuid>   (optional; arms the watchdog)
+#   POLYTAPE_EVENT_ID=<numeric id; legacy single-event ExecStart only>
+#
+# This is the PRODUCTION multi-event unit: it records ALL open World Cup match
+# moneylines in one process via the discovery file into /data/run-wc. Keep this
+# file in sync with the live unit (`systemctl cat polytape`).
 #
 # Restart=always recovers crashes and the post-migration reconnect; on a
 # *persistent* fatal (e.g. disk full -> exit 2) the process keeps dying, no data is
@@ -26,7 +30,9 @@ User=polytape
 Group=polytape
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/polytape/polytape.env
-ExecStart=/opt/polytape/venv/bin/polytape --event-id ${POLYTAPE_EVENT_ID} --out /data --log-level INFO
+ExecStart=/opt/polytape/venv/bin/polytape --matches-file /etc/polytape/wc_matches.json --open-only --run-name wc --out /data --log-level INFO
+# Legacy single-event mode (writes /data/event-<id>); swap the ExecStart above for:
+#   ExecStart=/opt/polytape/venv/bin/polytape --event-id ${POLYTAPE_EVENT_ID} --out /data --log-level INFO
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
