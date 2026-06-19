@@ -1,0 +1,38 @@
+# polytape admin dashboard — read-only sidecar, bound to localhost.
+#
+# Reach it WITHOUT opening any port, via an SSH tunnel from your machine:
+#   gcloud compute ssh polytape-rec --zone=europe-west2-a --project=<proj> \
+#     -- -L 8080:localhost:8080
+# then open http://localhost:8080
+#
+# Needs the admin extra in the venv:  pip install fastapi uvicorn
+# Install:
+#   sudo cp deploy/polytape-admin.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now polytape-admin
+
+[Unit]
+Description=polytape admin dashboard (read-only, localhost:8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polytape
+Group=polytape
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYTAPE_RUN_DIR=/data/run-wc
+Environment=POLYTAPE_UNIT=polytape
+Environment=POLYTAPE_ENV_FILE=/etc/polytape/polytape.env
+ExecStart=/opt/polytape/venv/bin/polytape-admin --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polytape-admin
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
