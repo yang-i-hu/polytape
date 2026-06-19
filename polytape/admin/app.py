@@ -78,13 +78,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--env-file", default=os.environ.get("POLYTAPE_ENV_FILE", "/etc/polytape/polytape.env")
     )
+    parser.add_argument(
+        "--matches-file",
+        default=os.environ.get("POLYTAPE_MATCHES_FILE", "/etc/polytape/wc_matches.json"),
+    )
     parser.add_argument("--host", default=os.environ.get("POLYTAPE_ADMIN_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("POLYTAPE_ADMIN_PORT", "8080"))
     )
     args = parser.parse_args(argv)
 
-    reader = RunReader(args.run_dir, unit=args.unit, env_file=args.env_file)
+    reader = RunReader(
+        args.run_dir, unit=args.unit, env_file=args.env_file, matches_file=args.matches_file
+    )
     with contextlib.suppress(Exception):
         reader.update()  # warm once so the first request has data
 
