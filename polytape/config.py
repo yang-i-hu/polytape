@@ -65,8 +65,7 @@ class Config:
         object.__setattr__(self, "event_id", ids[0])
         if not self.comments and not self.book:
             raise ValueError(
-                "at least one stream must be enabled "
-                "(do not combine --no-comments with --no-book)"
+                "at least one stream must be enabled (do not combine --no-comments with --no-book)"
             )
         if not self.dry_run:
             non_numeric = [i for i in ids if not i.isdigit()]

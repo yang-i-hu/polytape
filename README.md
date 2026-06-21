@@ -1,5 +1,7 @@
 # polytape
 
+[![CI](https://github.com/yang-i-hu/polytape/actions/workflows/ci.yml/badge.svg)](https://github.com/yang-i-hu/polytape/actions/workflows/ci.yml)
+
 Record two of Polymarket's public, real-time feeds during a live event — the
 **comment stream** (RTDS websocket) and the **order book** (CLOB websocket) — to
 timestamped JSONL for later research.
@@ -39,7 +41,7 @@ applicable laws when recording and using this data.
 - Python 3.10+
 - Runtime dependencies: [`websockets`](https://pypi.org/project/websockets/),
   [`httpx`](https://pypi.org/project/httpx/)
-- Dev dependencies: `pytest`, `ruff`, `black`
+- Dev dependencies: `pytest`, `ruff`
 
 ## Install
 
@@ -68,6 +70,7 @@ until you stop it with `Ctrl-C` (SIGINT) or SIGTERM.
 | `--event-id ID` | *(required)* | Polymarket **Event** ID to record (numeric for a live capture; any string under `--dry-run`). |
 | `--out DIR` | `./data` | Output root directory. Data is written to `DIR/event-<id>/`. |
 | `--comments` / `--no-comments` | on | Record (or skip) the RTDS comment stream. |
+| `--include-series-comments` | off | Also record comments on the event's **parent series** (e.g. a sports league/tournament chat). Sports comments often live on the series, not the match — see [below](#sports-comments-live-on-the-series). |
 | `--book` / `--no-book` | on | Record (or skip) the CLOB order-book stream. |
 | `--market-id ID` | *(auto)* | Override the market(s) to record instead of every market in the event. May be repeated. |
 | `--no-hash` | off | Write usernames/identifiers verbatim instead of hashing them. |
@@ -197,6 +200,109 @@ recovery relies on that snapshot rather than REST backfill.
 
 ---
 
+## Live monitor (dashboard)
+
+The polytape monitor (run with `python -m polytape.monitor`, or the installed
+`polytape-monitor` command) is a small **read-only** web dashboard for watching a
+capture happen — message counts, throughput, the server→receive delay, the
+message-type mix, staleness, and the disconnect/backfill log, refreshed about
+once a second.
+
+**Monitoring is read-only.** It is a separate process that only ever **reads**
+the files a capture already writes (the append-only `*.jsonl` and the
+atomically-rewritten `meta.json`). It never imports the recorder's network or
+writer path and adds **no work to the capture's hot path** — start it, stop it,
+or restart it freely at any time, even mid-recording, with zero effect on what's
+being recorded. (An optional, loopback-only control plane can additionally
+*launch* and *stop* captures — see [Controls](#controls-start--stop-a-capture-from-the-dashboard)
+below — but a launched recorder is just a normal `polytape` process.)
+
+```bash
+# In one terminal: record (or already recording) into ./data
+python -m polytape --event-id 12345
+
+# In another: watch it live (defaults to ./data, http://localhost:8787)
+python -m polytape.monitor --open
+```
+
+Try it with no live event by pointing the monitor at a synthetic feed:
+
+```bash
+python -m polytape.monitor.demo            # writes a live synthetic capture to ./data
+python -m polytape.monitor --open          # then watch it move
+```
+
+### Controls (start / stop a capture from the dashboard)
+
+The dashboard has a **Recorder** panel that can launch and stop captures for you:
+
+- **Start** a *Live event* — enter a numeric event id, a slug, or just **paste the
+  Polymarket URL** (e.g. `https://polymarket.com/sports/.../fifwc-ksa-ury-2026-06-15`);
+  the slug is resolved to its event id for you. Toggle the comment/book streams,
+  username hashing, and **series chat** (the parent league/tournament comments —
+  see [Sports comments live on the series](#sports-comments-live-on-the-series)).
+  Or start a *Demo feed* (synthetic, no network).
+- **Find related** — paste any event's URL/slug and click *Find related* to list
+  the **other events in its series** (e.g. every match in the tournament). Click a
+  row to drop it into the input, or hit **Record ▶** to capture it directly — each
+  in its own session. Handy for recording several matches without hunting URLs.
+- **Stop** any capture the dashboard launched — a graceful shutdown that
+  finalizes `meta.json` (`SIGINT` on POSIX, `CTRL_BREAK` on Windows).
+- **Pause / Resume** the live view — this freezes the *dashboard's* refresh so
+  you can inspect; it never affects what's being recorded. (There is no "pause
+  recording": a live websocket feed can't pause without disconnecting and
+  missing data — the very thing the recorder exists to capture.)
+
+You can record **several events at once**. The **Events & sessions** list shows
+every capture under the root (recording, idle, or stopped); click a row to view
+it here, hit **Open ↗** to open it in its own browser tab, or **Stop** a running
+one. Starting a new recording opens it in its own tab by default — so each
+event/match gets its own live session.
+
+A launched capture is an ordinary `polytape` process, identical to one started by
+hand, so it keeps running if you close the dashboard (the monitor does not stop
+recordings on exit). Captures started in another terminal are still shown and
+monitored, but only ones this dashboard launched get a **Stop** button.
+
+> **One recorder per event.** Two recorders writing the same `event-<id>` folder
+> interleave their appends and corrupt the JSONL. The dashboard refuses to start a
+> capture for an event that already looks actively recorded (its files were just
+> written) — but it can't detect a *quiet* feed already being recorded by another
+> process, so don't point a second recorder at an event you're already capturing.
+
+**Safety.** Control spawns processes, so it is **enabled only on a loopback bind**
+and is guarded against cross-site requests (a custom header browsers can't forge
+cross-origin). Disable it entirely with `--read-only`; to allow it on a
+non-loopback bind (use with care) pass `--allow-control`.
+
+### Options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--out DIR` | `./data` | Capture root to watch (the recorder's `--out`), or a single `event-<id>` dir. New captures started from the UI are written here. |
+| `--host HOST` | `127.0.0.1` | Bind host. Loopback by default; binding elsewhere exposes capture volume/timing to the network. |
+| `--port PORT` | `8787` | Bind port. |
+| `--idle-threshold S` | `20` | Seconds without a new message before a running capture is shown as **idle** (low comment volume is normal). |
+| `--read-only` | off | Disable the start/stop control plane entirely (pure observer). |
+| `--allow-control` | off | Allow control on a non-loopback bind (spawns processes — use with care). |
+| `--open` | off | Open the dashboard in a browser on start. |
+
+### Notes
+
+- **Zero new dependencies.** The dashboard is the Python standard library
+  (`http.server`) plus one self-contained HTML page (vanilla JS, canvas
+  sparklines) — no framework, no build step, no CDN; it works fully offline.
+- **No payload content is exposed.** The dashboard surfaces only aggregate
+  counters and non-identifying metadata (stream, message type, timestamps,
+  delay) — never comment bodies, and never usernames even under `--no-hash`.
+- **Exact totals, live windows.** Message *counts* are exact from the first
+  refresh; the *rate*, *delay percentiles*, and *type mix* describe traffic seen
+  since the monitor attached (so attaching to a long-running capture stays cheap).
+- If the recorder root holds several `event-*` captures, the dashboard shows a
+  picker and defaults to the most recently active one.
+
+---
+
 ## Behavior
 
 ### Streams
@@ -218,6 +324,58 @@ recovery relies on that snapshot rather than REST backfill.
   **deltas** (`price_change`) thereafter — plus `last_trade_price` and
   `tick_size_change`. All are recorded verbatim with the message type preserved
   inside `raw`.
+
+### Sports comments live on the series
+
+By default polytape keeps only comments whose `parentEntityID` is the event id.
+For many markets that's right — but **Polymarket's sports chat is attached to the
+parent _series_ (the league/tournament), not the individual match event.** Such a
+match event typically has `commentCount: 0` of its own, so a default capture
+records **zero** comments even while the chat is active.
+
+Pass `--include-series-comments` to also record the event's parent-series comments
+(resolved from the event's `series`). Two things to know:
+
+- It's **tournament-wide**: you get the whole series' chat (e.g. every FIFA World
+  Cup comment), because the match has no chat channel of its own to narrow to.
+- It only changes the **comment** filter; book recording is unaffected, and the
+  default (event-only) behavior is unchanged unless you pass the flag. Backfill on
+  reconnect covers each parent (event and series) independently.
+
+### Holdings (positions) on comments
+
+Each comment also carries the author's **holdings** — the position the app renders
+next to each user, and what makes one shared series chat *look* like a distinct
+per-match room. polytape requests them with `get_positions=true`, so a comment's
+`raw…profile.positions` is an array of `{tokenId, positionSize}`:
+
+```json
+"profile": { "pseudonym": "<hashed>", "positions": [ { "tokenId": "5699…0447", "positionSize": "144532000" } ] }
+```
+
+- **`positionSize` is 1e6-scaled** USDC-share units — divide by 1,000,000 for the
+  share count (`144532000` → 144.532 shares).
+- **Attributing a holding to a specific match:** a commenter's `positions` span
+  *every* market they hold in the series, not just one match. Intersect each
+  `positions[].tokenId` with that event's `clob_token_ids` (in `meta.json`) to keep
+  only the holdings for the match you care about; the outcome label comes from which
+  token matched (a market's `outcomes` are index-aligned with its `clobTokenIds`).
+- **Identity is hashed; holdings are not.** With hashing on (default), the
+  `name`/`pseudonym`/wallet fields inside `profile` are hashed, but `positions` are
+  kept verbatim. Set a stable `POLYTAPE_SALT` to correlate a user's holdings across
+  comments without de-anonymizing them.
+- `meta.json` records `"holdings_captured": true` when the comment stream is on.
+
+> **Holdings change over a match — each comment is a point-in-time snapshot.** A
+> comment's `positions` are the author's holdings *as of that record's `ts_recv`*,
+> not a static attribute. For **live** comments that is the post time; for comments
+> recovered by **backfill** it is the *fetch* time (the Gamma API returns current
+> positions, so a backfilled comment's holdings are a later snapshot than its
+> `ts_server`/`createdAt`). You therefore get an irregular time series of holdings,
+> sampled whenever a user comments — not a continuous position history. (To track a
+> user's holdings continuously you'd poll
+> `data-api.polymarket.com/positions?user=<wallet>&eventId=<id>` on a timer; that's
+> out of scope for the passive recorder.)
 
 ### Reconnect + backfill
 
@@ -250,10 +408,14 @@ the capture path can be exercised and tested with zero network access.
 
 ```bash
 pip install -e ".[dev]"
-pytest            # unit tests, fully offline (no network required)
-ruff check .
-black .
+pytest                 # unit tests, fully offline (no network required)
+ruff check .           # lint
+ruff format --check .  # style (drop --check to auto-format)
 ```
+
+These are exactly the checks CI runs on every push and pull request to `main`
+(across Python 3.10–3.14). `ruff` is pinned in the `dev` extra so local results
+match CI; bump it deliberately and reformat in the same commit.
 
 ### Smoke test (manual, requires network + a live event)
 

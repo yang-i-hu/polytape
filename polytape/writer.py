@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
 from polytape import __version__
-from polytape.config import Config
+from polytape.config import STREAM_COMMENTS, Config
 from polytape.envelope import Hasher, build_envelope, iso_to_datetime, utc_now_iso
 
 if TYPE_CHECKING:
@@ -248,6 +248,9 @@ class CaptureWriter:
             "market_ids": [c for e in self._event_infos for c in e.condition_ids],
             "clob_token_ids": [t for e in self._event_infos for t in e.clob_token_ids],
             "streams": list(self._config.enabled_streams),
+            # Comments are fetched with get_positions=true, so each comment carries
+            # the author's holdings (profile.positions) as a snapshot at ts_recv.
+            "holdings_captured": STREAM_COMMENTS in self._config.enabled_streams,
             "out_dir": self._dir.as_posix(),
             "hashing": {
                 "enabled": self._hasher is not None,

@@ -45,7 +45,9 @@ def synthetic_comment_frames(event_id: str) -> list[str]:
     """Comment-stream frames: comments, a reaction, and a duplicate (for dedup).
 
     Comments carry ``parentEntityID`` and the reaction a ``commentID`` so they
-    pass the client-side event filter, exactly like live frames.
+    pass the client-side event filter, exactly like live frames. Each ``profile``
+    carries ``positions`` (holdings), so the dry run exercises holdings capture;
+    token ``"100"`` is one of the synthetic event's CLOB tokens.
     """
     frames: list[str] = []
     for i in range(3):
@@ -66,6 +68,9 @@ def synthetic_comment_frames(event_id: str) -> list[str]:
                             "name": f"user{i}",
                             "pseudonym": f"pseud{i}",
                             "proxyWallet": f"0xUSER{i}",
+                            "positions": [
+                                {"tokenId": "100", "positionSize": f"{(i + 1) * 1000000}"}
+                            ],
                         },
                     },
                 }
@@ -102,7 +107,11 @@ def synthetic_backfill_comments(event_id: str) -> list[dict[str, Any]]:
             "createdAt": "2026-01-01T00:01:00Z",
             "userAddress": "0xUSER9",
             "body": "missed during the gap",
-            "profile": {"name": "latecomer", "proxyWallet": "0xUSER9"},
+            "profile": {
+                "name": "latecomer",
+                "proxyWallet": "0xUSER9",
+                "positions": [{"tokenId": "200", "positionSize": "5000000"}],
+            },
         },
         {  # already seen live -> deduped, counts as not-newly-written
             "id": "dry-c0",

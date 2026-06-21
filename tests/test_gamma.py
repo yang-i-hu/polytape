@@ -13,6 +13,9 @@ from polytape.gamma import (
     _filter_markets,
     _parse_event,
     _parse_token_ids,
+    parse_event_ref,
+    related_events,
+    resolve_event_id,
 )
 
 EVENT_OBJ = {
@@ -38,6 +41,12 @@ def test_parse_event_object_and_list_forms():
     assert _parse_event([EVENT_OBJ], "12345").event_id == "12345"  # ?id= array form
 
 
+def test_parse_event_series_ids():
+    obj = {**EVENT_OBJ, "series": [{"id": 11433, "slug": "soccer-fifwc"}, {"id": "999"}]}
+    assert _parse_event(obj, "12345").series_ids == ("11433", "999")
+    assert _parse_event(EVENT_OBJ, "12345").series_ids == ()  # no series -> empty
+
+
 def test_parse_token_ids_stringified():
     assert _parse_token_ids({"clobTokenIds": '["a","b"]'}) == ("a", "b")
     assert _parse_token_ids({}) == ()
@@ -48,6 +57,102 @@ def test_parse_token_ids_stringified():
 def test_parse_event_empty_list_raises():
     with pytest.raises(GammaError):
         _parse_event([], "12345")
+
+
+def test_parse_event_ref_id_slug_and_url():
+    assert parse_event_ref("351729") == ("id", "351729")
+    assert parse_event_ref("  351729  ") == ("id", "351729")
+    assert parse_event_ref("fifwc-ksa-ury-2026-06-15") == ("slug", "fifwc-ksa-ury-2026-06-15")
+    assert parse_event_ref("https://polymarket.com/sports/world-cup/fifwc-ksa-ury-2026-06-15") == (
+        "slug",
+        "fifwc-ksa-ury-2026-06-15",
+    )
+    # trailing slash + query string are tolerated
+    assert parse_event_ref("https://polymarket.com/event/big-game/?tid=1") == ("slug", "big-game")
+    with pytest.raises(GammaError):
+        parse_event_ref("   ")
+
+
+def test_resolve_event_id_numeric_needs_no_network():
+    # A numeric ref returns immediately; passing client=None would try the network,
+    # so reaching the return proves no request was made.
+    assert resolve_event_id("351729", client=None) == "351729"
+
+
+def test_resolve_event_id_slug_via_gamma():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[{"id": "351729", "title": "Saudi Arabia vs. Uruguay"}])
+
+    http = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://gamma-api.polymarket.com"
+    )
+    assert resolve_event_id("fifwc-ksa-ury-2026-06-15", client=http) == "351729"
+    assert "slug=fifwc-ksa-ury-2026-06-15" in seen["url"]
+
+
+def test_resolve_event_id_unknown_slug_raises():
+    http = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[])),
+        base_url="https://gamma-api.polymarket.com",
+    )
+    with pytest.raises(GammaError):
+        resolve_event_id("no-such-event", client=http)
+
+
+def test_related_events_lists_series_matches():
+    def handler(req):
+        p = req.url.params
+        if "slug" in p:  # resolve the source event
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "351730",
+                        "slug": "fifwc-irn-nzl",
+                        "series": [{"id": 11433, "title": "FIFA World Cup"}],
+                    }
+                ],
+            )
+        if "series_id" in p:  # list the series' open events
+            assert p["series_id"] == "11433" and p["closed"] == "false"
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "351731", "slug": "a", "title": "France vs. Senegal", "closed": False},
+                    {
+                        "id": "351730",
+                        "slug": "fifwc-irn-nzl",
+                        "title": "Iran vs. NZ",
+                        "closed": False,
+                    },
+                ],
+            )
+        return httpx.Response(404, json={})
+
+    http = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://gamma-api.polymarket.com"
+    )
+    out = related_events("https://polymarket.com/sports/world-cup/fifwc-irn-nzl", client=http)
+    assert out["source_event_id"] == "351730"
+    assert out["series_id"] == "11433"
+    assert out["series_title"] == "FIFA World Cup"
+    assert [e["event_id"] for e in out["events"]] == ["351731", "351730"]
+    assert out["events"][0]["title"] == "France vs. Senegal"
+
+
+def test_related_events_no_series_returns_self():
+    http = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=[{"id": "999", "slug": "solo", "title": "Solo"}])
+        ),
+        base_url="https://gamma-api.polymarket.com",
+    )
+    out = related_events("solo", client=http)
+    assert out["series_id"] is None
+    assert [e["event_id"] for e in out["events"]] == ["999"]
 
 
 def test_filter_markets_by_gamma_or_condition_id():
@@ -98,6 +203,49 @@ async def test_get_retries_on_5xx():
     g = _client(handler)
     ev = await g.resolve_event("12345")
     assert ev.event_id == "12345" and state["n"] == 2
+    await g.aclose()
+
+
+async def test_fetch_comments_series_parent():
+    seen: dict[str, str] = {}
+
+    def handler(req):
+        seen.update(dict(req.url.params))
+        return httpx.Response(200, json=[{"id": "s1"}])
+
+    g = _client(handler)
+    out = await g.fetch_comments("11433", parent_entity_type="Series")
+    assert out == [{"id": "s1"}]
+    assert seen["parent_entity_type"] == "Series" and seen["parent_entity_id"] == "11433"
+    await g.aclose()
+
+
+async def test_fetch_comments_requests_holdings_by_default():
+    seen: dict[str, str] = {}
+
+    def handler(req):
+        seen.clear()
+        seen.update(dict(req.url.params))
+        return httpx.Response(200, json=[])
+
+    g = _client(handler)
+    await g.fetch_comments("11433", parent_entity_type="Series")
+    assert seen.get("get_positions") == "true"  # holdings requested by default
+    await g.fetch_comments("11433", parent_entity_type="Series", get_positions=False)
+    assert "get_positions" not in seen  # opt-out drops the param
+    await g.aclose()
+
+
+async def test_backfill_threads_get_positions():
+    seen: dict[str, str] = {}
+
+    def handler(req):
+        seen.update(dict(req.url.params))
+        return httpx.Response(200, json=[])
+
+    g = _client(handler)
+    await g.backfill_since("11433", parent_entity_type="Series", max_pages=1)
+    assert seen.get("get_positions") == "true"
     await g.aclose()
 
 
