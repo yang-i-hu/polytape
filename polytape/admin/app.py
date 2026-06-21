@@ -23,10 +23,19 @@ public port and no new firewall hole. fastapi/uvicorn are an optional extra
 import argparse
 import asyncio
 import contextlib
+import json
+import logging
 import os
+import shutil
+import tempfile
+from pathlib import Path
 
+from polytape.admin import download as dl
 from polytape.admin.page import PAGE
 from polytape.admin.reader import RunReader
+from polytape.envelope import utc_now_iso
+
+logger = logging.getLogger("polytape.admin")
 
 
 def create_app(
@@ -51,7 +60,7 @@ def create_app(
     from contextlib import asynccontextmanager
 
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
     from polytape.admin import control
 
@@ -123,6 +132,83 @@ def create_app(
         # stops a forged cross-origin POST from riding the session cookie.
         ct = request.headers.get("content-type", "").split(";")[0].strip().lower()
         return ct == "application/json"
+
+    @app.get("/api/download")
+    async def download_archive(request: Request):
+        # A raw export ships payload content the read-only views deliberately never do
+        # (comment bodies, book records), so it rides the SAME gate as control: a
+        # configured secret + a valid login session. It is read-only (no intent broker).
+        # Being a GET it can't carry the json/control header, but the SameSite=strict
+        # session cookie authenticates a same-origin <a download> and a cross-site page
+        # can't send it (CSRF-safe); we also reject a cross-site Sec-Fetch-Site.
+        if not controls_on:
+            return JSONResponse({"error": "controls disabled"}, status_code=503)
+        src = _source(request)
+        sid = request.cookies.get("polytape_admin")
+        if not sessions.valid(sid):
+            audit.write(action="download", result="unauthorized", source=src)
+            return JSONResponse({"error": "not authenticated"}, status_code=403)
+        site = request.headers.get("sec-fetch-site")
+        if site is not None and site not in ("same-origin", "none"):
+            # The real CSRF case (a valid session driven from a foreign origin) — audit it.
+            audit.write(action="download", result="cross-site-blocked", source=src)
+            return JSONResponse({"error": "cross-site download blocked"}, status_code=403)
+        # ?all=1 -> the whole run; repeatable ?event=<id> -> selected matches. Parsed
+        # by hand so the signature stays Query()-free (and lint-clean).
+        whole = request.query_params.get("all", "").lower() in ("1", "true", "yes", "on")
+        event = request.query_params.getlist("event")
+        fp = control.fingerprint(sid)
+        run_dir = reader.run_dir
+        try:
+            meta = await asyncio.to_thread(dl.load_run_meta, run_dir)
+        except (OSError, json.JSONDecodeError):
+            return JSONResponse({"error": "run metadata unavailable"}, status_code=404)
+
+        headers = {"Cache-Control": "no-store"}
+        if whole:
+            entries = await asyncio.to_thread(dl.whole_run_entries, run_dir, meta)
+            if not entries:
+                return JSONResponse({"error": "run has no data files"}, status_code=404)
+            audit.write(
+                action="download", result="ok", source=src, session_fp=fp, scope="whole-run"
+            )
+            headers["Content-Disposition"] = f'attachment; filename="{run_dir.name}.tar.gz"'
+            return StreamingResponse(
+                dl.stream_targz(entries), media_type="application/gzip", headers=headers
+            )
+
+        known = set(dl.known_event_ids(meta))
+        selected = [e for e in dict.fromkeys(event) if e in known]  # dedupe; keep only known
+        if not selected:
+            return JSONResponse({"error": "no known match selected"}, status_code=400)
+        scratch = Path(tempfile.mkdtemp(prefix="polytape-dl-"))
+        try:
+            entries = await asyncio.to_thread(
+                dl.filter_run, run_dir, selected, scratch, meta=meta, exported_at=utc_now_iso()
+            )
+        except OSError as exc:
+            shutil.rmtree(scratch, ignore_errors=True)
+            logger.warning("download filter failed: %s", exc)
+            return JSONResponse({"error": "could not build archive"}, status_code=507)
+        except BaseException:
+            # Any non-OSError bug must not leak the (potentially multi-GB) scratch dir
+            # on the recorder VM's filesystem; clean up, then let it surface as a 500.
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
+        audit.write(
+            action="download", result="ok", source=src, session_fp=fp, scope=",".join(selected)
+        )
+        filename = (
+            f"event-{selected[0]}.tar.gz"
+            if len(selected) == 1
+            else f"polytape-{len(selected)}-matches.tar.gz"
+        )
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return StreamingResponse(
+            dl.stream_targz(entries, on_done=lambda: shutil.rmtree(scratch, ignore_errors=True)),
+            media_type="application/gzip",
+            headers=headers,
+        )
 
     @app.get("/api/session")
     async def session(request: Request) -> JSONResponse:

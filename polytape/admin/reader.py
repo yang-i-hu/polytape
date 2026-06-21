@@ -108,6 +108,11 @@ class RunReader:
 
     # -- file helpers ------------------------------------------------------- #
 
+    @property
+    def run_dir(self) -> Path:
+        """The run directory this reader observes (used by the download endpoint)."""
+        return self._dir
+
     def _file(self, stream: str) -> Path:
         return self._dir / f"{stream}.jsonl"
 
