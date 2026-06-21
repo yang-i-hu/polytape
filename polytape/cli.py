@@ -8,6 +8,7 @@ The actual capture pipeline (Gamma resolution, websockets, writer) is wired into
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -33,15 +34,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--event-id",
-        required=True,
+        action="append",
+        dest="event_id",
         metavar="ID",
-        help="Polymarket Event ID to record (numeric for live captures).",
+        help="Polymarket Event ID to record (numeric; repeatable for several events).",
+    )
+    parser.add_argument(
+        "--matches-file",
+        dest="matches_file",
+        metavar="PATH",
+        help="JSON file of matches (e.g. wc_matches.json) to record instead of --event-id.",
+    )
+    parser.add_argument(
+        "--open-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --matches-file, record only events that are not yet closed.",
+    )
+    parser.add_argument(
+        "--run-name",
+        dest="run_name",
+        metavar="NAME",
+        help="Label for a multi-event run; output goes to OUT/run-<name>/.",
     )
     parser.add_argument(
         "--out",
         default="./data",
         metavar="DIR",
-        help="Output root directory; data is written to DIR/event-<id>/.",
+        help="Output root directory; data is written to DIR/event-<id>/ (or DIR/run-<name>/).",
     )
     parser.add_argument(
         "--comments",
@@ -59,19 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-hash",
         action="store_true",
         help="Write usernames/identifiers verbatim instead of salted-hashing them.",
-    )
-    parser.add_argument(
-        "--include-series-comments",
-        action="store_true",
-        help="Also record comments on the event's parent series (e.g. a sports "
-        "league/tournament chat, where sports comments live rather than on the match).",
-    )
-    parser.add_argument(
-        "--entity-type",
-        default="Event",
-        choices=("Event", "Series"),
-        help="Parent entity type of --event-id. 'Series' records a parent-series "
-        "chat directly by its series id (comments only; no markets/book).",
     )
     parser.add_argument(
         "--market-id",
@@ -101,15 +108,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def load_matches(path: str, open_only: bool = True) -> tuple[str, ...]:
+    """Read event ids from a matches JSON file (e.g. ``wc_matches.json``).
+
+    The file is a list of objects with ``event_id`` and ``closed`` fields (as
+    produced by ``scripts/list_wc_matches.py``). With ``open_only`` (default),
+    closed/resolved events are skipped. Order-preserving and de-duplicated.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    ids: list[str] = []
+    for match in data:
+        if open_only and match.get("closed"):
+            continue
+        event_id = match.get("event_id")
+        if event_id:
+            ids.append(str(event_id).strip())
+    return tuple(dict.fromkeys(ids))
+
+
 def config_from_args(args: argparse.Namespace) -> Config:
     """Build a validated :class:`Config` from parsed arguments.
 
     Raises:
         ValueError: if the argument combination is invalid (propagated from
-            :class:`Config` validation).
+            :class:`Config` validation, or for a missing/empty event source).
     """
+    if args.event_id:
+        event_ids = tuple(str(e).strip() for e in args.event_id)
+    elif args.matches_file:
+        event_ids = load_matches(args.matches_file, args.open_only)
+        if not event_ids:
+            raise ValueError(f"no matching events found in {args.matches_file}")
+    else:
+        raise ValueError("one of --event-id or --matches-file is required")
     return Config(
-        event_id=str(args.event_id).strip(),
+        event_ids=event_ids,
+        run_name=args.run_name,
         out_dir=Path(args.out),
         comments=args.comments,
         book=args.book,
@@ -117,8 +151,6 @@ def config_from_args(args: argparse.Namespace) -> Config:
         market_ids=tuple(args.market_id or ()),
         dry_run=args.dry_run,
         log_level=args.log_level,
-        include_series_comments=args.include_series_comments,
-        entity_type=args.entity_type,
     )
 
 
@@ -161,8 +193,9 @@ def main(argv: list[str] | None = None) -> int:
     config = parse_args(argv)
     setup_logging(config.log_level)
     logger.info(
-        "polytape %s | event=%s streams=%s out=%s hash=%s dry_run=%s",
+        "polytape %s | events=%d (primary=%s) streams=%s out=%s hash=%s dry_run=%s",
         __version__,
+        len(config.event_ids),
         config.event_id,
         ",".join(config.enabled_streams),
         config.event_dir,

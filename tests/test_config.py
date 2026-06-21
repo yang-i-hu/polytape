@@ -34,7 +34,7 @@ def test_nonnumeric_dry_run_ok():
 
 
 def test_empty_event_id_raises():
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError, match="at least one event id"):
         Config(event_id="   ")
 
 
@@ -64,13 +64,6 @@ def test_cli_log_level_uppercased():
     assert parse_args(["--event-id", "1", "--log-level", "debug"]).log_level == "DEBUG"
 
 
-def test_cli_include_series_comments_flag():
-    assert parse_args(["--event-id", "1"]).include_series_comments is False
-    assert (
-        parse_args(["--event-id", "1", "--include-series-comments"]).include_series_comments is True
-    )
-
-
 def test_cli_missing_event_id_exits():
     with pytest.raises(SystemExit):
         parse_args([])
@@ -79,3 +72,47 @@ def test_cli_missing_event_id_exits():
 def test_cli_both_streams_off_exits():
     with pytest.raises(SystemExit):
         parse_args(["--event-id", "1", "--no-comments", "--no-book"])
+
+
+# -- multi-event (Phase 3) ------------------------------------------------- #
+
+
+def _write_matches(tmp_path):
+    import json
+
+    p = tmp_path / "m.json"
+    p.write_text(
+        json.dumps(
+            [
+                {"event_id": "1001", "closed": False},
+                {"event_id": "1002", "closed": True},
+                {"event_id": "1003", "closed": False},
+                {"event_id": "1001", "closed": False},  # duplicate
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return p
+
+
+def test_load_matches_open_only(tmp_path):
+    from polytape.cli import load_matches
+
+    p = _write_matches(tmp_path)
+    assert load_matches(str(p), open_only=True) == ("1001", "1003")  # closed skipped, deduped
+    assert load_matches(str(p), open_only=False) == ("1001", "1002", "1003")
+
+
+def test_cli_matches_file_is_multi(tmp_path):
+    p = _write_matches(tmp_path)
+    cfg = parse_args(["--matches-file", str(p), "--run-name", "wc", "--out", str(tmp_path)])
+    assert cfg.event_ids == ("1001", "1003")
+    assert cfg.is_multi and cfg.event_dir == tmp_path / "run-wc"
+
+
+def test_cli_multiple_event_ids(tmp_path):
+    cfg = parse_args(
+        ["--event-id", "1001", "--event-id", "1002", "--run-name", "wc", "--out", str(tmp_path)]
+    )
+    assert cfg.event_ids == ("1001", "1002")
+    assert cfg.event_dir == tmp_path / "run-wc"

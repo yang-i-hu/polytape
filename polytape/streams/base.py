@@ -30,7 +30,25 @@ logger = logging.getLogger("polytape.stream")
 # should not silently drop a large frame.
 _MAX_MESSAGE_SIZE = 16 * 1024 * 1024
 
+# Default per-stream read deadline (seconds). If *no* frame at all arrives within
+# this window the socket is force-closed and reconnected. On a healthy link the
+# keepalive PONG replies (every ~ping_interval seconds) keep this from firing, so
+# it triggers only on true silence — a TCP half-open or the network blackout of a
+# GCP live migration — and never on a merely quiet market. (A data-plane-only
+# freeze where PONGs keep flowing but data stops is a high-fan-in concern, out of
+# scope for this single-event recorder.)
+_READ_TIMEOUT = 20.0
+
 ConnectFactory = Callable[[str], Any]  # url -> async context manager yielding a ws
+
+
+class StreamInactivityError(Exception):
+    """No frame arrived within the read deadline (silent freeze / migration brownout).
+
+    Deliberately a plain ``Exception`` so the supervisor's broad handler treats it
+    as an ordinary reconnectable error: force-close, reconnect with backoff, and
+    record the gap — the same recovery path a real disconnect takes.
+    """
 
 
 def default_connect(url: str) -> Any:
@@ -60,13 +78,17 @@ class WebSocketStream:
         writer: CaptureWriter,
         ping_text: str,
         ping_interval: float = 5.0,
+        read_timeout: float = _READ_TIMEOUT,
         connect: ConnectFactory = default_connect,
+        on_activity: Callable[[], None] | None = None,
     ) -> None:
         self.url = url
         self.writer = writer
         self.ping_text = ping_text
         self.ping_interval = ping_interval
+        self.read_timeout = read_timeout
         self._connect = connect
+        self._on_activity = on_activity
 
     # -- to override ------------------------------------------------------- #
 
@@ -84,6 +106,15 @@ class WebSocketStream:
 
     def on_written(self, raw: dict[str, Any]) -> None:
         """Hook invoked after a *new* (non-duplicate) message is written."""
+
+    def resolve_event_id(self, raw: dict[str, Any]) -> str | None:
+        """Return the event id a message belongs to, for per-event accounting.
+
+        Default ``None`` (single-event / untagged). The comment stream returns the
+        ``parentEntityID`` (or a reaction's resolved event); the book stream maps
+        the top-level ``market`` (condition id) to its event.
+        """
+        return None
 
     # -- message decoding -------------------------------------------------- #
 
@@ -132,7 +163,8 @@ class WebSocketStream:
                 backoff and to backfill missed comments on reconnect.
 
         Raises:
-            Propagates connection errors (e.g. ``websockets.ConnectionClosed``)
+            Propagates connection errors (e.g. ``websockets.ConnectionClosedError``)
+            and :class:`StreamInactivityError` (no frame within ``read_timeout``)
             so the supervisor can reconnect. A clean close returns normally.
         """
         frames = self.subscribe_frames()
@@ -144,12 +176,22 @@ class WebSocketStream:
             try:
                 if on_connect is not None:
                     await on_connect()
-                async for message in ws:
+                while True:
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=self.read_timeout)
+                    except asyncio.TimeoutError as exc:
+                        raise StreamInactivityError(
+                            f"{self.stream}: no frame for {self.read_timeout:.0f}s"
+                        ) from exc
+                    if self._on_activity is not None:
+                        self._on_activity()
                     for raw in self.decode(message):
                         if not self.should_record(raw):
                             continue
-                        if self.writer.write(self.stream, raw):
+                        if self.writer.write(self.stream, raw, event_id=self.resolve_event_id(raw)):
                             self.on_written(raw)
+            except websockets.ConnectionClosedOK:
+                pass  # clean close -> return normally (supervisor logs "session ended")
             finally:
                 keepalive.cancel()
                 with contextlib.suppress(BaseException):

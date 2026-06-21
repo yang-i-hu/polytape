@@ -1,0 +1,74 @@
+# polytape admin dashboard — sidecar bound to localhost:8080.
+#
+# Reach it WITHOUT opening any port, via an SSH tunnel from your machine:
+#   gcloud compute ssh polytape-rec --zone=europe-west2-a --project=<proj> -- -L 8080:localhost:8080
+# then open http://localhost:8080
+#
+# The dashboard is read-only UNLESS a control secret is configured. Read-only mode
+# needs no setup beyond the venv extra. The guarded control plane (restart / refresh /
+# arm-heartbeat) requires the dedicated user + secret + privilege bridge below.
+#
+# ── read-only setup ────────────────────────────────────────────────────────
+#   pip install 'polytape[admin]'   # fastapi + uvicorn into the venv
+#   cp deploy/polytape-admin.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now polytape-admin
+#
+# ── control-plane setup (run as root; verify on the VM before trusting) ──────
+#   useradd --system --no-create-home --shell /usr/sbin/nologin polytape-admin
+#   usermod -aG polytape polytape-admin                 # ONLY to read heartbeat.env (group polytape)
+#   # Heartbeat URL in its OWN file so the admin reads armed-state but NEVER the salt;
+#   # leave /etc/polytape/polytape.env at 0600 owner polytape (admin must not read it):
+#   install -m 0640 -o root -g polytape /dev/null /etc/polytape/heartbeat.env
+#   # The admin secret (NOT in this unit text, NOT readable by the recorder 'polytape'):
+#   install -m 0600 -o polytape-admin -g polytape-admin /dev/null /etc/polytape/admin.env
+#   printf 'POLYTAPE_ADMIN_TOKEN=%s\n' "$(openssl rand -base64 32)" > /etc/polytape/admin.env
+#   cp deploy/polytape-admin.tmpfiles.conf /etc/tmpfiles.d/polytape-admin.conf
+#   systemd-tmpfiles --create /etc/tmpfiles.d/polytape-admin.conf   # /run/polytape-admin{,/intent} + lock
+#   install -m 0755 deploy/polytape-control.sh /opt/polytape/polytape-control.sh
+#   cp deploy/polytape-control.service deploy/polytape-control.path /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now polytape-control.path
+#   systemctl restart polytape-admin
+# Controls stay OFF (read-only) until /etc/polytape/admin.env exists with a token.
+
+[Unit]
+Description=polytape admin dashboard (localhost:8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polytape-admin
+Group=polytape-admin
+SupplementaryGroups=polytape
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYTAPE_RUN_DIR=/data/run-wc
+Environment=POLYTAPE_UNIT=polytape
+# Read heartbeat-armed state from the salt-free heartbeat.env, NOT polytape.env.
+Environment=POLYTAPE_ENV_FILE=/etc/polytape/heartbeat.env
+Environment=POLYTAPE_MATCHES_FILE=/etc/polytape/wc_matches.json
+Environment=POLYTAPE_INTENT_DIR=/run/polytape-admin/intent
+Environment=POLYTAPE_AUDIT_DIR=/var/log/polytape-admin/audit.jsonl
+# Holds POLYTAPE_ADMIN_TOKEN. Optional ('-'): without it the control plane is OFF.
+EnvironmentFile=-/etc/polytape/admin.env
+ExecStart=/opt/polytape/venv/bin/polytape-admin --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polytape-admin
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/run/polytape-admin
+LogsDirectory=polytape-admin
+LogsDirectoryMode=0700
+UMask=0077
+ProtectHome=true
+PrivateTmp=true
+# Hard memory cap: the sidecar's bounded reads sit well under this; the cap means a
+# runaway scan gets cgroup-killed in isolation and can NEVER OOM the recorder.
+MemoryHigh=512M
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

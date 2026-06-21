@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+import websockets
 
 from polytape.config import Config
 from polytape.gamma import EventInfo, Market
@@ -32,6 +33,19 @@ class FakeWS:
         if self.blocking:
             await self._block.wait()  # stay open until cancelled
         raise StopAsyncIteration
+
+    async def recv(self) -> str:
+        """Return the next frame, block while ``blocking``, else signal a clean close.
+
+        Mirrors the real ``websockets`` client: a clean end raises
+        ``ConnectionClosedOK`` (which the stream loop treats as a normal return).
+        """
+        if self._frames:
+            await asyncio.sleep(0)
+            return self._frames.pop(0)
+        if self.blocking:
+            await self._block.wait()  # stay open until cancelled
+        raise websockets.ConnectionClosedOK(None, None)
 
 
 class FakeCM:

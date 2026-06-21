@@ -7,7 +7,7 @@ import json
 import pytest
 
 from polytape.envelope import Hasher
-from polytape.writer import CaptureWriter, _downtime_seconds
+from polytape.writer import CaptureWriter, FatalRecorderError, _downtime_seconds
 
 
 def _read(path):
@@ -90,3 +90,67 @@ def test_write_before_open_raises(make_config):
     w = CaptureWriter(make_config(book=False))
     with pytest.raises(RuntimeError, match="not open"):
         w.write("comments", {"payload": {"id": "a"}})
+
+
+class _FullDisk:
+    """A file stub that fails every write/flush as if the disk were full (ENOSPC)."""
+
+    def write(self, *_args):
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        raise OSError(28, "No space left on device")
+
+    def close(self):
+        pass
+
+
+def test_write_full_disk_is_fatal(make_config):
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+        w._files["comments"].close()
+        w._files["comments"] = _FullDisk()  # simulate ENOSPC on the data file
+        with pytest.raises(FatalRecorderError):
+            w.write("comments", {"payload": {"id": "a"}})
+
+
+def test_meta_write_full_disk_is_fatal(make_config, monkeypatch):
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+
+        def _boom(*_a, **_k):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("polytape.writer.os.replace", _boom)
+        with pytest.raises(FatalRecorderError):
+            w.record_gap("comments", "2026-06-15T19:31:02Z", "2026-06-15T19:31:07Z")
+
+
+def test_seen_set_is_bounded(make_config, monkeypatch):
+    monkeypatch.setattr("polytape.writer._SEEN_CAP", 3)
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+        for i in range(5):
+            assert w.write("comments", {"payload": {"id": f"c{i}"}}) is True
+        assert w.seen_count("comments") <= 3
+        # the oldest ids were evicted -> writable again (no longer "seen")
+        assert w.write("comments", {"payload": {"id": "c0"}}) is True
+        # a still-recent id is correctly rejected as a duplicate
+        assert w.write("comments", {"payload": {"id": "c4"}}) is False
+
+
+def test_multi_event_counts_and_envelope_shape(make_config):
+    cfg = make_config()
+    with CaptureWriter(cfg) as w:
+        assert w.write("comments", {"payload": {"id": "a"}}, event_id="1001") is True
+        assert w.write("comments", {"payload": {"id": "b"}}, event_id="1002") is True
+        assert w.write("book", {"event_type": "book", "hash": "0xH"}, event_id="1001") is True
+    rec = json.loads(_read(cfg.event_dir / "comments.jsonl")[0])
+    # the documented 5-key envelope contract survives the multi-event path
+    assert set(rec) == {"stream", "id", "ts_recv", "ts_server", "raw"}
+    meta = json.loads((cfg.event_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["counts"] == {"comments": 2, "book": 1}
+    assert meta["counts_by_event"] == {
+        "1001": {"comments": 1, "book": 1},
+        "1002": {"comments": 1},
+    }

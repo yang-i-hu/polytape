@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from polytape.envelope import utc_now_iso
+from polytape.writer import FatalRecorderError
 
 if TYPE_CHECKING:
     from polytape.gamma import GammaClient
@@ -41,7 +42,6 @@ class StreamSupervisor:
         *,
         writer: CaptureWriter,
         backfill: BackfillCallback | None = None,
-        initial_backfill: bool = False,
         base_delay: float = 1.0,
         max_delay: float = 30.0,
         reset_after: float = 15.0,
@@ -52,7 +52,6 @@ class StreamSupervisor:
         self._stream = stream
         self._writer = writer
         self._backfill = backfill
-        self._initial_backfill = initial_backfill
         self._base_delay = base_delay
         self._max_delay = max_delay
         self._reset_after = reset_after
@@ -93,6 +92,8 @@ class StreamSupervisor:
                 backfilled = await self._backfill()
             except asyncio.CancelledError:
                 raise
+            except FatalRecorderError:
+                raise  # disk full while backfilling: surface it, don't swallow
             except Exception:
                 logger.exception("%s: backfill failed on reconnect", self._name)
         self._writer.record_gap(
@@ -110,28 +111,12 @@ class StreamSupervisor:
         """
         attempt = 0
         pending_disconnect: str | None = None
-        did_initial = False
 
         async def _on_connect() -> None:
-            nonlocal pending_disconnect, did_initial
+            nonlocal pending_disconnect
             if pending_disconnect is not None:
                 await self._handle_reconnect(pending_disconnect)
                 pending_disconnect = None
-            elif self._initial_backfill and not did_initial and self._backfill is not None:
-                # Pull the *existing* messages (e.g. the chat already posted) once
-                # on first connect, so the capture isn't empty until something new
-                # arrives. Not a gap — no meta gap entry is recorded.
-                did_initial = True
-                try:
-                    recovered = await self._backfill()
-                    if recovered:
-                        logger.info(
-                            "%s: initial backfill recovered %d message(s)", self._name, recovered
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("%s: initial backfill failed", self._name)
 
         while not self._stop.is_set():
             started = self._monotonic()
@@ -139,6 +124,8 @@ class StreamSupervisor:
                 await self._stream.run_once(on_connect=_on_connect)
             except asyncio.CancelledError:
                 raise
+            except FatalRecorderError:
+                raise  # disk full / unrecoverable: do NOT reconnect, stop the process
             except Exception as exc:
                 logger.warning("%s: connection error: %s", self._name, exc)
             else:
@@ -175,12 +162,12 @@ def make_comment_backfill(
 
     async def _backfill() -> int:
         count = 0
-        for parent_type, parent_id in stream.backfill_targets():
-            missed = await gamma.backfill_since(
-                parent_id, stream.cursor_for(parent_id), parent_entity_type=parent_type
-            )
+        # One firehose, N events: page each event from its own cursor and tag the
+        # recovered comments with that event id (dedup guards against overlap).
+        for event_id in stream.event_ids:
+            missed = await gamma.backfill_since(event_id, stream.last_comment_id_for(event_id))
             for comment in missed:
-                if writer.write(stream.stream, comment):
+                if writer.write(stream.stream, comment, event_id=event_id):
                     count += 1
         if count:
             logger.info("%s: backfilled %d missed comment(s)", stream.stream, count)

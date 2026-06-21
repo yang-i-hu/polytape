@@ -13,6 +13,8 @@ import json
 import logging
 from typing import Any
 
+import websockets
+
 from polytape.config import STREAM_COMMENTS, Config
 from polytape.envelope import Hasher, utc_now_iso
 from polytape.gamma import EventInfo, Market
@@ -213,6 +215,12 @@ class _MockWS:
             await asyncio.sleep(0)  # cooperative yield
             return self._frames.pop(0)
         raise StopAsyncIteration
+
+    async def recv(self) -> str:
+        if self._frames:
+            await asyncio.sleep(0)  # cooperative yield
+            return self._frames.pop(0)
+        raise websockets.ConnectionClosedOK(None, None)  # clean close -> run_once returns
 
 
 class _MockCM:

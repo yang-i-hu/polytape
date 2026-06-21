@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
-from polytape.streams.base import WebSocketStream
-from polytape.streams.clob import BookStream, book_subscribe_frame
+import pytest
+
+from polytape.gamma import EventInfo, Market, cond_to_event
+from polytape.streams.base import StreamInactivityError, WebSocketStream
+from polytape.streams.clob import BookStream, book_subscribe_frame, shard_tokens
 from polytape.streams.rtds import CommentStream, comment_subscribe_frame
 from polytape.writer import CaptureWriter
 
@@ -30,65 +34,8 @@ def test_comment_should_record_filters_by_event():
     # reaction only attributed once its parent comment has been seen
     reaction = {"type": "reaction_created", "payload": {"id": "r", "commentID": "x"}}
     assert not cs.should_record(reaction)
-    cs._known_comment_ids.add("x")
+    cs._comment_to_event["x"] = "20200"  # parent comment now seen this session
     assert cs.should_record(reaction)
-
-
-def test_comment_should_record_includes_series_when_enabled():
-    cs = CommentStream(event_id="351729", writer=None, series_ids=("11433",))
-    # event-level comment
-    assert cs.should_record({"type": "comment_created", "payload": {"parentEntityID": "351729"}})
-    # parent-series comment (where sports chat lives)
-    assert cs.should_record(
-        {
-            "type": "comment_created",
-            "payload": {"parentEntityID": 11433, "parentEntityType": "Series"},
-        }
-    )
-    # a different series is still dropped
-    assert not cs.should_record({"type": "comment_created", "payload": {"parentEntityID": "99999"}})
-
-
-def test_comment_series_off_by_default():
-    cs = CommentStream(event_id="351729", writer=None)  # no series_ids
-    assert not cs.should_record({"type": "comment_created", "payload": {"parentEntityID": "11433"}})
-    assert cs.should_record({"type": "comment_created", "payload": {"parentEntityID": "351729"}})
-
-
-def _comment(parent_id, parent_type):
-    return {
-        "type": "comment_created",
-        "payload": {"parentEntityID": parent_id, "parentEntityType": parent_type},
-    }
-
-
-def test_comment_event_capture_rejects_colliding_series_chat():
-    # id 11433 exists in BOTH namespaces (an Event AND the "FIFA World Cup" Series).
-    # Recording the EVENT must not absorb the SERIES chat when the type is present.
-    cs = CommentStream(event_id="11433", writer=None)  # entity_type defaults to "Event"
-    assert cs.should_record(_comment(11433, "Event"))
-    assert not cs.should_record(_comment(11433, "Series"))
-
-
-def test_comment_series_capture_records_series_and_backfills_as_series():
-    # Recording a parent-series chat directly by its series id (the dashboard's
-    # "Live chat now" Record on a Series row).
-    cs = CommentStream(event_id="11433", writer=None, entity_type="Series")
-    assert cs.should_record(_comment(11433, "Series"))
-    # the same id in the Event namespace is a different entity -> dropped
-    assert not cs.should_record(_comment(11433, "Event"))
-    # backfill must query /comments?parent_entity_type=Series, not Event
-    assert cs.backfill_targets() == [("Series", "11433")]
-
-
-def test_comment_per_parent_cursor_and_backfill_targets():
-    cs = CommentStream(event_id="351729", writer=None, series_ids=("11433",))
-    assert cs.backfill_targets() == [("Event", "351729"), ("Series", "11433")]
-    cs.on_written({"type": "comment_created", "payload": {"id": "e1", "parentEntityID": "351729"}})
-    cs.on_written({"type": "comment_created", "payload": {"id": "s1", "parentEntityID": "11433"}})
-    assert cs.cursor_for("351729") == "e1"
-    assert cs.cursor_for("11433") == "s1"
-    assert cs.last_comment_id == "e1"  # the event's cursor
 
 
 def test_book_subscribe_frame():
@@ -154,3 +101,108 @@ async def test_book_stream_ids(make_config, make_connect):
 
 def test_book_stream_empty_tokens_no_frame():
     assert BookStream(token_ids=[], writer=None).subscribe_frames() == []
+
+
+async def test_watchdog_raises_on_inactivity(make_config, make_connect):
+    # Socket open but no frame ever arrives (a silent freeze / migration blackout):
+    # the read deadline must fire so the supervisor reconnects and records a gap.
+    cfg = make_config(book=False)
+    connect = make_connect([], blocking=True)
+    with CaptureWriter(cfg) as w:
+        cs = CommentStream(event_id="20200", writer=w, connect=connect)
+        cs.read_timeout = 0.05
+        with pytest.raises(StreamInactivityError):
+            await asyncio.wait_for(cs.run_once(), timeout=2.0)
+
+
+async def test_watchdog_does_not_trip_while_data_flows(make_config, make_connect):
+    # A frame within the deadline must not trip the watchdog; a clean close returns.
+    cfg = make_config(book=False)
+    c = {"type": "comment_created", "payload": {"id": "c1", "parentEntityID": 20200}}
+    connect = make_connect([json.dumps(c)])
+    with CaptureWriter(cfg) as w:
+        cs = CommentStream(event_id="20200", writer=w, connect=connect)
+        cs.read_timeout = 0.5
+        await asyncio.wait_for(cs.run_once(), timeout=2.0)
+        assert w.counts["comments"] == 1
+
+
+# -- multi-event (Phase 3) ------------------------------------------------- #
+
+
+def test_shard_tokens_packs_whole_groups():
+    groups = [tuple(f"e{e}t{i}" for i in range(6)) for e in range(44)]  # 44 events x 6 tokens
+    shards = shard_tokens(groups, cap=180)
+    flat = [t for s in shards for t in s]
+    assert len(flat) == 264 and len(set(flat)) == 264  # complete union, no token shared
+    assert all(len(s) <= 180 for s in shards)
+    assert all(len(s) % 6 == 0 for s in shards)  # an event's 6 tokens never split
+    assert len(shards) == 2  # 264 tokens at cap 180
+
+
+def test_shard_tokens_single_and_oversized():
+    assert shard_tokens([("a", "b")], cap=180) == [("a", "b")]
+    assert shard_tokens([(), ("a",)], cap=180) == [("a",)]  # empty groups skipped
+    with pytest.raises(ValueError):
+        shard_tokens([tuple(range(200))], cap=180)
+
+
+def test_book_stream_demux_routes_by_market():
+    routing = {"0xA": "1001", "0xB": "1002"}
+    bs = BookStream(token_ids=["t"], writer=None, cond_to_event=routing)
+    # all message types route by top-level market; price_change has NO top-level asset_id
+    assert bs.resolve_event_id({"event_type": "book", "market": "0xA", "asset_id": "t"}) == "1001"
+    assert (
+        bs.resolve_event_id(
+            {"event_type": "price_change", "market": "0xB", "price_changes": [{"asset_id": "z"}]}
+        )
+        == "1002"
+    )
+    assert bs.resolve_event_id({"event_type": "last_trade_price", "market": "0xA"}) == "1001"
+    assert bs.resolve_event_id({"market": "0xUNKNOWN"}) is None
+    # known market kept, unknown dropped, missing market recorded (never silently lost)
+    assert bs.should_record({"market": "0xA"}) is True
+    assert bs.should_record({"market": "0xZZZ"}) is False
+    assert bs.should_record({"event_type": "book"}) is True
+
+
+def test_book_stream_single_event_accepts_all():
+    bs = BookStream(token_ids=["t"], writer=None)  # no routing map (single-event back-compat)
+    assert bs.should_record({"market": "anything"}) is True
+    assert bs.resolve_event_id({"market": "anything"}) is None
+
+
+def test_comment_stream_multi_event_routing():
+    cs = CommentStream(event_ids={"1001", "1002"}, writer=None)
+    a = {"type": "comment_created", "payload": {"id": "ca", "parentEntityID": 1001}}
+    b = {"type": "comment_created", "payload": {"id": "cb", "parentEntityID": 1002}}
+    other = {"type": "comment_created", "payload": {"id": "cx", "parentEntityID": 9999}}
+    assert cs.should_record(a) and cs.should_record(b) and not cs.should_record(other)
+    assert cs.resolve_event_id(a) == "1001" and cs.resolve_event_id(b) == "1002"
+    cs.on_written(a)
+    cs.on_written(b)
+    assert cs.last_comment_id_for("1001") == "ca" and cs.last_comment_id_for("1002") == "cb"
+    assert cs.last_comment_id is None  # ambiguous for a multi-event stream
+    react = {"type": "reaction_created", "payload": {"id": "r", "commentID": "ca"}}
+    assert cs.should_record(react) and cs.resolve_event_id(react) == "1001"
+
+
+def test_cond_to_event_maps_condition_ids():
+    e1 = EventInfo(
+        event_id="1001",
+        title=None,
+        slug=None,
+        markets=(
+            Market(id="m1", condition_id="0xA", token_ids=("t1", "t2")),
+            Market(id="m2", condition_id="0xB", token_ids=("t3", "t4")),
+        ),
+        raw={},
+    )
+    e2 = EventInfo(
+        event_id="1002",
+        title=None,
+        slug=None,
+        markets=(Market(id="m3", condition_id="0xC", token_ids=("t5", "t6")),),
+        raw={},
+    )
+    assert cond_to_event([e1, e2]) == {"0xA": "1001", "0xB": "1001", "0xC": "1002"}

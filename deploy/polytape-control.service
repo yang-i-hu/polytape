@@ -1,0 +1,18 @@
+# Root-run oneshot that acts on the admin's control intents. Triggered by
+# polytape-control.path; runs deploy/polytape-control.sh, the single privileged
+# validation + audit choke point. Deliberately runs as root (it must restart the
+# recorder / edit the env file) but does NOTHING the helper does not allow-list.
+[Unit]
+Description=polytape control-plane helper (privileged, intent-driven)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/polytape/polytape-control.sh
+# Hardening: needs root to restart the recorder, but a minimal write surface —
+# only the env dir, the admin spool, and the shared restart lock.
+ProtectSystem=strict
+ReadWritePaths=/etc/polytape /run/polytape-admin /run/polytape-control.lock
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true

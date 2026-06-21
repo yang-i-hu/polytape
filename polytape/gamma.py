@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
@@ -323,6 +324,23 @@ def _filter_markets(markets: tuple[Market, ...], market_ids: tuple[str, ...]) ->
     return selected
 
 
+def cond_to_event(events: Sequence[EventInfo]) -> dict[str, str]:
+    """Map each market's condition id to its event id — the CLOB demux key.
+
+    Every CLOB message type carries a top-level ``market`` (condition id), so
+    routing by ``market`` attributes each message to the right event. ``price_change``
+    in particular has no top-level ``asset_id``, so condition-id routing is the only
+    uniform key. Built from the resolved :class:`EventInfo` tuple so subscriptions
+    and routing share one source of truth.
+    """
+    mapping: dict[str, str] = {}
+    for event in events:
+        for market in event.markets:
+            if market.condition_id:
+                mapping[market.condition_id] = event.event_id
+    return mapping
+
+
 # --------------------------------------------------------------------------- #
 # Network client.
 # --------------------------------------------------------------------------- #
@@ -439,6 +457,36 @@ class GammaClient:
             len(info.clob_token_ids),
         )
         return info
+
+    async def resolve_events(
+        self, event_ids: Sequence[str], market_ids: tuple[str, ...] = ()
+    ) -> tuple[EventInfo, ...]:
+        """Resolve several events concurrently (bounded), preserving input order.
+
+        Individual failures are logged and skipped so one delisted/changed event
+        cannot sink the whole run; raises :class:`GammaError` only if *none*
+        resolve.
+        """
+        sem = asyncio.Semaphore(5)
+        ids = [str(e).strip() for e in event_ids]
+
+        async def _one(eid: str) -> EventInfo:
+            async with sem:
+                return await self.resolve_event(eid, market_ids)
+
+        results = await asyncio.gather(*(_one(e) for e in ids), return_exceptions=True)
+        events: list[EventInfo] = []
+        for eid, res in zip(ids, results, strict=True):
+            if isinstance(res, EventInfo):
+                events.append(res)
+            elif isinstance(res, asyncio.CancelledError):
+                raise res
+            else:
+                logger.warning("could not resolve event %s: %s", eid, res)
+        if not events:
+            raise GammaError(f"no events could be resolved from {ids}")
+        logger.info("resolved %d/%d event(s)", len(events), len(ids))
+        return tuple(events)
 
     async def fetch_comments(
         self,
