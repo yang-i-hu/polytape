@@ -37,6 +37,8 @@ PAGE = """<!doctype html>
   .live{background:rgba(61,220,151,.15);color:var(--green)}
   .quiet{background:rgba(245,177,76,.15);color:var(--amber)}
   .pending{background:var(--surface2);color:var(--dim)}
+  .finished{background:var(--surface2);color:var(--muted)}
+  .dlchk:disabled{opacity:.3;cursor:not-allowed}
   .footer{margin-top:14px;font-size:12px;color:var(--dim);font-family:var(--mono)}
   .ok{color:var(--green)} .warn{color:var(--amber)} .bad{color:var(--red)}
   .dlcol{display:none}
@@ -255,18 +257,27 @@ async function tick(){
     document.getElementById('cards').innerHTML = cards.map(([l,v])=>
       '<div class="card"><div class="lbl">'+l+'</div><div class="val">'+v+'</div></div>').join('');
 
-    document.getElementById('mtitle').textContent = 'matches · '+ms.length+' open';
-    document.getElementById('rows').innerHTML = ms.map(m=>
-      '<tr data-eid="'+m.event_id+'" style="cursor:pointer">'+
-      '<td class="dlcol"><input type="checkbox" class="dlchk" data-eid="'+m.event_id+'"'+(dlSelected.has(m.event_id)?' checked':'')+'></td>'+
-      '<td>'+m.title+'</td><td class="num">'+(m.date||'—')+'</td>'+
-      '<td class="num">'+n(m.counts?.book||0)+'</td>'+
-      '<td class="num">'+n(m.counts?.comments||0)+'</td>'+
-      '<td class="num '+freshClass(m.last_seen_age_s)+'">'+age(m.last_seen_age_s)+'</td>'+
-      '<td><span class="tag '+m.status+'">'+m.status+'</span></td></tr>').join('')
+    var nRec=ms.filter(function(m){return m.status==='live'||m.status==='quiet';}).length;
+    var nFin=ms.filter(function(m){return m.status==='finished';}).length;
+    document.getElementById('mtitle').textContent =
+      'matches · '+ms.length+' ('+nRec+' recording · '+nFin+' finished)';
+    document.getElementById('rows').innerHTML = ms.map(function(m){
+      var dis = m.downloadable ? '' : ' disabled';
+      // finished/pending: a dimmed em-dash for "last seen" (recency is meaningless there)
+      var lastSeen = (m.status==='finished'||m.status==='pending')
+        ? '<td class="num" style="color:var(--dim)">—</td>'
+        : '<td class="num '+freshClass(m.last_seen_age_s)+'">'+age(m.last_seen_age_s)+'</td>';
+      return '<tr data-eid="'+m.event_id+'" style="cursor:pointer">'+
+        '<td class="dlcol"><input type="checkbox" class="dlchk" data-eid="'+m.event_id+'"'+(dlSelected.has(m.event_id)?' checked':'')+dis+' title="'+(m.downloadable?'select to download':'no recorded data')+'"></td>'+
+        '<td>'+m.title+'</td><td class="num">'+(m.date||'—')+'</td>'+
+        '<td class="num">'+n(m.counts?.book||0)+'</td>'+
+        '<td class="num">'+n(m.counts?.comments||0)+'</td>'+
+        lastSeen+
+        '<td><span class="tag '+m.status+'">'+m.status+'</span></td></tr>';
+    }).join('')
       || '<tr><td colspan="7" style="color:var(--dim)">no matches in this run yet</td></tr>';
-    // forget ticks for matches that have rolled out of the run, then refresh the bar
-    var present=new Set(ms.map(function(m){return m.event_id;}));
+    // forget ticks for matches that are no longer downloadable, then refresh the bar
+    var present=new Set(ms.filter(function(m){return m.downloadable;}).map(function(m){return m.event_id;}));
     Array.from(dlSelected).forEach(function(e){ if(!present.has(e)) dlSelected.delete(e); });
     updateDlBar();
     document.getElementById('footer').textContent = 'updated '+(st.as_of||'')+' · started '+(st.started_at||'?');
@@ -277,7 +288,7 @@ async function tick(){
 }
 document.getElementById('rows').onclick=function(e){
   var chk=e.target.closest('.dlchk');
-  if(chk){ var id=chk.getAttribute('data-eid'); if(chk.checked) dlSelected.add(id); else dlSelected.delete(id); updateDlBar(); return; }
+  if(chk){ if(chk.disabled) return; var id=chk.getAttribute('data-eid'); if(chk.checked) dlSelected.add(id); else dlSelected.delete(id); updateDlBar(); return; }
   if(e.target.closest('.dlcol')) return;  // clicking the tick-box cell must not open the preview
   var tr=e.target.closest('tr'); if(tr&&tr.dataset.eid) openMatch(tr.dataset.eid);
 };

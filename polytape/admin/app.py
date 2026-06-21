@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 
 from polytape.admin import download as dl
+from polytape.admin import registry as reg
 from polytape.admin.page import PAGE
 from polytape.admin.reader import RunReader
 from polytape.envelope import utc_now_iso
@@ -43,6 +44,8 @@ def create_app(
     *,
     poll_interval: float = 2.0,
     admin_token: str | None = None,
+    registry_file: str | Path | None = None,
+    registry_refresh_s: float = 600.0,
     broker=None,
     audit=None,
     sessions=None,
@@ -89,13 +92,34 @@ def create_app(
                     reader.update()
                 await asyncio.sleep(poll_interval)
 
-        task = asyncio.create_task(_loop())
+        async def _registry_loop() -> None:
+            # SEPARATE, slow task: recover the full match set (finished + open) from
+            # Gamma OFF the event loop (asyncio.to_thread), persist it atomically, and
+            # NEVER blank a good registry on a failed/empty fetch. Runs once at startup
+            # (cold-start warm), then every registry_refresh_s. Kept off the 2 s poll
+            # so a slow Gamma can never stall reader.update().
+            while True:
+                try:
+                    events = await asyncio.to_thread(reg.fetch_registry)
+                    if events:
+                        await asyncio.to_thread(
+                            reg.write_registry_atomic, registry_file, events, now_iso=utc_now_iso()
+                        )
+                except Exception:  # noqa: BLE001 - Gamma down -> keep the last good registry
+                    logger.warning("registry refresh failed (keeping last good)", exc_info=True)
+                await asyncio.sleep(registry_refresh_s)
+
+        tasks = [asyncio.create_task(_loop())]
+        if registry_file is not None and registry_refresh_s > 0:
+            tasks.append(asyncio.create_task(_registry_loop()))
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(title="polytape-admin", docs_url=None, redoc_url=None, lifespan=lifespan)
 
@@ -177,14 +201,24 @@ def create_app(
                 dl.stream_targz(entries), media_type="application/gzip", headers=headers
             )
 
-        known = set(dl.known_event_ids(meta))
+        # The merged registry (all matches, finished + open). Built from the freshly
+        # read meta (open set) + the in-memory registry (finished), so the gate matches
+        # the /api/matches listing and works even before the first poll.
+        registry = reader.download_registry(meta)
+        known = set(dl.registry_known_ids(registry))
         selected = [e for e in dict.fromkeys(event) if e in known]  # dedupe; keep only known
         if not selected:
             return JSONResponse({"error": "no known match selected"}, status_code=400)
         scratch = Path(tempfile.mkdtemp(prefix="polytape-dl-"))
         try:
             entries = await asyncio.to_thread(
-                dl.filter_run, run_dir, selected, scratch, meta=meta, exported_at=utc_now_iso()
+                dl.filter_run,
+                run_dir,
+                selected,
+                scratch,
+                meta=meta,
+                registry=registry,
+                exported_at=utc_now_iso(),
             )
         except OSError as exc:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -341,6 +375,11 @@ def main(argv: list[str] | None = None) -> int:
         "--matches-file",
         default=os.environ.get("POLYTAPE_MATCHES_FILE", "/etc/polytape/wc_matches.json"),
     )
+    parser.add_argument(
+        "--registry-file",
+        default=os.environ.get("POLYTAPE_REGISTRY_FILE", "/var/log/polytape-admin/registry.json"),
+        help="Cumulative run registry (all matches, finished + open); refreshed from Gamma.",
+    )
     parser.add_argument("--host", default=os.environ.get("POLYTAPE_ADMIN_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("POLYTAPE_ADMIN_PORT", "8080"))
@@ -348,7 +387,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     reader = RunReader(
-        args.run_dir, unit=args.unit, env_file=args.env_file, matches_file=args.matches_file
+        args.run_dir,
+        unit=args.unit,
+        env_file=args.env_file,
+        matches_file=args.matches_file,
+        registry_file=args.registry_file,
     )
     with contextlib.suppress(Exception):
         reader.update()  # warm once so the first request has data
@@ -360,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     uvicorn.run(
-        create_app(reader, admin_token=admin_token),
+        create_app(reader, admin_token=admin_token, registry_file=args.registry_file),
         host=args.host,
         port=args.port,
         log_level="warning",

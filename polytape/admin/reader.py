@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from polytape.admin import registry as _reg
 from polytape.envelope import iso_to_datetime, utc_now_iso
 
 # Bound the bytes read per _consume call. Without this, the FIRST scan of a
@@ -57,6 +58,7 @@ class RunReader:
         unit: str = "polytape",
         env_file: str | Path = "/etc/polytape/polytape.env",
         matches_file: str | Path = "/etc/polytape/wc_matches.json",
+        registry_file: str | Path = "/var/log/polytape-admin/registry.json",
         live_window_s: float = 60.0,
         price_history: int = 120,
         peek: int = 60,
@@ -68,6 +70,7 @@ class RunReader:
         self._unit = unit
         self._env_file = Path(env_file)
         self._matches_file = Path(matches_file)
+        self._registry_file = Path(registry_file)
         self._live_window = live_window_s
         self._price_history = price_history
         self._now = now
@@ -101,6 +104,11 @@ class RunReader:
         self._asset_cond: dict[str, str] = {}
         self._event_conds: dict[str, list[str]] = {}
         self._market_label: dict[str, str] = {}
+        # Cumulative run registry (all matches, finished + open) — recovered from Gamma
+        # discovery and persisted; EXTENDS the meta-derived maps so finished matches
+        # (rolled out of meta.events) are still listed, counted, and downloadable.
+        self._registry: _reg.Registry = _reg.Registry()
+        self._registry_sig: tuple[int, int] | None = None
         # Reconstructed L2 book + last trade + price history, keyed by token (asset_id).
         self._book: dict[str, dict[str, dict[str, str]]] = {}
         self._last_trade: dict[str, dict[str, Any]] = {}
@@ -172,6 +180,38 @@ class RunReader:
                 if cond:
                     labels[cond] = market.get("groupItemTitle") or cond
         self._market_label = labels
+
+    def _load_registry(self) -> None:
+        """Load the persisted run registry (mtime-cached), and fold in its labels.
+
+        Best-effort: a missing/garbage file leaves an empty registry, so the admin
+        degrades to meta-only (exactly today's behaviour). The registry supersedes
+        ``_load_labels`` when present (its ``groupItemTitle`` covers finished matches),
+        but ``_load_labels`` stays as the fallback when the file is absent.
+        """
+        try:
+            stat = self._registry_file.stat()
+        except OSError:
+            self._registry, self._registry_sig = _reg.Registry(), None
+            return
+        sig = (stat.st_mtime_ns, stat.st_size)
+        if sig == self._registry_sig:
+            return
+        self._registry = _reg.load_registry(self._registry_file)
+        self._registry_sig = sig
+        if self._registry.labels:
+            # Registry labels win (cover finished matches); keep any meta-only labels.
+            self._market_label = {**self._market_label, **self._registry.labels}
+
+    def _book_event(self, raw: dict[str, Any]) -> str | None:
+        """Attribute a book record to its event: current meta first, then the registry.
+
+        The registry fallback is what credits FINISHED matches' records (their
+        conditionIds left ``meta.events`` when they rolled out) during the same book
+        scan the reader already performs — no extra pass.
+        """
+        market = str(raw.get("market"))
+        return self._cond2event.get(market) or self._registry.cond2event.get(market)
 
     def _consume(self, stream: str, event_of: Callable[[dict[str, Any]], str | None]) -> None:
         path = self._file(stream)
@@ -273,7 +313,8 @@ class RunReader:
         """Refresh meta + labels, ingest newly-appended records, refresh live snapshots."""
         self._load_meta()
         self._load_labels()
-        self._consume("book", lambda raw: self._cond2event.get(str(raw.get("market"))))
+        self._load_registry()
+        self._consume("book", self._book_event)
         self._consume("comments", _comment_event)
         # Refresh the cached recorder state once per tick (not once per /api/status
         # request) and compute records/sec from the count delta since the last tick.
@@ -315,8 +356,10 @@ class RunReader:
         """Reconstructed preview for one match: each outcome's book, last trade, price line."""
         event_id = str(event_id)
         markets: list[dict[str, Any]] = []
-        for cond in self._event_conds.get(event_id, []):
-            token = self._market_yes.get(cond, "")
+        # Registry fallback so a FINISHED match (gone from meta.events) still previews.
+        conds = self._event_conds.get(event_id) or self._registry.event_conds.get(event_id, [])
+        for cond in conds:
+            token = self._market_yes.get(cond) or self._registry.market_yes.get(cond, "")
             book = self._book.get(token, {"bids": {}, "asks": {}})
             bids = sorted(((float(p), float(s)) for p, s in book["bids"].items()), reverse=True)[:8]
             asks = sorted((float(p), float(s)) for p, s in book["asks"].items())[:8]
@@ -345,8 +388,11 @@ class RunReader:
             )
         return {
             "event_id": event_id,
-            "title": self._event_title.get(event_id, event_id),
-            "date": self._event_date.get(event_id),
+            "title": self._registry.title.get(event_id)
+            or self._event_title.get(event_id, event_id),
+            "date": self._registry.date.get(event_id) or self._event_date.get(event_id),
+            # A finished match's reconstructed book is frozen at its last record, not live.
+            "historical": event_id not in set(self._event_ids),
             "markets": markets,
         }
 
@@ -441,25 +487,95 @@ class RunReader:
         }
 
     def matches(self) -> list[dict[str, Any]]:
+        """Every match in the run — finished + open — in STABLE schedule order.
+
+        Lists the registry (all matches ever recorded) unioned with the current open
+        set, so finished/rolled-out matches stay selectable for download. Ordered by
+        scheduled ``date`` (then ``event_id``), NOT recency — so rows never jump as
+        live counts tick. ``status`` adds ``finished``; open-set membership overrides
+        the registry's ``closed`` flag (a reopened match never shows finished).
+        """
+        open_set = set(self._event_ids)
+        ids = list(self._registry.order)
+        ids += [eid for eid in self._event_ids if eid not in set(ids)]  # brand-new fixtures
+
         rows: list[dict[str, Any]] = []
-        for eid in self._event_ids:
+        for eid in ids:
             age = self._age_s(self._last_ts.get(eid))
-            if age is None:
-                state = "pending"
-            elif age <= self._live_window:
-                state = "live"
-            else:
-                state = "quiet"
+            if eid in open_set:  # currently recording — recency decides live/quiet/pending
+                status = (
+                    "pending" if age is None else ("live" if age <= self._live_window else "quiet")
+                )
+            else:  # rolled out of the open set — a finished/past match
+                status = "finished"
+            counts = self._by_event.get(eid, {})
             rows.append(
                 {
                     "event_id": eid,
-                    "title": self._event_title.get(eid, eid),
-                    "date": self._event_date.get(eid),
-                    "counts": self._by_event.get(eid, {}),
+                    "title": self._registry.title.get(eid) or self._event_title.get(eid, eid),
+                    "date": self._registry.date.get(eid) or self._event_date.get(eid),
+                    "counts": counts,
                     "last_seen_age_s": age,
-                    "status": state,
+                    "status": status,
+                    "open": eid in open_set,
+                    # On disk and selectable — data was actually recorded for it.
+                    "downloadable": bool(counts.get("book") or counts.get("comments")),
                 }
             )
-        # Freshest first; never-seen (pending) sink to the bottom.
-        rows.sort(key=lambda r: (r["last_seen_age_s"] is None, r["last_seen_age_s"] or 0.0))
+        # STABLE schedule order: by date (undated last), then event_id. No recency.
+        rows.sort(key=lambda r: (r["date"] is None, r["date"] or "", r["event_id"]))
         return rows
+
+    def download_registry(self, meta: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+        """The merged ``{event_id: entry}`` the download path uses — the in-memory
+        registry (all matches, finished + open) unioned with the CURRENT open set.
+
+        Prefers a freshly-read ``meta`` for the open set (the route already loads it),
+        falling back to the reader's cached ``meta`` snapshot — so the gate works even
+        before the first poll. Registry entries win on overlap (richer identity); a
+        brand-new fixture present only in meta is still added. Each entry carries
+        ``markets[{conditionId, clobTokenIds}]`` so the download can resolve a finished
+        match's conditionIds for filtering.
+        """
+        merged: dict[str, dict[str, Any]] = {
+            eid: dict(e) for eid, e in self._registry.events.items()
+        }
+        meta_events = (meta.get("events") if meta else None) or []
+        if meta_events:
+            for ev in meta_events:
+                eid = str(ev.get("id"))
+                if not eid or eid == "None":
+                    continue
+                merged.setdefault(
+                    eid,
+                    {
+                        "event_id": eid,
+                        "title": (ev.get("title") or "").strip() or eid,
+                        "slug": ev.get("slug"),
+                        "date": _slug_date(ev.get("slug")),
+                        "closed": False,
+                        "markets": [
+                            {
+                                "conditionId": m.get("conditionId"),
+                                "clobTokenIds": m.get("clobTokenIds") or [],
+                            }
+                            for m in (ev.get("markets") or [])
+                        ],
+                    },
+                )
+        else:  # no fresh meta -> fall back to the reader's cached open set
+            for eid in self._event_ids:
+                merged.setdefault(
+                    eid,
+                    {
+                        "event_id": eid,
+                        "title": self._event_title.get(eid, eid),
+                        "date": self._event_date.get(eid),
+                        "closed": False,
+                        "markets": [
+                            {"conditionId": c, "clobTokenIds": []}
+                            for c in self._event_conds.get(eid, [])
+                        ],
+                    },
+                )
+        return merged

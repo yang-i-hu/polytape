@@ -28,6 +28,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from polytape.admin import registry as _reg
+
 logger = logging.getLogger("polytape.admin.download")
 
 _STREAMS = ("book", "comments")
@@ -47,6 +49,16 @@ def load_run_meta(run_dir: Path) -> dict[str, Any]:
 def known_event_ids(meta: dict[str, Any]) -> list[str]:
     """Event ids present in the run, in meta order."""
     return [str(e.get("id")) for e in (meta.get("events") or []) if e.get("id") is not None]
+
+
+def registry_known_ids(registry: dict[str, dict[str, Any]]) -> list[str]:
+    """Event ids of the merged run registry (all matches, incl. finished)."""
+    return _reg.known_ids(registry)
+
+
+def registry_cond_to_event(registry: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """conditionId -> event_id over the merged registry (first claim, by schedule)."""
+    return _reg.cond_to_event(registry)
 
 
 def _cond_to_event(meta: dict[str, Any]) -> dict[str, str]:
@@ -102,16 +114,47 @@ class _CommentRouter:
         return None
 
 
-def per_event_meta(meta: dict[str, Any], event_id: str, *, exported_at: str) -> dict[str, Any]:
-    """A standalone ``meta.json`` for one event, sliced out of the run meta."""
+def per_event_meta(
+    meta: dict[str, Any],
+    event_id: str,
+    *,
+    exported_at: str,
+    registry: dict[str, dict[str, Any]] | None = None,
+    written_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """A standalone ``meta.json`` for one event, sliced out of the run meta.
+
+    Identity (event / markets / conditionIds) comes from the run registry when given
+    — so it works for a FINISHED match whose entry already left ``meta.events`` — and
+    falls back to ``meta.events``. Counts prefer the recorder's dedup-aware
+    ``counts_by_event`` (authoritative for a live match) and fall back to the actual
+    filtered-line tally (``written_counts``) for a finished match absent from it.
+    """
     event = next((e for e in (meta.get("events") or []) if str(e.get("id")) == event_id), None)
-    markets = (event or {}).get("markets") or []
+    reg_entry = (registry or {}).get(event_id)
+    if event is not None:
+        identity: dict[str, Any] | None = event
+        markets = event.get("markets") or []
+    elif reg_entry is not None:
+        markets = reg_entry.get("markets") or []
+        identity = {
+            "id": event_id,
+            "title": reg_entry.get("title"),
+            "slug": reg_entry.get("slug"),
+            "markets": markets,
+        }
+    else:
+        identity, markets = None, []
     conds = [m.get("conditionId") for m in markets if m.get("conditionId")]
     tokens = [t for m in markets for t in (m.get("clobTokenIds") or [])]
     # Whitelist the hashing fields rather than copying the dict wholesale: only the
     # non-reversible fingerprint should ever leave the box, never a raw salt if one
     # were ever (mis)placed there.
     hashing = meta.get("hashing") or {}
+    # Membership test (not ``or``): a live match's recorder count is authoritative even
+    # if it were ever an empty dict; only a finished match (absent entirely) uses the tally.
+    counts_by_event = meta.get("counts_by_event") or {}
+    counts = counts_by_event[event_id] if event_id in counts_by_event else (written_counts or {})
     return {
         "polytape_version": meta.get("polytape_version"),
         "event_id": event_id,
@@ -124,10 +167,10 @@ def per_event_meta(meta: dict[str, Any], event_id: str, *, exported_at: str) -> 
         },
         "started_at": meta.get("started_at"),
         "stopped_at": meta.get("stopped_at"),
-        "counts": (meta.get("counts_by_event") or {}).get(event_id, {}),
+        "counts": counts,
         "market_ids": conds,
         "clob_token_ids": tokens,
-        "event": event,
+        "event": identity,
         "gaps": meta.get("gaps") or [],
         "source": {
             "kind": "filtered-slice",
@@ -154,8 +197,13 @@ def _scan_and_route(
     attribute: Callable[[dict[str, Any]], str | None],
     writer_for: Callable[[str, str], BinaryIO],
     chunk_bytes: int,
-) -> None:
-    """Stream ``src`` and append each wanted line (byte-exact) to its event writer."""
+) -> dict[tuple[str, str], int]:
+    """Stream ``src`` and append each wanted line (byte-exact) to its event writer.
+
+    Returns a ``{(event_id, stream): lines_written}`` tally so the slice's ``meta.json``
+    can report a finished match's actual count (it is absent from ``counts_by_event``).
+    """
+    tally: dict[tuple[str, str], int] = {}
     buf = b""
     with open(src, "rb") as fh:
         while True:
@@ -179,7 +227,9 @@ def _scan_and_route(
                 eid = attribute(rec.get("raw") or {})
                 if eid is not None and eid in wanted:
                     writer_for(eid, stream).write(raw_line + b"\n")
+                    tally[(eid, stream)] = tally.get((eid, stream), 0) + 1
     # Any trailing partial line (a live recorder mid-append) is intentionally dropped.
+    return tally
 
 
 def filter_run(
@@ -188,21 +238,32 @@ def filter_run(
     dest_dir: Path,
     *,
     meta: dict[str, Any] | None = None,
+    registry: dict[str, dict[str, Any]] | None = None,
     exported_at: str,
     chunk_bytes: int = _READ_CHUNK,
 ) -> list[tuple[str, Path]]:
     """Filter the combined run files into ``dest_dir/event-<id>/`` and list archive entries.
 
     Scans each combined file once, routing every attributed line to its event's
-    writer — so selecting several matches stays a single pass per stream. Always
-    writes a per-event ``meta.json`` slice (even for a match with no records yet),
-    so the archive documents exactly what was selected. Returns the archive
-    entries ``[(arcname, path), ...]``.
+    writer — so selecting several matches stays a single pass per stream. When a
+    ``registry`` is given (all matches incl. finished), book records attribute via its
+    conditionId map, so FINISHED matches' records (gone from ``meta.events``) still
+    route. Always writes a per-event ``meta.json`` slice (even for a match with no
+    records yet). Returns the archive entries ``[(arcname, path), ...]``.
     """
     meta = meta if meta is not None else load_run_meta(run_dir)
-    cond2event = _cond_to_event(meta)
+    if registry:
+        # Mirror the reader's attribution EXACTLY (reader._book_event): the registry
+        # covers finished matches, but the current meta (open set) WINS on any shared
+        # conditionId. So a record the dashboard counts under event X always downloads
+        # under X too — and a meta conditionId a registry entry happens to lack (e.g. a
+        # fixture whose market wasn't deployed at discovery time) is never dropped.
+        cond2event = {**registry_cond_to_event(registry), **_cond_to_event(meta)}
+    else:
+        cond2event = _cond_to_event(meta)
     wanted = {str(e) for e in event_ids}
     writers: dict[tuple[str, str], BinaryIO] = {}
+    tally: dict[tuple[str, str], int] = {}
 
     def writer_for(eid: str, stream: str) -> BinaryIO:
         key = (eid, stream)
@@ -225,7 +286,10 @@ def filter_run(
                 # Stateful: seeds a commentID->event map as it scans so reactions
                 # (no parentEntityID) are attributed, mirroring the recorder.
                 attribute = _CommentRouter()
-            _scan_and_route(src, stream, wanted, attribute, writer_for, chunk_bytes)
+            for key, n in _scan_and_route(
+                src, stream, wanted, attribute, writer_for, chunk_bytes
+            ).items():
+                tally[key] = tally.get(key, 0) + n
     finally:
         for handle in writers.values():
             handle.close()
@@ -235,8 +299,15 @@ def filter_run(
         ev_dir = dest_dir / f"event-{eid}"
         ev_dir.mkdir(parents=True, exist_ok=True)
         meta_path = ev_dir / "meta.json"
+        written = {s: tally[(eid, s)] for s in _STREAMS if tally.get((eid, s))}
         meta_path.write_text(
-            json.dumps(per_event_meta(meta, eid, exported_at=exported_at), indent=2) + "\n",
+            json.dumps(
+                per_event_meta(
+                    meta, eid, exported_at=exported_at, registry=registry, written_counts=written
+                ),
+                indent=2,
+            )
+            + "\n",
             encoding="utf-8",
         )
         for name in ("meta.json", "book.jsonl", "comments.jsonl"):
