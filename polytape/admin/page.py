@@ -226,11 +226,34 @@ function downloadHref(url){
   var a=document.createElement('a'); a.href=url; a.download='';
   document.body.appendChild(a); a.click(); a.remove();
 }
-function downloadRun(){ downloadHref('/api/download?all=1'); }
+var _DLNOTE_DEFAULT=(document.getElementById('dlnote')||{}).textContent||'';
+var _dlNoteTimer=null;
+function dlNote(msg, revertMs){
+  var note=document.getElementById('dlnote'); if(!note) return;
+  if(_dlNoteTimer){ clearTimeout(_dlNoteTimer); _dlNoteTimer=null; }
+  note.textContent = (msg===null) ? _DLNOTE_DEFAULT : msg;
+  if(msg!==null && revertMs){ _dlNoteTimer=setTimeout(function(){ dlNote(null); }, revertMs); }
+}
+async function startDownload(qs, label){
+  // Sessions are in-memory, so an admin restart makes a plain <a download> silently
+  // 403. Re-check auth FIRST and tell the user, instead of nothing happening.
+  var s; try{ s=await fetch('/api/session',{cache:'no-store'}).then(function(r){return r.json();}); }
+  catch(e){ s={}; }
+  if(!s.authed){
+    refreshSession();
+    alert('Your admin session expired (the dashboard restarted). Click “log in”, then try the download again.');
+    return;
+  }
+  // An <a download> gives no completion callback; show a best-effort "preparing" hint
+  // (a per-match archive is built by scanning the whole run, which can take a minute).
+  dlNote('preparing '+label+' — the server is scanning the run; your download will start shortly…', 120000);
+  downloadHref('/api/download?'+qs);
+}
+function downloadRun(){ startDownload('all=1', 'the whole run'); }
 function downloadSelected(){
   if(!dlSelected.size) return;
   var qs=Array.from(dlSelected).map(function(e){return 'event='+encodeURIComponent(e);}).join('&');
-  downloadHref('/api/download?'+qs);
+  startDownload(qs, dlSelected.size+' selected match(es)');
 }
 
 async function tick(){
