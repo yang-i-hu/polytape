@@ -37,8 +37,13 @@ PAGE = """<!doctype html>
   .live{background:rgba(61,220,151,.15);color:var(--green)}
   .quiet{background:rgba(245,177,76,.15);color:var(--amber)}
   .pending{background:var(--surface2);color:var(--dim)}
+  .finished{background:var(--surface2);color:var(--muted)}
+  .dlchk:disabled{opacity:.3;cursor:not-allowed}
   .footer{margin-top:14px;font-size:12px;color:var(--dim);font-family:var(--mono)}
   .ok{color:var(--green)} .warn{color:var(--amber)} .bad{color:var(--red)}
+  .dlcol{display:none}
+  body.authed .dlcol{display:table-cell}
+  .dlchk{cursor:pointer;width:15px;height:15px;accent-color:var(--blue);vertical-align:middle}
 </style>
 </head>
 <body>
@@ -61,10 +66,16 @@ PAGE = """<!doctype html>
     <span class="note" id="ctlnote">checking controls&hellip;</span>
   </div>
 
+  <div class="controls" id="dlbar" style="display:none">
+    <button id="dl-run" style="cursor:pointer;opacity:1" onclick="downloadRun()">&#11015; download whole run</button>
+    <button id="dl-sel" style="opacity:.6" onclick="downloadSelected()" disabled>&#11015; download selected</button>
+    <span class="note" id="dlnote">tick matches to download &middot; the .tar.gz lands on your machine (through the tunnel)</span>
+  </div>
+
   <h2 id="mtitle">matches</h2>
   <table>
-    <thead><tr><th style="width:34%">match</th><th>date</th><th>book</th><th>comments</th><th>last seen</th><th>status</th></tr></thead>
-    <tbody id="rows"><tr><td colspan="6" style="color:var(--dim)">loading…</td></tr></tbody>
+    <thead><tr><th class="dlcol" style="width:28px"></th><th style="width:34%">match</th><th>date</th><th>book</th><th>comments</th><th>last seen</th><th>status</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="7" style="color:var(--dim)">loading…</td></tr></tbody>
   </table>
   <div class="footer" id="footer"></div>
   <div id="preview" style="display:none;margin-top:18px"></div>
@@ -154,6 +165,12 @@ async function refreshSession(){
     !on ? 'controls disabled — no admin secret configured'
     : authed ? 'controls unlocked · every action is audited'
     : 'controls locked — log in to enable';
+  // Download is the most sensitive read (raw payloads), so it follows the login
+  // session: the tick-boxes + download bar appear only once authed.
+  document.body.classList.toggle('authed', !!authed);
+  var dlb=document.getElementById('dlbar'); if(dlb) dlb.style.display=authed?'flex':'none';
+  if(!authed) dlSelected.clear();
+  updateDlBar();
 }
 function authClick(){
   if(SESSION.authed){ fetch('/api/logout',{method:'POST'}).then(refreshSession); return; }
@@ -197,6 +214,48 @@ async function submitControl(action,needsUrl){
   }catch(e){ var el=document.getElementById('m-err'); if(el) el.textContent='request failed'; }
 }
 
+// --- match-data download (login-gated; the cookie rides the same-origin GET) -
+var dlSelected = new Set();
+function updateDlBar(){
+  var b=document.getElementById('dl-sel'); if(!b) return;
+  var k=dlSelected.size; b.disabled=!k;
+  b.style.opacity=k?'1':'.6'; b.style.cursor=k?'pointer':'not-allowed';
+  b.innerHTML='&#11015; download selected'+(k?' ('+k+')':'');
+}
+function downloadHref(url){
+  var a=document.createElement('a'); a.href=url; a.download='';
+  document.body.appendChild(a); a.click(); a.remove();
+}
+var _DLNOTE_DEFAULT=(document.getElementById('dlnote')||{}).textContent||'';
+var _dlNoteTimer=null;
+function dlNote(msg, revertMs){
+  var note=document.getElementById('dlnote'); if(!note) return;
+  if(_dlNoteTimer){ clearTimeout(_dlNoteTimer); _dlNoteTimer=null; }
+  note.textContent = (msg===null) ? _DLNOTE_DEFAULT : msg;
+  if(msg!==null && revertMs){ _dlNoteTimer=setTimeout(function(){ dlNote(null); }, revertMs); }
+}
+async function startDownload(qs, label){
+  // Sessions are in-memory, so an admin restart makes a plain <a download> silently
+  // 403. Re-check auth FIRST and tell the user, instead of nothing happening.
+  var s; try{ s=await fetch('/api/session',{cache:'no-store'}).then(function(r){return r.json();}); }
+  catch(e){ s={}; }
+  if(!s.authed){
+    refreshSession();
+    alert('Your admin session expired (the dashboard restarted). Click “log in”, then try the download again.');
+    return;
+  }
+  // An <a download> gives no completion callback; show a best-effort "preparing" hint
+  // (a per-match archive is built by scanning the whole run, which can take a minute).
+  dlNote('preparing '+label+' — the server is scanning the run; your download will start shortly…', 120000);
+  downloadHref('/api/download?'+qs);
+}
+function downloadRun(){ startDownload('all=1', 'the whole run'); }
+function downloadSelected(){
+  if(!dlSelected.size) return;
+  var qs=Array.from(dlSelected).map(function(e){return 'event='+encodeURIComponent(e);}).join('&');
+  startDownload(qs, dlSelected.size+' selected match(es)');
+}
+
 async function tick(){
   try{
     const [st, ms] = await Promise.all([
@@ -221,21 +280,41 @@ async function tick(){
     document.getElementById('cards').innerHTML = cards.map(([l,v])=>
       '<div class="card"><div class="lbl">'+l+'</div><div class="val">'+v+'</div></div>').join('');
 
-    document.getElementById('mtitle').textContent = 'matches · '+ms.length+' open';
-    document.getElementById('rows').innerHTML = ms.map(m=>
-      '<tr data-eid="'+m.event_id+'" style="cursor:pointer"><td>'+m.title+'</td><td class="num">'+(m.date||'—')+'</td>'+
-      '<td class="num">'+n(m.counts?.book||0)+'</td>'+
-      '<td class="num">'+n(m.counts?.comments||0)+'</td>'+
-      '<td class="num '+freshClass(m.last_seen_age_s)+'">'+age(m.last_seen_age_s)+'</td>'+
-      '<td><span class="tag '+m.status+'">'+m.status+'</span></td></tr>').join('')
-      || '<tr><td colspan="6" style="color:var(--dim)">no matches in this run yet</td></tr>';
+    var nRec=ms.filter(function(m){return m.status==='live'||m.status==='quiet';}).length;
+    var nFin=ms.filter(function(m){return m.status==='finished';}).length;
+    document.getElementById('mtitle').textContent =
+      'matches · '+ms.length+' ('+nRec+' recording · '+nFin+' finished)';
+    document.getElementById('rows').innerHTML = ms.map(function(m){
+      var dis = m.downloadable ? '' : ' disabled';
+      // finished/pending: a dimmed em-dash for "last seen" (recency is meaningless there)
+      var lastSeen = (m.status==='finished'||m.status==='pending')
+        ? '<td class="num" style="color:var(--dim)">—</td>'
+        : '<td class="num '+freshClass(m.last_seen_age_s)+'">'+age(m.last_seen_age_s)+'</td>';
+      return '<tr data-eid="'+m.event_id+'" style="cursor:pointer">'+
+        '<td class="dlcol"><input type="checkbox" class="dlchk" data-eid="'+m.event_id+'"'+(dlSelected.has(m.event_id)?' checked':'')+dis+' title="'+(m.downloadable?'select to download':'no recorded data')+'"></td>'+
+        '<td>'+m.title+'</td><td class="num">'+(m.date||'—')+'</td>'+
+        '<td class="num">'+n(m.counts?.book||0)+'</td>'+
+        '<td class="num">'+n(m.counts?.comments||0)+'</td>'+
+        lastSeen+
+        '<td><span class="tag '+m.status+'">'+m.status+'</span></td></tr>';
+    }).join('')
+      || '<tr><td colspan="7" style="color:var(--dim)">no matches in this run yet</td></tr>';
+    // forget ticks for matches that are no longer downloadable, then refresh the bar
+    var present=new Set(ms.filter(function(m){return m.downloadable;}).map(function(m){return m.event_id;}));
+    Array.from(dlSelected).forEach(function(e){ if(!present.has(e)) dlSelected.delete(e); });
+    updateDlBar();
     document.getElementById('footer').textContent = 'updated '+(st.as_of||'')+' · started '+(st.started_at||'?');
   }catch(e){
     document.getElementById('recstate').textContent = 'admin unreachable';
     document.getElementById('recdot').style.background = 'var(--red)';
   }
 }
-document.getElementById('rows').onclick=function(e){ var tr=e.target.closest('tr'); if(tr&&tr.dataset.eid) openMatch(tr.dataset.eid); };
+document.getElementById('rows').onclick=function(e){
+  var chk=e.target.closest('.dlchk');
+  if(chk){ if(chk.disabled) return; var id=chk.getAttribute('data-eid'); if(chk.checked) dlSelected.add(id); else dlSelected.delete(id); updateDlBar(); return; }
+  if(e.target.closest('.dlcol')) return;  // clicking the tick-box cell must not open the preview
+  var tr=e.target.closest('tr'); if(tr&&tr.dataset.eid) openMatch(tr.dataset.eid);
+};
 tick(); setInterval(tick, 3000);
 refreshSession(); setInterval(refreshSession, 20000);
 </script>

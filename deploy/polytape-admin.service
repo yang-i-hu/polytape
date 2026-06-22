@@ -49,6 +49,10 @@ Environment=POLYTAPE_ENV_FILE=/etc/polytape/heartbeat.env
 Environment=POLYTAPE_MATCHES_FILE=/etc/polytape/wc_matches.json
 Environment=POLYTAPE_INTENT_DIR=/run/polytape-admin/intent
 Environment=POLYTAPE_AUDIT_DIR=/var/log/polytape-admin/audit.jsonl
+# Persisted login sessions (sha256 verifiers only) so a restart doesn't log everyone out.
+Environment=POLYTAPE_SESSION_FILE=/var/log/polytape-admin/sessions.json
+# Pre-built per-match download archives for FINISHED matches (near-instant downloads).
+Environment=POLYTAPE_EXTRACT_DIR=/var/cache/polytape-admin
 # Holds POLYTAPE_ADMIN_TOKEN. Optional ('-'): without it the control plane is OFF.
 EnvironmentFile=-/etc/polytape/admin.env
 ExecStart=/opt/polytape/venv/bin/polytape-admin --host 127.0.0.1 --port 8080
@@ -62,6 +66,10 @@ ProtectSystem=strict
 ReadWritePaths=/run/polytape-admin
 LogsDirectory=polytape-admin
 LogsDirectoryMode=0700
+# /var/cache/polytape-admin for pre-built match extracts (auto-granted RW under
+# ProtectSystem=strict, same as LogsDirectory). Capped in code (enforce_cap, 4 GiB).
+CacheDirectory=polytape-admin
+CacheDirectoryMode=0700
 UMask=0077
 ProtectHome=true
 PrivateTmp=true

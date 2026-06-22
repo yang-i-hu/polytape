@@ -23,10 +23,37 @@ public port and no new firewall hole. fastapi/uvicorn are an optional extra
 import argparse
 import asyncio
 import contextlib
+import json
+import logging
 import os
+import shutil
+import tempfile
+from pathlib import Path
 
+from polytape.admin import download as dl
+from polytape.admin import extractor
+from polytape.admin import registry as reg
 from polytape.admin.page import PAGE
 from polytape.admin.reader import RunReader
+from polytape.envelope import utc_now_iso
+
+logger = logging.getLogger("polytape.admin")
+
+
+def _stream_file(fh, chunk: int = 1024 * 1024):
+    """Yield an open file's bytes in chunks, closing it when done (or on client abort).
+
+    Used by the download fast-path: the fd is opened in the request handler so that an
+    eviction racing the response can't 404 us (an already-open fd survives unlink).
+    """
+    try:
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                return
+            yield block
+    finally:
+        fh.close()
 
 
 def create_app(
@@ -34,6 +61,11 @@ def create_app(
     *,
     poll_interval: float = 2.0,
     admin_token: str | None = None,
+    registry_file: str | Path | None = None,
+    registry_refresh_s: float = 600.0,
+    extract_dir: str | Path | None = None,
+    extract_refresh_s: float = 600.0,
+    session_file: str | Path | None = None,
     broker=None,
     audit=None,
     sessions=None,
@@ -51,13 +83,18 @@ def create_app(
     from contextlib import asynccontextmanager
 
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
     from polytape.admin import control
 
     controls_on = bool(admin_token)
     if controls_on:
-        sessions = sessions or control.Sessions()
+        # Persist sessions so an admin restart no longer logs everyone out (stores only
+        # sha256(sid); the shared secret stays the only thing that can mint one).
+        sessions = sessions or control.Sessions(
+            store_path=session_file
+            or os.environ.get("POLYTAPE_SESSION_FILE", "/var/log/polytape-admin/sessions.json")
+        )
         rate_limiter = rate_limiter or control.RateLimiter()
         login_throttle = control.LoginThrottle()
         if audit is None:
@@ -73,20 +110,80 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         async def _loop() -> None:
-            # Single-threaded: update() runs in the event loop between requests,
-            # so there is no race with the (sync) status()/matches() reads.
+            # update() runs in a WORKER THREAD so its bounded multi-GB catch-up scan
+            # never blocks the event loop. It holds the reader's lock across that scan, so
+            # the read endpoints below ALSO run via asyncio.to_thread — a request that
+            # arrives mid-scan waits on a worker, never on the event-loop thread, leaving
+            # the loop free to keep serving everything else.
             while True:
                 with contextlib.suppress(Exception):
-                    reader.update()
+                    await asyncio.to_thread(reader.update)
                 await asyncio.sleep(poll_interval)
 
-        task = asyncio.create_task(_loop())
+        async def _registry_loop() -> None:
+            # SEPARATE, slow task: recover the full match set (finished + open) from
+            # Gamma OFF the event loop (asyncio.to_thread), persist it atomically, and
+            # NEVER blank a good registry on a failed/empty fetch. Runs once at startup
+            # (cold-start warm), then every registry_refresh_s. Kept off the 2 s poll
+            # so a slow Gamma can never stall reader.update().
+            while True:
+                try:
+                    events = await asyncio.to_thread(reg.fetch_registry)
+                    if events:
+                        await asyncio.to_thread(
+                            reg.write_registry_atomic, registry_file, events, now_iso=utc_now_iso()
+                        )
+                except Exception:  # noqa: BLE001 - Gamma down -> keep the last good registry
+                    logger.warning("registry refresh failed (keeping last good)", exc_info=True)
+                await asyncio.sleep(registry_refresh_s)
+
+        async def _extract_loop() -> None:
+            # Pre-build per-match archives for FINISHED matches so their downloads are
+            # near-instant. Off the event loop; gated on caught_up() so its full-run scan
+            # never piles CPU onto the post-restart catch-up drain.
+            while True:
+                try:
+                    # caught_up() takes the reader lock; run it (and the other reader
+                    # probes) OFF the loop so a mid-scan lock-wait never stalls the loop.
+                    if await asyncio.to_thread(reader.caught_up):
+                        extractable = await asyncio.to_thread(reader.extractable_event_ids)
+                        pending = [
+                            e
+                            for e in extractable
+                            if not extractor.has_complete_extract(extract_dir, e)
+                        ]
+                        if pending:
+                            meta = await asyncio.to_thread(dl.load_run_meta, reader.run_dir)
+                            registry = await asyncio.to_thread(reader.download_registry, meta)
+                            # Trim the resident cache BEFORE adding a batch (make room), then
+                            # again after (trim the additions) — bounds peak disk either side.
+                            await asyncio.to_thread(extractor.enforce_cap, extract_dir)
+                            await asyncio.to_thread(
+                                extractor.build_extracts,
+                                reader.run_dir,
+                                extract_dir,
+                                pending,
+                                registry=registry,
+                                meta=meta,
+                            )
+                            await asyncio.to_thread(extractor.enforce_cap, extract_dir)
+                except Exception:  # noqa: BLE001 - never let the extractor loop die
+                    logger.warning("extract pass failed", exc_info=True)
+                await asyncio.sleep(extract_refresh_s)
+
+        tasks = [asyncio.create_task(_loop())]
+        if registry_file is not None and registry_refresh_s > 0:
+            tasks.append(asyncio.create_task(_registry_loop()))
+        if extract_dir is not None and extract_refresh_s > 0:
+            tasks.append(asyncio.create_task(_extract_loop()))
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(title="polytape-admin", docs_url=None, redoc_url=None, lifespan=lifespan)
 
@@ -94,23 +191,27 @@ def create_app(
     async def index() -> str:
         return PAGE
 
+    # Each read method takes the reader's lock (held across update()'s catch-up scan), so
+    # they run via asyncio.to_thread: a request waits on a worker, never the loop thread.
+
     @app.get("/api/status")
     async def status() -> JSONResponse:
-        return JSONResponse(reader.status())
+        return JSONResponse(await asyncio.to_thread(reader.status))
 
     @app.get("/api/matches")
     async def matches() -> JSONResponse:
-        return JSONResponse(reader.matches())
+        return JSONResponse(await asyncio.to_thread(reader.matches))
 
     @app.get("/api/matches/{event_id}")
     async def match(event_id: str) -> JSONResponse:
-        return JSONResponse(reader.match_view(event_id))
+        return JSONResponse(await asyncio.to_thread(reader.match_view, event_id))
 
     @app.get("/api/live")
     async def live() -> JSONResponse:
-        # Poll-based live view (rates + recent records + gaps). Cheap: it reads
-        # only state the update() loop already maintains, so no file I/O per request.
-        return JSONResponse(reader.live())
+        # Poll-based live view (rates + recent records + gaps): reads only state the
+        # update() loop already maintains (no file I/O), off-loop so a mid-scan lock-wait
+        # doesn't stall the loop.
+        return JSONResponse(await asyncio.to_thread(reader.live))
 
     # -- guarded control plane (present only when a secret is configured) ---- #
 
@@ -123,6 +224,118 @@ def create_app(
         # stops a forged cross-origin POST from riding the session cookie.
         ct = request.headers.get("content-type", "").split(";")[0].strip().lower()
         return ct == "application/json"
+
+    @app.get("/api/download")
+    async def download_archive(request: Request):
+        # A raw export ships payload content the read-only views deliberately never do
+        # (comment bodies, book records), so it rides the SAME gate as control: a
+        # configured secret + a valid login session. It is read-only (no intent broker).
+        # Being a GET it can't carry the json/control header, but the SameSite=strict
+        # session cookie authenticates a same-origin <a download> and a cross-site page
+        # can't send it (CSRF-safe); we also reject a cross-site Sec-Fetch-Site.
+        if not controls_on:
+            return JSONResponse({"error": "controls disabled"}, status_code=503)
+        src = _source(request)
+        sid = request.cookies.get("polytape_admin")
+        if not sessions.valid(sid):
+            audit.write(action="download", result="unauthorized", source=src)
+            return JSONResponse({"error": "not authenticated"}, status_code=403)
+        site = request.headers.get("sec-fetch-site")
+        if site is not None and site not in ("same-origin", "none"):
+            # The real CSRF case (a valid session driven from a foreign origin) — audit it.
+            audit.write(action="download", result="cross-site-blocked", source=src)
+            return JSONResponse({"error": "cross-site download blocked"}, status_code=403)
+        # ?all=1 -> the whole run; repeatable ?event=<id> -> selected matches. Parsed
+        # by hand so the signature stays Query()-free (and lint-clean).
+        whole = request.query_params.get("all", "").lower() in ("1", "true", "yes", "on")
+        event = request.query_params.getlist("event")
+        fp = control.fingerprint(sid)
+        run_dir = reader.run_dir
+        try:
+            meta = await asyncio.to_thread(dl.load_run_meta, run_dir)
+        except (OSError, json.JSONDecodeError):
+            return JSONResponse({"error": "run metadata unavailable"}, status_code=404)
+
+        headers = {"Cache-Control": "no-store"}
+        if whole:
+            entries = await asyncio.to_thread(dl.whole_run_entries, run_dir, meta)
+            if not entries:
+                return JSONResponse({"error": "run has no data files"}, status_code=404)
+            audit.write(
+                action="download", result="ok", source=src, session_fp=fp, scope="whole-run"
+            )
+            headers["Content-Disposition"] = f'attachment; filename="{run_dir.name}.tar.gz"'
+            return StreamingResponse(
+                dl.stream_targz(entries), media_type="application/gzip", headers=headers
+            )
+
+        # The merged registry (all matches, finished + open). Built from the freshly
+        # read meta (open set) + the in-memory registry (finished), so the gate matches
+        # the /api/matches listing and works even before the first poll.
+        registry = await asyncio.to_thread(reader.download_registry, meta)
+        known = set(dl.registry_known_ids(registry))
+        selected = [e for e in dict.fromkeys(event) if e in known]  # dedupe; keep only known
+        if not selected:
+            return JSONResponse({"error": "no known match selected"}, status_code=400)
+        # Fast path: a single FINISHED match with a pre-built extract is served directly
+        # (near-instant) instead of re-scanning the whole run. We open the fd HERE, before
+        # returning, so an eviction (enforce_cap) racing between the completeness check and
+        # the response send can't 404 us — an already-open fd survives unlink. If the open
+        # loses the race (file already gone), fall through to a fresh scan.
+        if extract_dir is not None and len(selected) == 1:
+            eid = selected[0]
+            if extractor.has_complete_extract(extract_dir, eid):
+                try:
+                    fh = open(extractor.archive_path(extract_dir, eid), "rb")
+                except OSError:
+                    fh = None
+                if fh is not None:
+                    audit.write(
+                        action="download",
+                        result="ok",
+                        source=src,
+                        session_fp=fp,
+                        scope=eid,
+                        served="extract",
+                    )
+                    headers["Content-Disposition"] = f'attachment; filename="event-{eid}.tar.gz"'
+                    return StreamingResponse(
+                        _stream_file(fh), media_type="application/gzip", headers=headers
+                    )
+        scratch = Path(tempfile.mkdtemp(prefix="polytape-dl-"))
+        try:
+            entries = await asyncio.to_thread(
+                dl.filter_run,
+                run_dir,
+                selected,
+                scratch,
+                meta=meta,
+                registry=registry,
+                exported_at=utc_now_iso(),
+            )
+        except OSError as exc:
+            shutil.rmtree(scratch, ignore_errors=True)
+            logger.warning("download filter failed: %s", exc)
+            return JSONResponse({"error": "could not build archive"}, status_code=507)
+        except BaseException:
+            # Any non-OSError bug must not leak the (potentially multi-GB) scratch dir
+            # on the recorder VM's filesystem; clean up, then let it surface as a 500.
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
+        audit.write(
+            action="download", result="ok", source=src, session_fp=fp, scope=",".join(selected)
+        )
+        filename = (
+            f"event-{selected[0]}.tar.gz"
+            if len(selected) == 1
+            else f"polytape-{len(selected)}-matches.tar.gz"
+        )
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return StreamingResponse(
+            dl.stream_targz(entries, on_done=lambda: shutil.rmtree(scratch, ignore_errors=True)),
+            media_type="application/gzip",
+            headers=headers,
+        )
 
     @app.get("/api/session")
     async def session(request: Request) -> JSONResponse:
@@ -165,7 +378,12 @@ def create_app(
         )
         resp = JSONResponse({"ok": True})
         resp.set_cookie(
-            "polytape_admin", sid, max_age=1800, httponly=True, samesite="strict", path="/"
+            "polytape_admin",
+            sid,
+            max_age=int(sessions.ttl),  # one source of truth: match the server-side TTL
+            httponly=True,
+            samesite="strict",
+            path="/",
         )
         return resp
 
@@ -255,6 +473,17 @@ def main(argv: list[str] | None = None) -> int:
         "--matches-file",
         default=os.environ.get("POLYTAPE_MATCHES_FILE", "/etc/polytape/wc_matches.json"),
     )
+    parser.add_argument(
+        "--registry-file",
+        default=os.environ.get("POLYTAPE_REGISTRY_FILE", "/var/log/polytape-admin/registry.json"),
+        help="Cumulative run registry (all matches, finished + open); refreshed from Gamma.",
+    )
+    parser.add_argument(
+        "--extract-dir",
+        default=os.environ.get("POLYTAPE_EXTRACT_DIR"),
+        help="Dir for pre-built per-match download archives (finished matches). "
+        "Unset disables the extractor (downloads fall back to a full scan).",
+    )
     parser.add_argument("--host", default=os.environ.get("POLYTAPE_ADMIN_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("POLYTAPE_ADMIN_PORT", "8080"))
@@ -262,7 +491,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     reader = RunReader(
-        args.run_dir, unit=args.unit, env_file=args.env_file, matches_file=args.matches_file
+        args.run_dir,
+        unit=args.unit,
+        env_file=args.env_file,
+        matches_file=args.matches_file,
+        registry_file=args.registry_file,
     )
     with contextlib.suppress(Exception):
         reader.update()  # warm once so the first request has data
@@ -274,7 +507,12 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     uvicorn.run(
-        create_app(reader, admin_token=admin_token),
+        create_app(
+            reader,
+            admin_token=admin_token,
+            registry_file=args.registry_file,
+            extract_dir=args.extract_dir,
+        ),
         host=args.host,
         port=args.port,
         log_level="warning",
