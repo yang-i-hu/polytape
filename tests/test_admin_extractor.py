@@ -155,6 +155,7 @@ def test_download_serves_prebuilt_extract(tmp_path):
         [
             {
                 "event_id": "0900",
+                "title": "Brazil vs. Argentina",
                 "date": "2026-06-19",
                 "closed": True,
                 "markets": [{"conditionId": "0xZ", "clobTokenIds": []}],
@@ -183,3 +184,5 @@ def test_download_serves_prebuilt_extract(tmp_path):
     r = client.get("/api/download?event=0900")
     assert r.status_code == 200
     assert r.content == b"SENTINEL-TARGZ-BYTES"  # served the pre-built extract, no scan
+    # Filename carries the event id + FIFA codes of both sides (Brazil vs. Argentina).
+    assert "event-0900-BRA-ARG.tar.gz" in r.headers.get("content-disposition", "")

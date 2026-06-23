@@ -298,7 +298,8 @@ def create_app(
                         scope=eid,
                         served="extract",
                     )
-                    headers["Content-Disposition"] = f'attachment; filename="event-{eid}.tar.gz"'
+                    fname = dl.match_archive_name(eid, registry.get(eid))
+                    headers["Content-Disposition"] = f'attachment; filename="{fname}"'
                     return StreamingResponse(
                         _stream_file(fh), media_type="application/gzip", headers=headers
                     )
@@ -326,7 +327,7 @@ def create_app(
             action="download", result="ok", source=src, session_fp=fp, scope=",".join(selected)
         )
         filename = (
-            f"event-{selected[0]}.tar.gz"
+            dl.match_archive_name(selected[0], registry.get(selected[0]))
             if len(selected) == 1
             else f"polytape-{len(selected)}-matches.tar.gz"
         )
