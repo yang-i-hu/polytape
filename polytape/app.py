@@ -78,14 +78,17 @@ def _build_supervisors(
     """Construct supervisors: one comment firehose + one or more sharded book sockets.
 
     Comments for all events ride a single global firehose, filtered client-side to
-    the set of event ids. The union of every event's CLOB token ids is sharded into
-    sockets of <=180 tokens (whole event groups, never split); each book message is
-    routed to its event by top-level ``market`` (condition id).
+    the set of event ids *and* parent series ids (some products, e.g. the World Cup,
+    attach the comment feed to the parent Series rather than each Event). The union
+    of every event's CLOB token ids is sharded into sockets of <=180 tokens (whole
+    event groups, never split); each book message is routed to its event by
+    top-level ``market`` (condition id).
     """
     supervisors: list[StreamSupervisor] = []
     if config.comments:
         comments = CommentStream(
             event_ids={e.event_id for e in events},
+            series_ids={s for e in events for s in e.series_ids},
             writer=writer,
             connect=connect,
             on_activity=on_activity,

@@ -187,6 +187,24 @@ def test_comment_stream_multi_event_routing():
     assert cs.should_record(react) and cs.resolve_event_id(react) == "1001"
 
 
+def test_comment_stream_records_series_parented_comments():
+    # World Cup case: every match comment is parented to the Series (11433), not the
+    # event. The firehose filter must accept the series id, or 100% of comments drop.
+    cs = CommentStream(event_ids={"351771", "351765"}, series_ids={"11433"}, writer=None)
+    series_comment = {"type": "comment_created", "payload": {"id": "s1", "parentEntityID": 11433}}
+    event_comment = {"type": "comment_created", "payload": {"id": "e1", "parentEntityID": 351771}}
+    foreign = {"type": "comment_created", "payload": {"id": "x1", "parentEntityID": 99999}}
+    assert cs.should_record(series_comment)  # series-parented -> kept
+    assert cs.should_record(event_comment)  # event-parented -> kept
+    assert not cs.should_record(foreign)  # unrelated parent -> dropped
+    assert cs.resolve_event_id(series_comment) == "11433"
+    # The series cursor advances and seeds reaction attribution to the series.
+    cs.on_written(series_comment)
+    assert cs.last_comment_id_for("11433") == "s1"
+    react = {"type": "reaction_created", "payload": {"id": "r1", "commentID": "s1"}}
+    assert cs.should_record(react) and cs.resolve_event_id(react) == "11433"
+
+
 def test_cond_to_event_maps_condition_ids():
     e1 = EventInfo(
         event_id="1001",

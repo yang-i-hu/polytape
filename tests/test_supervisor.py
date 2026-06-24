@@ -19,6 +19,7 @@ class _Recorder:
     def __init__(self, *, stop_after, raises=False):
         self.event_id = "20200"
         self.event_ids = {"20200"}
+        self.series_ids = set()
         self.last_comment_id = None
         self.calls = 0
         self.sup: StreamSupervisor | None = None
@@ -110,15 +111,10 @@ async def test_comment_backfill_dedups_overlap(make_config):
         class _Stream:
             stream = "comments"
             event_ids = {"20200"}
+            series_ids = set()
 
             def last_comment_id_for(self, event_id):
                 return "live1"
-
-            def backfill_targets(self):
-                return [("Event", self.event_id)]
-
-            def cursor_for(self, parent_id):
-                return self.last_comment_id
 
         class _Gamma:
             async def backfill_since(self, parent_id, last, *, parent_entity_type="Event"):
@@ -127,6 +123,36 @@ async def test_comment_backfill_dedups_overlap(make_config):
         backfill = make_comment_backfill(_Stream(), _Gamma(), w)
         assert await backfill() == 2  # live1 overlaps -> not re-counted
         assert w.counts["comments"] == 3
+
+
+async def test_comment_backfill_pages_series_with_series_type(make_config):
+    # A series-parented comment feed (e.g. the World Cup) must be paged with
+    # parent_entity_type="Series"; the per-Event query returns nothing.
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+
+        class _Stream:
+            stream = "comments"
+            event_ids = {"351771"}
+            series_ids = {"11433"}
+
+            def last_comment_id_for(self, parent_id):
+                return None
+
+        seen: list[tuple[str, str]] = []
+
+        class _Gamma:
+            async def backfill_since(self, parent_id, last, *, parent_entity_type="Event"):
+                seen.append((str(parent_id), parent_entity_type))
+                # Only the Series feed carries comments for this product.
+                if parent_entity_type == "Series":
+                    return [{"id": "c1", "parentEntityID": 11433}]
+                return []
+
+        backfill = make_comment_backfill(_Stream(), _Gamma(), w)
+        assert await backfill() == 1
+        assert ("351771", "Event") in seen and ("11433", "Series") in seen
+        assert w.counts["comments"] == 1
 
 
 class _FatalStream:

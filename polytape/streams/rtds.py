@@ -10,6 +10,16 @@ event's comments normally. So polytape subscribes to the firehose and keeps only
 messages belonging to its event: comments by ``parentEntityID``, and reactions
 (which carry no ``parentEntityID``) by ``commentID`` against the comments seen
 this session. See ``PROTOCOL.md`` §1 and Open Question #3.
+
+**Comments may be parented to a Series, not the Event.** Some Polymarket
+products attach a single comment feed to the parent *Series* (a league/
+tournament) rather than to each Event. The FIFA World Cup is the live example:
+every match comment carries ``parentEntityID`` = the series id (``11433``,
+``parentEntityType`` ``"Series"``), and the per-event ``/comments`` endpoint
+returns nothing. So the firehose filter must accept *both* the run's event ids
+and its series ids, and backfill must page each parent with its correct
+``parent_entity_type`` (see :func:`polytape.supervisor.make_comment_backfill`).
+A filter keyed on event ids alone silently drops 100% of such comments.
 """
 
 from __future__ import annotations
@@ -51,11 +61,16 @@ def comment_subscribe_frame() -> str:
 
 
 class CommentStream(WebSocketStream):
-    """Records the RTDS ``comments`` topic for a single event (client-filtered).
+    """Records the RTDS ``comments`` topic for a run's events/series (client-filtered).
 
-    Tracks :attr:`last_comment_id` (the latest *comment* id, ignoring reactions)
-    so the supervisor can resume comment backfill after a disconnect, and the set
-    of comment ids seen this session so reactions can be attributed.
+    The firehose is filtered down to the comments whose ``parentEntityID`` is one
+    of this run's *parents* — its event ids **and** its series ids (some products,
+    e.g. the World Cup, attach the comment feed to the parent Series rather than
+    the Event; see the module docstring).
+
+    Tracks a per-parent backfill cursor (the latest *comment* id, ignoring
+    reactions) so the supervisor can resume backfill after a disconnect, and the
+    set of comment ids seen this session so reactions can be attributed.
     """
 
     stream = STREAM_COMMENTS
@@ -65,6 +80,7 @@ class CommentStream(WebSocketStream):
         *,
         event_id: str | int | None = None,
         event_ids: set[str] | None = None,
+        series_ids: set[str] | None = None,
         writer: Any,
         connect: Any = None,
         on_activity: Any = None,
@@ -86,11 +102,16 @@ class CommentStream(WebSocketStream):
             event_ids if event_ids is not None else ({event_id} if event_id is not None else set())
         )
         self.event_ids: set[str] = {str(e) for e in ids}
+        # Parent Series ids whose comment feed also belongs to this run (e.g. a
+        # tournament chat that every match's comments hang off of).
+        self.series_ids: set[str] = {str(s) for s in (series_ids or set())}
+        # The firehose match set: a comment is ours if its parent is any of these.
+        self._parent_ids: set[str] = self.event_ids | self.series_ids
         # Primary id (single-event convenience / back-compat); None for multi-event.
         self.event_id: str | None = next(iter(self.event_ids)) if len(self.event_ids) == 1 else None
-        # Per-event backfill cursor: latest comment id seen for each event.
+        # Per-parent backfill cursor: latest comment id seen for each event/series.
         self._last_comment_id: dict[str, str] = {}
-        # commentID -> event id, so reactions (which carry no parentEntityID) route.
+        # commentID -> parent id, so reactions (which carry no parentEntityID) route.
         self._comment_to_event: dict[str, str] = {}
 
     @property
@@ -113,17 +134,18 @@ class CommentStream(WebSocketStream):
         return payload if isinstance(payload, dict) else raw
 
     def should_record(self, raw: dict[str, Any]) -> bool:
-        """Keep only this run's events' comments/reactions from the firehose.
+        """Keep only this run's comments/reactions from the firehose.
 
-        Comments are matched by ``parentEntityID`` against the SET of recorded
-        events. Reactions carry no ``parentEntityID``, so they are matched by
-        ``commentID`` against comments already seen this session (reactions to
-        comments we never saw are not attributable and are dropped).
+        Comments are matched by ``parentEntityID`` against the run's parents — its
+        event ids *and* its series ids. Reactions carry no ``parentEntityID``, so
+        they are matched by ``commentID`` against comments already seen this
+        session (reactions to comments we never saw are not attributable and are
+        dropped).
         """
         core = self._core(raw)
         parent = core.get("parentEntityID")
         if parent is not None:
-            return str(parent) in self.event_ids
+            return str(parent) in self._parent_ids
         comment_id = core.get("commentID")
         if comment_id is not None:
             return str(comment_id) in self._comment_to_event
