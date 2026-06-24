@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import tarfile
+import tempfile
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from functools import partial
@@ -282,6 +283,24 @@ def per_event_meta(
 # --------------------------------------------------------------------------- #
 # Filtering a run into per-event scratch files
 # --------------------------------------------------------------------------- #
+
+
+def make_scratch_dir(scratch_root: str | Path | None, *, prefix: str) -> Path:
+    """Create a unique scratch dir for a filtered copy, under ``scratch_root`` (creating
+    it if missing) or the system temp dir when ``scratch_root`` is None.
+
+    The filtered copy of a multi-match (or finished-extract) download can be many GB, so
+    on the recorder VM it MUST land on the big run volume (``/data``), not the small root
+    fs that ``PrivateTmp`` / ``TMPDIR`` default to — overflowing root raised
+    ``[Errno 28] No space left on device`` and returned a 507. Point ``scratch_root`` at a
+    writable dir on the run volume (``POLYTAPE_SCRATCH_DIR`` / ``--scratch-dir``) to fix it.
+    ``OSError`` (e.g. the volume is full or the dir is unwritable) propagates to the caller.
+    """
+    if scratch_root is None:
+        return Path(tempfile.mkdtemp(prefix=prefix))
+    root = Path(scratch_root)
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=root))
 
 
 def _scan_and_route(

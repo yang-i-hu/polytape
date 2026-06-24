@@ -22,7 +22,6 @@ import os
 import re
 import shutil
 import tarfile
-import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -89,6 +88,7 @@ def build_extracts(
     *,
     registry: dict[str, dict] | None = None,
     meta: dict | None = None,
+    scratch_dir: str | Path | None = None,
 ) -> list[str]:
     """Extract each event in ``event_ids`` to ``event-<id>.tar.gz`` — ONE shared scan.
 
@@ -96,6 +96,10 @@ def build_extracts(
     combined files in a single pass, then packages + atomically publishes each as its
     own archive (marker last). Per-event failures are logged and skipped. MUST be
     called inside ``asyncio.to_thread`` — it does a full-run scan.
+
+    A batch's filtered copy can be many GB, so ``scratch_dir`` lands it on a chosen volume
+    (the run volume on the recorder) instead of the small root fs ``PrivateTmp`` defaults
+    to; None keeps the system temp dir. See :func:`download.make_scratch_dir`.
     """
     extract_dir = Path(extract_dir)
     extract_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +109,7 @@ def build_extracts(
     if not safe_ids:
         return []
     exported_at = utc_now_iso()
-    scratch = Path(tempfile.mkdtemp(prefix="polytape-extract-"))
+    scratch = dl.make_scratch_dir(scratch_dir, prefix="polytape-extract-")
     built: list[str] = []
     try:
         entries = dl.filter_run(

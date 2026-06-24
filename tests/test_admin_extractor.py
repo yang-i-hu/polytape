@@ -103,6 +103,35 @@ def test_build_extracts_skips_unsafe_ids(tmp_path):
     assert built == []  # unsafe id filtered out, nothing built (no crash)
 
 
+def test_build_extracts_honors_scratch_dir(tmp_path, monkeypatch):
+    # The pre-build pass's filtered copy of a finished match can be many GB, so it must
+    # scratch onto the configured volume (the run volume on prod), not the small root fs
+    # PrivateTmp defaults to. The inner copy is cleaned up; the root dir is left in place.
+    from polytape.admin import download as dl
+
+    _run(tmp_path)
+    scratch_root = tmp_path / "scratch"
+    seen: list[tuple] = []
+    real = dl.make_scratch_dir
+
+    def spy(root, *, prefix):
+        seen.append((root, prefix))
+        return real(root, prefix=prefix)
+
+    monkeypatch.setattr(dl, "make_scratch_dir", spy)
+    built = extractor.build_extracts(
+        tmp_path,
+        tmp_path / "extracts",
+        ["0900"],
+        registry=_REG,
+        meta={"events": [], "counts_by_event": {}},
+        scratch_dir=scratch_root,
+    )
+    assert built == ["0900"]
+    assert seen == [(scratch_root, "polytape-extract-")]  # routed onto the chosen volume
+    assert scratch_root.is_dir() and list(scratch_root.iterdir()) == []  # inner copy cleaned up
+
+
 def test_enforce_cap_counts_and_evicts_corrupt_marker(tmp_path):
     # A tarball whose marker is unparseable must still count toward the cap AND be evicted
     # first — otherwise a bad marker would let the cache grow unbounded past the cap.

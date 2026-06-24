@@ -9,6 +9,8 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -206,6 +208,39 @@ def test_whole_run_entries(tmp_path):
         f"{root}/book.jsonl",
         f"{root}/comments.jsonl",
     }
+    # Whole-run streams the combined files VERBATIM: every entry points straight at the
+    # run dir, so no filtered copy is made and this path never needs (or overflows)
+    # scratch — only the per-match filter path does.
+    assert all(Path(p).parent == tmp_path for _, p in entries)
+
+
+# --------------------------------------------------------------------------- #
+# Pure: scratch dir placement (off the small root fs / onto the run volume)
+# --------------------------------------------------------------------------- #
+
+
+def test_make_scratch_dir_uses_given_root(tmp_path):
+    root = tmp_path / "scratch"
+    d = dl.make_scratch_dir(root, prefix="polytape-dl-")
+    assert d.is_dir()
+    assert d.parent == root  # created UNDER the chosen volume, not the system /tmp
+    assert d.name.startswith("polytape-dl-")
+
+
+def test_make_scratch_dir_creates_missing_root(tmp_path):
+    root = tmp_path / "a" / "b" / "scratch"  # several missing parents
+    assert not root.exists()
+    d = dl.make_scratch_dir(root, prefix="x-")
+    assert d.parent == root and root.is_dir()  # root tree created on demand
+
+
+def test_make_scratch_dir_none_uses_system_tmp(tmp_path):
+    d = dl.make_scratch_dir(None, prefix="polytape-dl-")
+    try:
+        assert d.is_dir()
+        assert d.parent == Path(tempfile.gettempdir())  # falls back to the system temp dir
+    finally:
+        d.rmdir()
 
 
 def test_stream_targz_roundtrip_and_cleanup(tmp_path):
@@ -236,12 +271,18 @@ def client_factory(tmp_path):
 
     _setup_run(tmp_path)
 
-    def _make(*, secret: str | None = "secret"):
+    def _make(*, secret: str | None = "secret", scratch_dir=None):
         reader = RunReader(
             tmp_path, env_file=tmp_path / "missing.env", matches_file=tmp_path / "missing.json"
         )
         audit = control.AuditLog(tmp_path / "audit.jsonl")
-        app = create_app(reader, admin_token=secret, audit=audit, sessions=control.Sessions())
+        app = create_app(
+            reader,
+            admin_token=secret,
+            audit=audit,
+            sessions=control.Sessions(),
+            scratch_dir=scratch_dir,
+        )
         return TestClient(app), audit
 
     return _make
@@ -315,3 +356,40 @@ def test_download_is_audited(client_factory, tmp_path):
     lines = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
     dl_events = [json.loads(line) for line in lines if json.loads(line).get("action") == "download"]
     assert dl_events and dl_events[-1]["result"] == "ok" and dl_events[-1]["scope"] == "1001"
+
+
+def test_download_filter_uses_configured_scratch_dir(client_factory, tmp_path, monkeypatch):
+    # The fixture run is still OPEN (events live in meta), so there is no cached extract and
+    # the route filters into scratch. That scratch must land under the CONFIGURED dir (the
+    # big /data volume on prod), not the default system tmp; only the inner copy is removed
+    # on completion, leaving the root intact for the next download.
+    scratch_root = tmp_path / "scratch"
+    seen: list[tuple] = []
+    real = dl.make_scratch_dir
+
+    def spy(root, *, prefix):
+        seen.append((root, prefix))
+        return real(root, prefix=prefix)
+
+    monkeypatch.setattr(dl, "make_scratch_dir", spy)
+    client, _ = client_factory(scratch_dir=scratch_root)
+    _login(client)
+    r = client.get("/api/download?event=1001")
+    assert r.status_code == 200
+    assert seen == [(scratch_root, "polytape-dl-")]  # routed onto the chosen volume
+    assert scratch_root.is_dir()  # root kept...
+    assert list(scratch_root.iterdir()) == []  # ...but the (multi-GB) inner copy is cleaned up
+
+
+def test_download_scratch_unavailable_returns_507(client_factory, monkeypatch):
+    # If the scratch volume is full/unwritable, scratch creation raises OSError; the route
+    # must surface a 507 (could-not-build), NOT crash into a 500 — this is the [Errno 28]
+    # path the prod journal hit, now off the small root fs.
+    def boom(root, *, prefix):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(dl, "make_scratch_dir", boom)
+    client, _ = client_factory()
+    _login(client)
+    r = client.get("/api/download?event=1001")
+    assert r.status_code == 507

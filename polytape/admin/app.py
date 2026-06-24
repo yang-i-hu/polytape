@@ -27,7 +27,6 @@ import json
 import logging
 import os
 import shutil
-import tempfile
 from pathlib import Path
 
 from polytape.admin import download as dl
@@ -89,6 +88,7 @@ def create_app(
     extract_dir: str | Path | None = None,
     extract_refresh_s: float = 600.0,
     checkpoint_every: int = 30,
+    scratch_dir: str | Path | None = None,
     session_file: str | Path | None = None,
     broker=None,
     audit=None,
@@ -206,6 +206,7 @@ def create_app(
                                 pending,
                                 registry=registry,
                                 meta=meta,
+                                scratch_dir=scratch_dir,
                             )
                             await asyncio.to_thread(extractor.enforce_cap, extract_dir)
                 except Exception:  # noqa: BLE001 - never let the extractor loop die
@@ -350,6 +351,7 @@ def create_app(
                         missing,
                         registry=registry,
                         meta=meta,
+                        scratch_dir=scratch_dir,
                     )
                 except Exception:  # noqa: BLE001 - fall back to the full-run scan below
                     logger.warning("on-demand extract build failed", exc_info=True)
@@ -376,7 +378,17 @@ def create_app(
         cached = await _serve_from_cache()
         if cached is not None:
             return cached
-        scratch = Path(tempfile.mkdtemp(prefix="polytape-dl-"))
+        # The filtered copy lands on scratch_dir's volume (the big run volume on the
+        # recorder), NOT the small root fs PrivateTmp defaults to — a whole-run-sized
+        # selection would otherwise overflow root with ENOSPC. Creating it can itself
+        # fail (full/unwritable volume); treat that as a 507 too, not a 500.
+        try:
+            scratch = await asyncio.to_thread(
+                dl.make_scratch_dir, scratch_dir, prefix="polytape-dl-"
+            )
+        except OSError as exc:
+            logger.warning("download scratch dir unavailable: %s", exc)
+            return JSONResponse({"error": "could not build archive"}, status_code=507)
         try:
             entries = await asyncio.to_thread(
                 dl.filter_run,
@@ -564,6 +576,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Persist the reader's scan offsets + aggregates here so a restart resumes "
         "forward in seconds instead of re-draining the whole log. Unset disables it.",
     )
+    parser.add_argument(
+        "--scratch-dir",
+        default=os.environ.get("POLYTAPE_SCRATCH_DIR"),
+        help="Volume for the (multi-GB) filtered-copy scratch of a download/extract. "
+        "Point at the run volume (e.g. /data/tmp/polytape-admin) so it doesn't overflow "
+        "the small root fs PrivateTmp defaults to. Unset uses the system temp dir.",
+    )
     parser.add_argument("--host", default=os.environ.get("POLYTAPE_ADMIN_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("POLYTAPE_ADMIN_PORT", "8080"))
@@ -593,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
             admin_token=admin_token,
             registry_file=args.registry_file,
             extract_dir=args.extract_dir,
+            scratch_dir=args.scratch_dir,
         ),
         host=args.host,
         port=args.port,
