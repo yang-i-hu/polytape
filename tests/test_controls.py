@@ -58,7 +58,7 @@ def test_fingerprint_is_short_and_not_the_value():
 
 def test_sessions_mint_validate_expire_drop():
     clock = [1000.0]
-    s = control.Sessions(ttl_s=100.0, mono=lambda: clock[0])
+    s = control.Sessions(ttl_s=100.0, clock=lambda: clock[0])
     sid = s.mint()
     assert s.valid(sid)
     assert not s.valid("nope") and not s.valid(None)
@@ -68,6 +68,54 @@ def test_sessions_mint_validate_expire_drop():
     assert s.valid(sid2)
     s.drop(sid2)
     assert not s.valid(sid2)
+
+
+def test_sessions_persist_across_restart(tmp_path):
+    clock = [1000.0]
+    path = tmp_path / "sessions.json"
+    s1 = control.Sessions(ttl_s=100.0, clock=lambda: clock[0], store_path=path)
+    sid = s1.mint()
+    # A fresh Sessions (a "restart") backed by the same file still honours the session.
+    s2 = control.Sessions(ttl_s=100.0, clock=lambda: clock[0], store_path=path)
+    assert s2.valid(sid)
+    # The file stores only the SHA-256 verifier, never the raw session id.
+    assert sid not in path.read_text(encoding="utf-8")
+    # Expired sessions are pruned on load (a restart after the TTL drops them).
+    clock[0] = 1200.0
+    s3 = control.Sessions(ttl_s=100.0, clock=lambda: clock[0], store_path=path)
+    assert not s3.valid(sid)
+
+
+def test_sessions_corrupt_store_degrades_to_empty(tmp_path):
+    path = tmp_path / "sessions.json"
+    path.write_text("not json{", encoding="utf-8")
+    s = control.Sessions(store_path=path)  # must not raise
+    assert not s.valid("anything")
+    assert s.valid(s.mint())  # still works (overwrites the garbage on next save)
+
+
+def test_sessions_mint_prunes_expired(tmp_path):
+    # mint() drops expired verifiers so the persisted store can't grow without bound.
+    clock = [1000.0]
+    path = tmp_path / "sessions.json"
+    s = control.Sessions(ttl_s=100.0, clock=lambda: clock[0], store_path=path)
+    s.mint()  # expires at 1100
+    clock[0] = 1200.0
+    s.mint()  # the now-expired verifier is pruned before the new one is added
+    assert len(json.loads(path.read_text(encoding="utf-8"))) == 1  # only the live session
+
+
+def test_sessions_valid_does_not_rewrite_store_on_expiry(tmp_path):
+    # The hot read path must not persist: an expired hit drops from memory only (no write),
+    # so the on-disk store is untouched by valid().
+    clock = [1000.0]
+    path = tmp_path / "sessions.json"
+    s = control.Sessions(ttl_s=100.0, clock=lambda: clock[0], store_path=path)
+    s.mint()
+    before = path.read_text(encoding="utf-8")
+    clock[0] = 1200.0  # past the TTL
+    assert not s.valid("anything")  # touches an expired/unknown sid
+    assert path.read_text(encoding="utf-8") == before  # file unchanged by the read path
 
 
 def test_rate_limiter_min_interval_per_action():

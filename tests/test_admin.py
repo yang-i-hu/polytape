@@ -84,7 +84,7 @@ def test_matches_per_event_recency_and_status(tmp_path):
     assert by_id["1001"]["title"] == "A vs. B" and by_id["1001"]["date"] == "2026-06-19"
     assert by_id["1001"]["status"] == "live"
     assert by_id["1002"]["status"] == "pending" and by_id["1002"]["counts"] == {}
-    # live (recent) sorts ahead of pending (never seen)
+    # rows are in schedule-date order now (1001's date precedes 1002's), not by recency
     assert r.matches()[0]["event_id"] == "1001"
 
 
