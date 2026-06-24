@@ -90,6 +90,10 @@ class CaptureWriter:
         # Per-event, per-stream written counts (multi-event runs). Records still go
         # to the shared per-stream files; this is just accounting for meta.json.
         self._counts_by_event: dict[str, dict[str, int]] = {}
+        # Freshness for the admin: last record ts per event + overall. Lets the dashboard
+        # show live/quiet and recorder liveness straight from meta.json — no log scan.
+        self._last_ts_by_event: dict[str, str] = {}
+        self._last_record_at: str | None = None
         self._gaps: list[dict[str, Any]] = []
         self._started_at: str | None = None
         self._stopped_at: str | None = None
@@ -110,6 +114,11 @@ class CaptureWriter:
             return
         self._dir.mkdir(parents=True, exist_ok=True)
         self._started_at = self._now()
+        # Continue the CUMULATIVE tally across restarts: the recorder appends to the same
+        # JSONL files, so counts must pick up where the prior process left off (the refresh
+        # roll-over restarts this process routinely). Without this, meta.json would reset to
+        # 0 on every restart and undercount the append-only log.
+        self._seed_counts_from_meta()
         for stream in self._config.enabled_streams:
             path = self._dir / f"{stream}.jsonl"
             # Append-only so an existing capture is never clobbered; dedup is
@@ -155,9 +164,14 @@ class CaptureWriter:
         """
         envelope = build_envelope(stream, raw, hasher=self._hasher, ts_recv=self._now())
         wrote = self.write_envelope(envelope)
-        if wrote and event_id is not None:
-            per_event = self._counts_by_event.setdefault(str(event_id), {})
-            per_event[stream] = per_event.get(stream, 0) + 1
+        if wrote:
+            ts = envelope["ts_recv"]
+            self._last_record_at = ts
+            if event_id is not None:
+                eid = str(event_id)
+                per_event = self._counts_by_event.setdefault(eid, {})
+                per_event[stream] = per_event.get(stream, 0) + 1
+                self._last_ts_by_event[eid] = ts
         return wrote
 
     def write_envelope(self, envelope: dict[str, Any]) -> bool:
@@ -239,6 +253,56 @@ class CaptureWriter:
     def _event_snapshot(self) -> dict[str, Any] | None:
         return self._snapshot(self._event_info) if self._event_info else None
 
+    def flush_meta(self) -> bool:
+        """Persist ``meta.json`` best-effort, for the periodic flusher.
+
+        Unlike the gap/close paths, a transient flush failure here must NOT escalate to
+        :class:`FatalRecorderError` and kill a healthy recording — the stream-write path
+        is the real disk-full detector. Called on the event loop (serialized with
+        :meth:`write`), so the count snapshot is consistent. Returns True on success.
+        """
+        if not self._open:
+            return False
+        try:
+            self._write_meta()
+            return True
+        except FatalRecorderError:
+            logger.warning("periodic meta.json flush failed (continuing)", exc_info=True)
+            return False
+
+    def _seed_counts_from_meta(self) -> None:
+        """Seed cumulative counts + freshness from an existing ``meta.json`` so a restart
+        CONTINUES the tally over the append-only files instead of restarting from zero.
+
+        Best-effort: a missing/corrupt meta leaves everything at zero (a fresh run). Only
+        well-typed, non-negative values are adopted, so a hand-mangled meta can't poison
+        the counters.
+        """
+        try:
+            meta = json.loads((self._dir / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(meta, dict):
+            return
+        counts = meta.get("counts")
+        if isinstance(counts, dict):
+            for stream, n in counts.items():
+                if isinstance(n, int) and n >= 0:
+                    self._counts[str(stream)] = n
+        by_event = meta.get("counts_by_event")
+        if isinstance(by_event, dict):
+            for eid, per in by_event.items():
+                if isinstance(per, dict):
+                    self._counts_by_event[str(eid)] = {
+                        str(s): n for s, n in per.items() if isinstance(n, int) and n >= 0
+                    }
+        last_ts = meta.get("last_ts_by_event")
+        if isinstance(last_ts, dict):
+            self._last_ts_by_event = {str(e): t for e, t in last_ts.items() if isinstance(t, str)}
+        last_at = meta.get("last_record_at")
+        if isinstance(last_at, str):
+            self._last_record_at = last_at
+
     def _meta(self) -> dict[str, Any]:
         return {
             "polytape_version": __version__,
@@ -260,6 +324,9 @@ class CaptureWriter:
             "stopped_at": self._stopped_at,
             "counts": dict(self._counts),
             "counts_by_event": {k: dict(v) for k, v in self._counts_by_event.items()},
+            # Freshness, for the admin to show live/quiet + recorder liveness from meta alone.
+            "last_ts_by_event": dict(self._last_ts_by_event),
+            "last_record_at": self._last_record_at,
             "event": self._event_snapshot(),
             "events": [self._snapshot(e) for e in self._event_infos],
             "gaps": list(self._gaps),

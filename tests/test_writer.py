@@ -154,3 +154,53 @@ def test_multi_event_counts_and_envelope_shape(make_config):
         "1001": {"comments": 1, "book": 1},
         "1002": {"comments": 1},
     }
+
+
+def _meta(cfg):
+    return json.loads((cfg.event_dir / "meta.json").read_text(encoding="utf-8"))
+
+
+def test_counts_cumulative_across_restart(make_config):
+    # The recorder appends to the same files across restarts (refresh roll-over), so
+    # meta counts must CONTINUE from the prior process, not reset to 0 and undercount.
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+        w.write("comments", {"payload": {"id": "a"}}, event_id="7")
+        w.write("comments", {"payload": {"id": "b"}}, event_id="7")
+    assert _meta(cfg)["counts"]["comments"] == 2
+    with CaptureWriter(cfg) as w:  # restart, same dir
+        assert w.counts["comments"] == 2  # seeded from meta on open(), not reset
+        w.write("comments", {"payload": {"id": "c"}}, event_id="7")
+    m = _meta(cfg)
+    assert m["counts"]["comments"] == 3  # cumulative across the restart
+    assert m["counts_by_event"]["7"]["comments"] == 3
+
+
+def test_meta_has_freshness_fields(make_config):
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+        w.write("comments", {"payload": {"id": "a"}}, event_id="7")
+    m = _meta(cfg)
+    assert m["last_record_at"] is not None
+    assert m["last_ts_by_event"]["7"] == m["last_record_at"]  # last per-event == overall
+
+
+def test_flush_meta_persists_fresh_counts_without_close(make_config):
+    # The periodic flusher keeps meta.json current mid-run so the admin needs no scan.
+    cfg = make_config(book=False)
+    with CaptureWriter(cfg) as w:
+        w.write("comments", {"payload": {"id": "a"}})
+        w.write("comments", {"payload": {"id": "b"}})
+        assert w.flush_meta() is True
+        assert _meta(cfg)["counts"]["comments"] == 2  # on disk before close()
+
+
+def test_seed_ignores_corrupt_meta(make_config):
+    # A garbage meta.json must not crash open() or poison the counters — start fresh.
+    cfg = make_config(book=False)
+    cfg.event_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.event_dir / "meta.json").write_text("{ not valid json", encoding="utf-8")
+    with CaptureWriter(cfg) as w:
+        assert w.counts.get("comments", 0) == 0
+        w.write("comments", {"payload": {"id": "a"}})
+        assert w.counts["comments"] == 1

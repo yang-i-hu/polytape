@@ -39,6 +39,19 @@ logger = logging.getLogger("polytape.app")
 HEARTBEAT_ENV = "POLYTAPE_HEARTBEAT_URL"
 
 
+async def _meta_flusher(writer: CaptureWriter, *, period: float = 5.0) -> None:
+    """Periodically persist ``meta.json`` so the admin reads fresh per-match counts and
+    freshness straight from it — no scan of the multi-GB log, ~KB of memory.
+
+    Runs ON the event loop (not a worker thread) so the small JSON write is serialized
+    with :meth:`CaptureWriter.write`; there is no lock and the count snapshot must stay
+    consistent. ``period`` bounds how stale the on-disk counts can get (a few seconds).
+    """
+    while True:
+        await asyncio.sleep(period)
+        writer.flush_meta()
+
+
 async def _heartbeat(
     url: str,
     last_activity: list[float],
@@ -170,6 +183,9 @@ async def run(
             logger.error("nothing to record (book requested but the event has no CLOB token ids)")
             return 1
         tasks = [asyncio.create_task(s.run(), name=f"polytape.{s.name}") for s in supervisors]
+        # Keep meta.json fresh so the admin dashboard reads per-match counts + freshness
+        # from it instead of scanning the multi-GB log.
+        tasks.append(asyncio.create_task(_meta_flusher(writer), name="polytape.meta_flush"))
 
         hb_url = os.environ.get(HEARTBEAT_ENV)
         if hb_url:
