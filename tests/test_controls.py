@@ -215,7 +215,7 @@ def _reader(tmp_path):
     (tmp_path / "meta.json").write_text(
         json.dumps({"started_at": "2026-06-19T00:00:00Z", "events": []}), encoding="utf-8"
     )
-    return RunReader(tmp_path, env_file=tmp_path / "x.env", matches_file=tmp_path / "x.json")
+    return RunReader(tmp_path, env_file=tmp_path / "x.env")
 
 
 def _app(tmp_path, *, secret="s3cr3t"):

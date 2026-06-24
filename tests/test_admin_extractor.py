@@ -41,8 +41,11 @@ def _members(raw: bytes) -> dict[str, bytes]:
 
 # finished event 0900 (conditionId 0xZ) with two book records; 0xQ belongs to no event
 def _run(tmp_path):
+    # meta.counts_by_event is the recorder's per-match accounting the admin now reads to
+    # decide which finished matches are extractable (0900 has the two 0xZ book records).
     (tmp_path / "meta.json").write_text(
-        json.dumps({"run_name": "wc", "counts_by_event": {}, "events": []}), encoding="utf-8"
+        json.dumps({"run_name": "wc", "counts_by_event": {"0900": {"book": 2}}, "events": []}),
+        encoding="utf-8",
     )
     _write_jsonl(
         tmp_path / "book.jsonl", [_book("0xZ", "z1"), _book("0xZ", "z2"), _book("0xQ", "q1")]
@@ -195,7 +198,6 @@ def test_download_serves_prebuilt_extract(tmp_path):
     reader = RunReader(
         tmp_path,
         env_file=tmp_path / "x.env",
-        matches_file=tmp_path / "x.json",
         registry_file=tmp_path / "registry.json",
     )
     reader.update()
@@ -249,7 +251,12 @@ def _run2(tmp_path, *, open_events=()):
         for e in _REG2
         if e["event_id"] in open_events
     ]
-    meta = {"run_name": "wc", "counts_by_event": {}, "events": events}
+    # Per-match counts the admin reads from meta (0900: two 0xZ records, 0901: one 0xW).
+    meta = {
+        "run_name": "wc",
+        "counts_by_event": {"0900": {"book": 2}, "0901": {"book": 1}},
+        "events": events,
+    }
     (tmp_path / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
     _write_jsonl(
         tmp_path / "book.jsonl",
@@ -269,7 +276,6 @@ def _login_client(tmp_path, ed, *, extract_refresh_s=0):
     reader = RunReader(
         tmp_path,
         env_file=tmp_path / "x.env",
-        matches_file=tmp_path / "x.json",
         registry_file=tmp_path / "registry.json",
     )
     reader.update()
