@@ -1,6 +1,10 @@
 # Captured recordings — never commit data
 data/
 
+# Viewer demo/test captures and local preview config
+_vtmp/
+.claude/launch.json
+
 # Generated snapshot of live Polymarket data (regenerable via scripts/list_wc_matches.py)
 wc_matches.json
 

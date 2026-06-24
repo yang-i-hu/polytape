@@ -42,6 +42,7 @@ admin = [
 polytape = "polytape.cli:main"
 polytape-admin = "polytape.admin.app:main"
 polytape-monitor = "polytape.monitor.__main__:main"
+polytape-view = "polytape.viewer.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/polytape/polytape"
@@ -52,6 +53,11 @@ packages = ["polytape"]
 # Ship the monitor dashboard HTML (a non-Python asset) inside the wheel so the
 # monitor works from an installed wheel as well as the source tree.
 artifacts = ["polytape/monitor/index.html"]
+
+# Ship the viewer's static frontend (HTML/CSS/JS) inside the wheel so the
+# `polytape-view` UI works from an installed wheel as well as the source tree.
+[tool.hatch.build.targets.wheel.force-include]
+"polytape/viewer/static" = "polytape/viewer/static"
 
 [tool.ruff]
 line-length = 100
