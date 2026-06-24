@@ -86,15 +86,16 @@ ProtectHome=true
 # Private /tmp (isolation). It lands on the small root fs, so large downloads must NOT
 # scratch here — they use POLYTAPE_SCRATCH_DIR on /data instead (see above).
 PrivateTmp=true
-# Hard memory cap. The dashboard reads counts/freshness from meta.json (a few KB) — it no
-# longer scans the multi-GB log — so the resident set is just the Python/FastAPI baseline
-# (~200-300 MB) plus the download extractor's bounded streaming buffers. 768M is the proven
-# pre-drain value with comfortable headroom for extract builds, and guarantees the sidecar
-# can NEVER OOM the recorder. (The old drain forced a 2G runtime override; that era is over.)
-# NOTE: if a prior 2G override was set via `systemctl set-property`, clear its drop-in under
+# Hard memory cap ONLY — deliberately no MemoryHigh. The dashboard reads counts/freshness
+# from meta.json (a few KB, no log scan); the resident set is the Python/FastAPI baseline
+# (~200 MB) plus transient extract-build/download buffers. 768M has comfortable headroom and
+# still can NEVER OOM the recorder. We do NOT set MemoryHigh: it is a SOFT limit that
+# throttles a process which can't quickly reclaim (a mid-build/download Python heap) into an
+# unresponsive hang instead of failing — exactly what wedged the sidecar once. With only
+# MemoryMax, an overflow is a clean OOM-kill that Restart=always recovers in seconds.
+# NOTE: clear any stale `systemctl set-property` drop-in under
 # /etc/systemd/system.control/polytape-admin.service.d/ on deploy so this unit value applies
 # (do NOT `systemctl revert` — there is no vendor unit, so revert would delete this file).
-MemoryHigh=512M
 MemoryMax=768M
 
 [Install]
