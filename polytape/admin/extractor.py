@@ -23,7 +23,10 @@ import re
 import shutil
 import tarfile
 import tempfile
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 from polytape.admin import download as dl
 from polytape.envelope import utc_now_iso
@@ -164,3 +167,79 @@ def enforce_cap(extract_dir: str | Path, cap_bytes: int = DEFAULT_CAP_BYTES) -> 
         marker_path(extract_dir, eid).unlink(missing_ok=True)
         archive_path(extract_dir, eid).unlink(missing_ok=True)
         total -= size
+
+
+# --------------------------------------------------------------------------- #
+# Streaming a COMBINED download from cached per-match extracts (no run scan)
+# --------------------------------------------------------------------------- #
+
+
+def _append_extract(out: tarfile.TarFile, fh: BinaryIO) -> None:
+    """Copy every file member of one open ``event-<id>.tar.gz`` into the ``out`` tar.
+
+    The inner archive is read once in streaming ``r|gz`` order; members keep their
+    ``event-<id>/<file>`` arcnames. An unreadable archive is logged and skipped.
+    """
+    try:
+        inner = tarfile.open(fileobj=fh, mode="r|gz")
+    except (OSError, tarfile.TarError):
+        logger.warning("combined download: skipping unreadable extract", exc_info=True)
+        return
+    with inner:
+        for member in inner:
+            if not member.isfile():
+                continue
+            src = inner.extractfile(member)
+            if src is not None:
+                out.addfile(member, src)
+
+
+def stream_combined_targz(
+    handles: list[BinaryIO], *, on_done: Callable[[], None] | None = None
+) -> Iterator[bytes]:
+    """Yield ONE gzip-tar combining several already-open per-match extract archives.
+
+    Each handle is an open ``event-<id>.tar.gz`` — opened by the caller BEFORE the
+    response starts, so an eviction (:func:`enforce_cap`) racing the send can't unlink it
+    out from under us (an already-open fd survives unlink). Their members are re-packed,
+    each inner archive read once, into a single ``w|gz`` tar written through an OS pipe by
+    a worker thread while this generator reads the other end — so even a multi-GB
+    selection streams at constant memory. Members keep their ``event-<id>/<file>``
+    arcnames, giving the combined archive the SAME flat layout as a single-match or
+    whole-run download. Every handle is closed once the stream drains (or the client
+    disconnects); ``on_done`` then runs (e.g. scratch cleanup), mirroring
+    :func:`polytape.admin.download.stream_targz`.
+    """
+    read_fd, write_fd = os.pipe()
+    errors: list[BaseException] = []
+
+    def _write() -> None:
+        try:
+            with os.fdopen(write_fd, "wb") as wf, tarfile.open(mode="w|gz", fileobj=wf) as out:
+                for fh in handles:
+                    _append_extract(out, fh)
+        except BaseException as exc:  # noqa: BLE001 - surface via log; reader sees EOF
+            errors.append(exc)
+
+    worker = threading.Thread(target=_write, daemon=True)
+    worker.start()
+    reader = os.fdopen(read_fd, "rb")
+    try:
+        while True:
+            data = reader.read(65536)
+            if not data:
+                break
+            yield data
+    finally:
+        reader.close()
+        worker.join()
+        for fh in handles:
+            with contextlib.suppress(OSError):
+                fh.close()
+        if errors:
+            logger.warning("combined download writer error: %r", errors[0])
+        if on_done is not None:
+            try:
+                on_done()
+            except Exception:  # noqa: BLE001
+                logger.exception("combined download cleanup failed")

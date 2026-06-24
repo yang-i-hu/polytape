@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tarfile
 import threading
 from collections.abc import Callable, Iterable, Iterator
@@ -34,6 +35,99 @@ logger = logging.getLogger("polytape.admin.download")
 
 _STREAMS = ("book", "comments")
 _READ_CHUNK = 8 * 1024 * 1024  # 8 MiB scan chunks; flat memory on a multi-GB file.
+
+
+# --------------------------------------------------------------------------- #
+# Human-friendly archive filename: event id + FIFA team codes
+# --------------------------------------------------------------------------- #
+
+# FIFA 3-letter codes for the 2026 World Cup teams. Keys match the Gamma event-title
+# sides / market groupItemTitle verbatim (incl. the tricky ones: "Korea Republic",
+# "IR Iran", "Türkiye", "South Africa", "Saudi Arabia", "Cabo Verde", "DR Congo",
+# "Côte d'Ivoire", "Curaçao"). An unmapped team falls back to a derived A-Z token.
+_FIFA_CODES = {
+    "Algeria": "ALG",
+    "Argentina": "ARG",
+    "Australia": "AUS",
+    "Austria": "AUT",
+    "Belgium": "BEL",
+    "Bosnia-Herzegovina": "BIH",
+    "Brazil": "BRA",
+    "Cabo Verde": "CPV",
+    "Canada": "CAN",
+    "Colombia": "COL",
+    "Croatia": "CRO",
+    "Curaçao": "CUW",
+    "Czechia": "CZE",
+    "Côte d'Ivoire": "CIV",
+    "DR Congo": "COD",
+    "Ecuador": "ECU",
+    "Egypt": "EGY",
+    "England": "ENG",
+    "France": "FRA",
+    "Germany": "GER",
+    "Ghana": "GHA",
+    "Haiti": "HAI",
+    "IR Iran": "IRN",
+    "Iraq": "IRQ",
+    "Japan": "JPN",
+    "Jordan": "JOR",
+    "Korea Republic": "KOR",
+    "Mexico": "MEX",
+    "Morocco": "MAR",
+    "Netherlands": "NED",
+    "New Zealand": "NZL",
+    "Norway": "NOR",
+    "Panama": "PAN",
+    "Paraguay": "PAR",
+    "Portugal": "POR",
+    "Qatar": "QAT",
+    "Saudi Arabia": "KSA",
+    "Scotland": "SCO",
+    "Senegal": "SEN",
+    "South Africa": "RSA",
+    "Spain": "ESP",
+    "Sweden": "SWE",
+    "Switzerland": "SUI",
+    "Tunisia": "TUN",
+    "Türkiye": "TUR",
+    "United States": "USA",
+    "Uruguay": "URU",
+    "Uzbekistan": "UZB",
+}
+
+# Title sides: "United States vs. Australia" / "Spain vs Saudi Arabia" -> the two teams.
+_VS_SPLIT = re.compile(r"\s+vs\.?\s+", re.IGNORECASE)
+
+
+def team_code(name: str) -> str:
+    """Short uppercase code for a team — its FIFA code if known, else a derived A-Z
+    token (so an unmapped / future team still yields a safe filename component)."""
+    code = _FIFA_CODES.get(name.strip())
+    if code:
+        return code
+    derived = "".join(ch for ch in name.upper() if "A" <= ch <= "Z")[:3]
+    return derived or "UNK"
+
+
+def _title_sides(entry: dict[str, Any] | None) -> tuple[str, str] | None:
+    """The two team names of a match from its title ('A vs. B'); None if not parseable."""
+    if not entry:
+        return None
+    parts = _VS_SPLIT.split(str(entry.get("title") or "").strip(), maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    return None
+
+
+def match_archive_name(event_id: str, entry: dict[str, Any] | None) -> str:
+    """Download filename for ONE match: ``event-<id>-<HOME>-<AWAY>.tar.gz`` (e.g.
+    ``event-351743-USA-AUS.tar.gz``). Falls back to ``event-<id>.tar.gz`` when the
+    title can't be split into two sides. Tokens are A-Z FIFA codes, so always safe."""
+    sides = _title_sides(entry)
+    if sides:
+        return f"event-{event_id}-{team_code(sides[0])}-{team_code(sides[1])}.tar.gz"
+    return f"event-{event_id}.tar.gz"
 
 
 # --------------------------------------------------------------------------- #

@@ -155,6 +155,7 @@ def test_download_serves_prebuilt_extract(tmp_path):
         [
             {
                 "event_id": "0900",
+                "title": "Brazil vs. Argentina",
                 "date": "2026-06-19",
                 "closed": True,
                 "markets": [{"conditionId": "0xZ", "clobTokenIds": []}],
@@ -183,3 +184,155 @@ def test_download_serves_prebuilt_extract(tmp_path):
     r = client.get("/api/download?event=0900")
     assert r.status_code == 200
     assert r.content == b"SENTINEL-TARGZ-BYTES"  # served the pre-built extract, no scan
+    # Filename carries the event id + FIFA codes of both sides (Brazil vs. Argentina).
+    assert "event-0900-BRA-ARG.tar.gz" in r.headers.get("content-disposition", "")
+
+
+# --------------------------------------------------------------------------- #
+# Combined multi-match download (stitched from cached extracts; no run scan)
+# --------------------------------------------------------------------------- #
+
+# Two events: 0900 (cond 0xZ, two book records) and 0901 (cond 0xW, one).
+_REG2 = [
+    {
+        "event_id": "0900",
+        "title": "Z vs. Y",
+        "date": "2026-06-19",
+        "closed": True,
+        "markets": [{"conditionId": "0xZ", "clobTokenIds": ["0xZ-Y"]}],
+    },
+    {
+        "event_id": "0901",
+        "title": "W vs. V",
+        "date": "2026-06-20",
+        "closed": True,
+        "markets": [{"conditionId": "0xW", "clobTokenIds": ["0xW-Y"]}],
+    },
+]
+_REG2_BY_ID = {e["event_id"]: e for e in _REG2}
+
+
+def _run2(tmp_path, *, open_events=()):
+    """A combined run with two matches' book records. Events named in ``open_events`` go
+    into meta.events (still OPEN); the rest are finished (registry-only, immutable)."""
+    events = [
+        {"id": e["event_id"], "title": e["title"], "markets": e["markets"]}
+        for e in _REG2
+        if e["event_id"] in open_events
+    ]
+    meta = {"run_name": "wc", "counts_by_event": {}, "events": events}
+    (tmp_path / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    _write_jsonl(
+        tmp_path / "book.jsonl",
+        [_book("0xZ", "z1"), _book("0xZ", "z2"), _book("0xW", "w1")],
+    )
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    reg.write_registry_atomic(tmp_path / "registry.json", _REG2, now_iso="t")
+
+
+def _login_client(tmp_path, ed, *, extract_refresh_s=0):
+    from fastapi.testclient import TestClient
+
+    from polytape.admin import control
+    from polytape.admin.app import create_app
+    from polytape.admin.reader import RunReader
+
+    reader = RunReader(
+        tmp_path,
+        env_file=tmp_path / "x.env",
+        matches_file=tmp_path / "x.json",
+        registry_file=tmp_path / "registry.json",
+    )
+    reader.update()
+    app = create_app(
+        reader,
+        admin_token="secret",
+        extract_dir=ed,
+        registry_refresh_s=0,  # no Gamma / background extractor loop in the test
+        extract_refresh_s=extract_refresh_s,
+        audit=control.AuditLog(tmp_path / "audit.jsonl"),
+        sessions=control.Sessions(),
+    )
+    client = TestClient(app)
+    assert client.post("/api/login", json={"token": "secret"}).status_code == 200
+    return client
+
+
+def _last_download(tmp_path):
+    lines = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(x) for x in lines if json.loads(x).get("action") == "download"]
+    return rows[-1]
+
+
+def test_stream_combined_targz_merges_extracts(tmp_path):
+    _run2(tmp_path)
+    ed = tmp_path / "extracts"
+    extractor.build_extracts(
+        tmp_path, ed, ["0900", "0901"], registry=_REG2_BY_ID, meta={"events": []}
+    )
+    handles = [
+        open(extractor.archive_path(ed, "0900"), "rb"),
+        open(extractor.archive_path(ed, "0901"), "rb"),
+    ]
+    done = []
+    raw = b"".join(extractor.stream_combined_targz(handles, on_done=lambda: done.append(True)))
+    members = _members(raw)
+    z = [json.loads(x)["id"] for x in members["event-0900/book.jsonl"].splitlines()]
+    w = [json.loads(x)["id"] for x in members["event-0901/book.jsonl"].splitlines()]
+    assert z == ["z1", "z2"] and w == ["w1"]  # both matches' records, verbatim
+    assert "event-0900/meta.json" in members and "event-0901/meta.json" in members
+    assert done == [True]  # cleanup ran after the stream drained
+    assert all(fh.closed for fh in handles)  # every handle closed by the streamer
+
+
+def test_download_multi_select_served_from_extracts(tmp_path):
+    pytest.importorskip("fastapi")
+    _run2(tmp_path)
+    ed = tmp_path / "extracts"
+    extractor.build_extracts(
+        tmp_path, ed, ["0900", "0901"], registry=_REG2_BY_ID, meta={"events": []}
+    )
+    client = _login_client(tmp_path, ed)
+    r = client.get("/api/download?event=0900&event=0901")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/gzip"
+    assert 'filename="polytape-2-matches.tar.gz"' in r.headers["content-disposition"]
+    members = _members(r.content)
+    assert "event-0900/book.jsonl" in members and "event-0901/book.jsonl" in members
+    audit = _last_download(tmp_path)
+    assert audit["result"] == "ok" and audit.get("served") == "extract"
+
+
+def test_download_multi_select_builds_missing_on_demand(tmp_path):
+    pytest.importorskip("fastapi")
+    _run2(tmp_path)
+    ed = tmp_path / "extracts"
+    ed.mkdir()
+    assert not extractor.has_complete_extract(ed, "0900")  # nothing pre-built
+    client = _login_client(tmp_path, ed)
+    r = client.get("/api/download?event=0900&event=0901")
+    assert r.status_code == 200
+    members = _members(r.content)
+    assert "event-0900/book.jsonl" in members and "event-0901/book.jsonl" in members
+    # built on demand AND left cached, so the NEXT download of either is scan-free
+    assert extractor.has_complete_extract(ed, "0900")
+    assert extractor.has_complete_extract(ed, "0901")
+    assert _last_download(tmp_path).get("served") == "extract"
+
+
+def test_download_multi_select_with_open_match_falls_back_to_scan(tmp_path):
+    pytest.importorskip("fastapi")
+    _run2(tmp_path, open_events=("0901",))  # 0901 still recording -> not cacheable
+    ed = tmp_path / "extracts"
+    ed.mkdir()
+    extractor.build_extracts(  # 0900 pre-built; 0901 is open so it has no extract
+        tmp_path, ed, ["0900"], registry=_REG2_BY_ID, meta={"events": []}
+    )
+    client = _login_client(tmp_path, ed)
+    r = client.get("/api/download?event=0900&event=0901")
+    assert r.status_code == 200
+    members = _members(r.content)
+    # the full-run scan still returns BOTH matches...
+    assert "event-0900/book.jsonl" in members and "event-0901/book.jsonl" in members
+    # ...but it was NOT served from the cache (an open match can't be pre-built).
+    assert _last_download(tmp_path).get("served") != "extract"

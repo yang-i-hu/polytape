@@ -56,6 +56,29 @@ def _stream_file(fh, chunk: int = 1024 * 1024):
         fh.close()
 
 
+def _open_extracts(extract_dir, event_ids):
+    """Open every match's cached archive in order, or return None if any isn't completely
+    cached or can't be opened (the caller then falls back to a fresh run scan).
+
+    Opening all fds up front means an eviction (enforce_cap) racing the response can't
+    unlink one out from under the stream mid-send — an already-open fd survives unlink.
+    """
+    handles = []
+    for eid in event_ids:
+        if not extractor.has_complete_extract(extract_dir, eid):
+            break
+        try:
+            handles.append(open(extractor.archive_path(extract_dir, eid), "rb"))
+        except OSError:
+            break
+    else:
+        return handles
+    for fh in handles:
+        with contextlib.suppress(OSError):
+            fh.close()
+    return None
+
+
 def create_app(
     reader: RunReader,
     *,
@@ -277,31 +300,60 @@ def create_app(
         selected = [e for e in dict.fromkeys(event) if e in known]  # dedupe; keep only known
         if not selected:
             return JSONResponse({"error": "no known match selected"}, status_code=400)
-        # Fast path: a single FINISHED match with a pre-built extract is served directly
-        # (near-instant) instead of re-scanning the whole run. We open the fd HERE, before
-        # returning, so an eviction (enforce_cap) racing between the completeness check and
-        # the response send can't 404 us — an already-open fd survives unlink. If the open
-        # loses the race (file already gone), fall through to a fresh scan.
-        if extract_dir is not None and len(selected) == 1:
-            eid = selected[0]
-            if extractor.has_complete_extract(extract_dir, eid):
+
+        # Cache fast-path: a selection of FINISHED matches is immutable, so serve it from
+        # the pre-built per-match extracts instead of re-scanning the whole run — one match
+        # streams its cached tarball verbatim; several are stitched member-by-member into a
+        # single archive. A finished match not yet cached is built on demand here (one
+        # scan) so the NEXT download of it is scan-free too. Falls back (returns None) to
+        # the full-run filter below when any selected match is still open, or an fd open
+        # loses a race with an eviction.
+        async def _serve_from_cache():
+            if extract_dir is None:
+                return None
+            # Only FINISHED matches (rolled out of the open set, with recorded data) have a
+            # stable slice that's safe to cache/serve. A single still-open match in the
+            # selection disqualifies the whole thing — fall back to the live filter.
+            finished = set(await asyncio.to_thread(reader.extractable_event_ids))
+            if not all(e in finished for e in selected):
+                return None
+            missing = [e for e in selected if not extractor.has_complete_extract(extract_dir, e)]
+            if missing:
                 try:
-                    fh = open(extractor.archive_path(extract_dir, eid), "rb")
-                except OSError:
-                    fh = None
-                if fh is not None:
-                    audit.write(
-                        action="download",
-                        result="ok",
-                        source=src,
-                        session_fp=fp,
-                        scope=eid,
-                        served="extract",
+                    await asyncio.to_thread(extractor.enforce_cap, extract_dir)
+                    await asyncio.to_thread(
+                        extractor.build_extracts,
+                        run_dir,
+                        extract_dir,
+                        missing,
+                        registry=registry,
+                        meta=meta,
                     )
-                    headers["Content-Disposition"] = f'attachment; filename="event-{eid}.tar.gz"'
-                    return StreamingResponse(
-                        _stream_file(fh), media_type="application/gzip", headers=headers
-                    )
+                except Exception:  # noqa: BLE001 - fall back to the full-run scan below
+                    logger.warning("on-demand extract build failed", exc_info=True)
+            handles = _open_extracts(extract_dir, selected)
+            if not handles:
+                return None
+            audit.write(
+                action="download",
+                result="ok",
+                source=src,
+                session_fp=fp,
+                scope=",".join(selected),
+                served="extract",
+            )
+            if len(handles) == 1:
+                fname = dl.match_archive_name(selected[0], registry.get(selected[0]))
+                stream = _stream_file(handles[0])
+            else:
+                fname = f"polytape-{len(handles)}-matches.tar.gz"
+                stream = extractor.stream_combined_targz(handles)
+            headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+            return StreamingResponse(stream, media_type="application/gzip", headers=headers)
+
+        cached = await _serve_from_cache()
+        if cached is not None:
+            return cached
         scratch = Path(tempfile.mkdtemp(prefix="polytape-dl-"))
         try:
             entries = await asyncio.to_thread(
@@ -326,7 +378,7 @@ def create_app(
             action="download", result="ok", source=src, session_fp=fp, scope=",".join(selected)
         )
         filename = (
-            f"event-{selected[0]}.tar.gz"
+            dl.match_archive_name(selected[0], registry.get(selected[0]))
             if len(selected) == 1
             else f"polytape-{len(selected)}-matches.tar.gz"
         )

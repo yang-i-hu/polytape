@@ -281,7 +281,8 @@ def test_download_selected_match_filtered(client_factory):
     _login(client)
     r = client.get("/api/download?event=1001")
     assert r.status_code == 200
-    assert 'filename="event-1001.tar.gz"' in r.headers["content-disposition"]
+    # Filename now carries the event id + both sides' codes (title "A vs. B").
+    assert 'filename="event-1001-A-B.tar.gz"' in r.headers["content-disposition"]
     members = _members(r.content)
     book = members["event-1001/book.jsonl"].splitlines()
     assert [json.loads(line)["id"] for line in book] == ["b1", "b2"]  # only 1001's book records
