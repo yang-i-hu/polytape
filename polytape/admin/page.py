@@ -67,6 +67,7 @@ PAGE = """<!doctype html>
 
   <div class="controls" id="dlbar" style="display:none">
     <button id="dl-run" style="cursor:pointer;opacity:1" onclick="downloadRun()">&#11015; download whole run</button>
+    <button id="dl-finished" style="opacity:.6" onclick="downloadFinished()" disabled>&#11015; download all finished</button>
     <button id="dl-sel" style="opacity:.6" onclick="downloadSelected()" disabled>&#11015; download selected</button>
     <span class="note" id="dlnote">tick matches to download &middot; the .tar.gz lands on your machine (through the tunnel)</span>
   </div>
@@ -194,6 +195,17 @@ function downloadSelected(){
   var qs=Array.from(dlSelected).map(function(e){return 'event='+encodeURIComponent(e);}).join('&');
   startDownload(qs, dlSelected.size+' selected match(es)');
 }
+// Finished + downloadable event ids, refreshed each tick() (see below).
+var FINISHED=[];
+function downloadFinished(){
+  // Auto-select every finished match and download them in one go. Finished matches are
+  // immutable, so the server serves them straight from the pre-built per-match extracts.
+  if(!FINISHED.length){ dlNote('no finished matches with data to download yet', 4000); return; }
+  FINISHED.forEach(function(e){ dlSelected.add(e); });  // reflect the auto-selection in the ticks
+  updateDlBar();
+  var qs=FINISHED.map(function(e){return 'event='+encodeURIComponent(e);}).join('&');
+  startDownload(qs, 'all '+FINISHED.length+' finished match(es)');
+}
 
 async function tick(){
   try{
@@ -223,6 +235,13 @@ async function tick(){
     var nFin=ms.filter(function(m){return m.status==='finished';}).length;
     document.getElementById('mtitle').textContent =
       'matches · '+ms.length+' ('+nRec+' recording · '+nFin+' finished)';
+    // Track finished+downloadable ids and reflect the count on the "download all finished" button.
+    FINISHED=ms.filter(function(m){return m.status==='finished' && m.downloadable;})
+      .map(function(m){return m.event_id;});
+    var fb=document.getElementById('dl-finished');
+    if(fb){ var k=FINISHED.length; fb.disabled=!k; fb.style.opacity=k?'1':'.6';
+      fb.style.cursor=k?'pointer':'not-allowed';
+      fb.innerHTML='&#11015; download all finished'+(k?' ('+k+')':''); }
     document.getElementById('rows').innerHTML = ms.map(function(m){
       var dis = m.downloadable ? '' : ' disabled';
       // finished/pending: a dimmed em-dash for "last seen" (recency is meaningless there)
