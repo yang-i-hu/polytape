@@ -24,6 +24,7 @@
 #   printf 'POLYTAPE_ADMIN_TOKEN=%s\n' "$(openssl rand -base64 32)" > /etc/polytape/admin.env
 #   cp deploy/polytape-admin.tmpfiles.conf /etc/tmpfiles.d/polytape-admin.conf
 #   systemd-tmpfiles --create /etc/tmpfiles.d/polytape-admin.conf   # /run/polytape-admin{,/intent} + lock
+#                                                                   # + /data/tmp/polytape-admin (download scratch)
 #   install -m 0755 deploy/polytape-control.sh /opt/polytape/polytape-control.sh
 #   cp deploy/polytape-control.service deploy/polytape-control.path /etc/systemd/system/
 #   systemctl daemon-reload
@@ -53,6 +54,11 @@ Environment=POLYTAPE_AUDIT_DIR=/var/log/polytape-admin/audit.jsonl
 Environment=POLYTAPE_SESSION_FILE=/var/log/polytape-admin/sessions.json
 # Pre-built per-match download archives for FINISHED matches (near-instant downloads).
 Environment=POLYTAPE_EXTRACT_DIR=/var/cache/polytape-admin
+# Scratch for the (multi-GB) filtered-copy of a download/extract. MUST sit on the big
+# run volume (/data, ~68 GB free) — NOT the small root fs that PrivateTmp's /tmp lands
+# on (~14 GB free), where a whole-run-sized selection overflowed with ENOSPC -> 507.
+# Pre-created + made RW below; see polytape-admin.tmpfiles.conf.
+Environment=POLYTAPE_SCRATCH_DIR=/data/tmp/polytape-admin
 # Holds POLYTAPE_ADMIN_TOKEN. Optional ('-'): without it the control plane is OFF.
 EnvironmentFile=-/etc/polytape/admin.env
 ExecStart=/opt/polytape/venv/bin/polytape-admin --host 127.0.0.1 --port 8080
@@ -63,7 +69,13 @@ StandardError=journal
 SyslogIdentifier=polytape-admin
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/run/polytape-admin
+# /data stays READ-ONLY (the admin reads the recorder's run but must never write it);
+# we grant RW ONLY to the dedicated scratch subdir on that volume (POLYTAPE_SCRATCH_DIR),
+# pre-created by tmpfiles (`systemd-tmpfiles --create` at install; boot-time otherwise).
+# The leading '-' makes a MISSING scratch dir non-fatal: this monitoring sidecar still
+# starts (downloads then fail with a 507) instead of crash-looping if /data isn't mounted
+# or tmpfiles hasn't run. /run/polytape-admin stays required (it's the control spool).
+ReadWritePaths=/run/polytape-admin -/data/tmp/polytape-admin
 LogsDirectory=polytape-admin
 LogsDirectoryMode=0700
 # /var/cache/polytape-admin for pre-built match extracts (auto-granted RW under
@@ -72,6 +84,8 @@ CacheDirectory=polytape-admin
 CacheDirectoryMode=0700
 UMask=0077
 ProtectHome=true
+# Private /tmp (isolation). It lands on the small root fs, so large downloads must NOT
+# scratch here — they use POLYTAPE_SCRATCH_DIR on /data instead (see above).
 PrivateTmp=true
 # Hard memory cap: the sidecar's bounded reads sit well under this; the cap means a
 # runaway scan gets cgroup-killed in isolation and can NEVER OOM the recorder.
