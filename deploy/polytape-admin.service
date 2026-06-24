@@ -52,6 +52,12 @@ Environment=POLYTAPE_INTENT_DIR=/run/polytape-admin/intent
 Environment=POLYTAPE_AUDIT_DIR=/var/log/polytape-admin/audit.jsonl
 # Persisted login sessions (sha256 verifiers only) so a restart doesn't log everyone out.
 Environment=POLYTAPE_SESSION_FILE=/var/log/polytape-admin/sessions.json
+# Reader scan checkpoint (per-stream byte offsets + aggregates) so an admin restart
+# RESUMES reading forward in seconds instead of re-draining the multi-GB book.jsonl from
+# byte 0 (~15–40 min, during which last_record_age_s tracks the read position and every
+# match wrongly shows stale). Validated against the run before trusting it; a stale/
+# mismatched checkpoint safely falls back to a full re-drain.
+Environment=POLYTAPE_READER_CHECKPOINT_FILE=/var/log/polytape-admin/reader-checkpoint.json
 # Pre-built per-match download archives for FINISHED matches (near-instant downloads).
 Environment=POLYTAPE_EXTRACT_DIR=/var/cache/polytape-admin
 # Scratch for the (multi-GB) filtered-copy of a download/extract. MUST sit on the big

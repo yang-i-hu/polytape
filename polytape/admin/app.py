@@ -87,6 +87,7 @@ def create_app(
     registry_refresh_s: float = 600.0,
     extract_dir: str | Path | None = None,
     extract_refresh_s: float = 600.0,
+    checkpoint_every: int = 30,
     scratch_dir: str | Path | None = None,
     session_file: str | Path | None = None,
     broker=None,
@@ -132,15 +133,32 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Warm start: resume the scan from a valid checkpoint (reading FORWARD from the
+        # saved offsets) instead of re-draining the whole multi-GB log from byte 0 — which
+        # would make last_record_age_s track the read position and show every match stale
+        # for ~15–40 min. A missing/stale/mismatched checkpoint is a safe no-op (re-drain).
+        # Both run off the event loop, before serving, so the first request already has data.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(reader.load_checkpoint)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(reader.update)
+
         async def _loop() -> None:
             # update() runs in a WORKER THREAD so its bounded multi-GB catch-up scan
             # never blocks the event loop. It holds the reader's lock across that scan, so
             # the read endpoints below ALSO run via asyncio.to_thread — a request that
             # arrives mid-scan waits on a worker, never on the event-loop thread, leaving
             # the loop free to keep serving everything else.
+            tick = 0
             while True:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(reader.update)
+                tick += 1
+                # Periodic checkpoint (off-loop; a no-op when disabled): cheap enough not
+                # to stall the poll, so a future restart resumes from near the live edge.
+                if checkpoint_every and tick % checkpoint_every == 0:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(reader.save_checkpoint)
                 await asyncio.sleep(poll_interval)
 
         async def _registry_loop() -> None:
@@ -208,6 +226,10 @@ def create_app(
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            # Final checkpoint on graceful shutdown so the next start resumes from the
+            # very edge of the log (a no-op when checkpointing is disabled).
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(reader.save_checkpoint)
 
     app = FastAPI(title="polytape-admin", docs_url=None, redoc_url=None, lifespan=lifespan)
 
@@ -549,6 +571,12 @@ def main(argv: list[str] | None = None) -> int:
         "Unset disables the extractor (downloads fall back to a full scan).",
     )
     parser.add_argument(
+        "--checkpoint-file",
+        default=os.environ.get("POLYTAPE_READER_CHECKPOINT_FILE"),
+        help="Persist the reader's scan offsets + aggregates here so a restart resumes "
+        "forward in seconds instead of re-draining the whole log. Unset disables it.",
+    )
+    parser.add_argument(
         "--scratch-dir",
         default=os.environ.get("POLYTAPE_SCRATCH_DIR"),
         help="Volume for the (multi-GB) filtered-copy scratch of a download/extract. "
@@ -567,9 +595,10 @@ def main(argv: list[str] | None = None) -> int:
         env_file=args.env_file,
         matches_file=args.matches_file,
         registry_file=args.registry_file,
+        checkpoint_file=args.checkpoint_file,
     )
-    with contextlib.suppress(Exception):
-        reader.update()  # warm once so the first request has data
+    # The lifespan warms the reader on startup (after loading any checkpoint), so the
+    # first request has data without re-draining the log here ahead of the checkpoint load.
 
     # Controls are OFF unless a shared secret is configured (defense in depth: the
     # localhost bind + SSH tunnel are necessary but not sufficient on their own).
