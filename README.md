@@ -303,6 +303,50 @@ non-loopback bind (use with care) pass `--allow-control`.
 
 ---
 
+## Viewing a capture
+
+`polytape-view` opens a local web UI that **replays a capture's history and follows a
+live one** — a depth ladder, a cumulative-depth chart, a mid-price time-series with a
+draggable scrubber, microprice/imbalance gauges, top-of-book metrics, and a trades tape.
+It only **reads** a capture directory (it never connects to Polymarket), so you can point
+it at a finished capture or at one that is still recording.
+
+```bash
+# View a single capture (opens http://127.0.0.1:8770 in your browser)
+polytape-view --event-dir ./data/event-12345
+
+# Same capture, mirroring the recorder's flags
+polytape-view --out ./data --event-id 12345
+
+# Scan a data root and pick from all captures
+polytape-view --data ./data
+```
+
+Useful flags: `--host`/`--port` (binds `127.0.0.1` by default so captures aren't exposed),
+`--poll-interval` (file-tail cadence for live follow), `--keyframe-every` (book snapshots
+cached for fast scrubbing), `--no-open` (don't launch a browser). It adds **no runtime
+dependencies** — the backend is pure standard library (HTTP + Server-Sent Events) and the
+frontend is dependency-free vanilla JS.
+
+**Live vs history.** When the capture is still recording (`stopped_at` is `null`), the viewer
+follows new book updates in real time over SSE; the Live/History toggle (or dragging the
+scrubber) switches to replaying any past moment, with reconnect gaps shaded and a
+"book uncertain" badge while inside a gap. Order-book reconstruction is done server-side and
+is the single source of truth.
+
+**Try it with synthetic data** (writes to a temp dir — never `./data`):
+
+```bash
+# Generate a dense demo capture (snapshot + deltas + trades + a reconnect gap, YES/NO)
+python scripts/make_demo_capture.py --out ./_vtmp --event-id 80505
+polytape-view --event-dir ./_vtmp/event-80505
+
+# ...or stream ~10s of live updates into it to exercise the live/SSE path
+python scripts/make_demo_capture.py --out ./_vtmp --event-id 80505 --live 10
+```
+
+---
+
 ## Behavior
 
 ### Streams

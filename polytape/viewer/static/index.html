@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>polytape · order book viewer</title>
+    <link rel="stylesheet" href="/static/css/app.css" />
+  </head>
+  <body>
+    <div id="app" class="app" hidden>
+      <header class="topbar">
+        <div class="brand">
+          <span class="logo">poly<span class="logo-accent">tape</span></span>
+          <div class="event">
+            <div id="event-title" class="event-title">—</div>
+            <div id="event-slug" class="event-slug"></div>
+          </div>
+        </div>
+
+        <div class="controls">
+          <div id="asset-chips" class="asset-chips" role="tablist" aria-label="Outcome"></div>
+          <div class="mode" role="group" aria-label="Mode">
+            <button id="mode-live" class="mode-btn" data-mode="live">● Live</button>
+            <button id="mode-history" class="mode-btn" data-mode="history">⟲ History</button>
+          </div>
+          <div class="status">
+            <span id="conn-dot" class="dot dot-grey" title="connection"></span>
+            <span id="conn-text" class="conn-text">connecting…</span>
+            <button id="gap-badge" class="gap-badge" hidden></button>
+          </div>
+        </div>
+      </header>
+
+      <div id="banner" class="banner" hidden></div>
+
+      <section id="metrics" class="metrics" aria-label="Top of book"></section>
+
+      <main class="grid">
+        <section class="panel ladder-panel" aria-label="Order book ladder">
+          <div class="panel-head">
+            <h2>Order book</h2>
+            <div class="panel-head-right">
+              <span id="asof" class="asof"></span>
+              <label class="depth-select">depth
+                <select id="depth">
+                  <option>10</option>
+                  <option selected>25</option>
+                  <option>50</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div id="ladder" class="ladder"></div>
+        </section>
+
+        <section class="panel center-panel">
+          <div class="panel-head"><h2>Depth</h2></div>
+          <div id="depthchart" class="depthchart"></div>
+          <div class="gauges-wrap">
+            <div id="gauges" class="gauges"></div>
+          </div>
+        </section>
+
+        <section class="panel tape-panel" aria-label="Recent trades">
+          <div class="panel-head">
+            <h2>Trades</h2>
+            <span id="tape-rate" class="tape-rate"></span>
+          </div>
+          <div id="tape" class="tape"></div>
+        </section>
+
+        <section class="panel series-panel" aria-label="Mid-price over time">
+          <div class="panel-head">
+            <h2>Mid price</h2>
+            <span id="series-readout" class="series-readout"></span>
+          </div>
+          <div id="timeseries" class="timeseries">
+            <canvas id="ts-canvas"></canvas>
+            <div id="ts-tooltip" class="ts-tooltip" hidden></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="picker" class="picker" hidden>
+      <h1>polytape captures</h1>
+      <ul id="picker-list" class="picker-list"></ul>
+    </div>
+
+    <div id="boot" class="boot">loading…</div>
+
+    <script type="module" src="/static/js/main.js"></script>
+  </body>
+</html>
