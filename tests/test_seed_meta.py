@@ -77,6 +77,31 @@ def test_main_writes_meta_preserving_other_fields(tmp_path):
     assert not (tmp_path / "meta.json.seed.tmp").exists()  # atomic write cleans up
 
 
+def test_out_then_apply_is_gap_free_path(tmp_path):
+    # The deploy path: scan to a side file while the recorder is live (--out, no meta
+    # write), then merge it in the stop window (--apply, no scan).
+    _setup(tmp_path)
+    side = tmp_path / "seed.json"
+    before = (tmp_path / "meta.json").read_text(encoding="utf-8")
+    seed.main(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--registry-file",
+            str(tmp_path / "registry.json"),
+            "--out",
+            str(side),
+        ]
+    )
+    assert json.loads(side.read_text(encoding="utf-8"))["counts"] == {"book": 4, "comments": 1}
+    assert (tmp_path / "meta.json").read_text(encoding="utf-8") == before  # --out left meta alone
+    # apply merges the side file without re-scanning
+    seed.main(["--run-dir", str(tmp_path), "--apply", str(side)])
+    meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["counts_by_event"]["0900"]["book"] == 2
+    assert meta["started_at"] == "2026-06-19T00:00:00Z"  # other fields preserved
+
+
 def test_dry_run_does_not_write(tmp_path):
     _setup(tmp_path)
     before = (tmp_path / "meta.json").read_text(encoding="utf-8")

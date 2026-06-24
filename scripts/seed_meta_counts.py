@@ -8,17 +8,20 @@ append-only JSONL files ONCE and writes accurate totals + per-event counts + las
 timestamps into ``meta.json``, so the upgraded recorder — which seeds its counters from
 ``meta.json`` on open() — continues from a correct baseline.
 
-Run it ONCE per run, in the recorder's stop->start window during the upgrade deploy:
+Run it ONCE per run during the upgrade. To avoid a recording gap, do the slow scan while
+the recorder is LIVE (writing a side file) and only the fast merge in the stop->start
+window (meta.json is owned by the running recorder, so the merge must not race it):
 
+    # while the recorder is LIVE — the scan causes no recording gap:
+    .../python scripts/seed_meta_counts.py --out /tmp/seed.json
+    # then the brief upgrade window:
     systemctl stop polytape
-    /opt/polytape/venv/bin/python scripts/seed_meta_counts.py --run-dir /data/run-wc \
-        --registry-file /var/log/polytape-admin/registry.json
+    .../python scripts/seed_meta_counts.py --apply /tmp/seed.json   # fast, no scan
     systemctl start polytape   # upgraded recorder seeds the accurate counts
 
-Run it while the recorder is STOPPED: it rewrites meta.json atomically, and a live
-recorder also writes meta.json (a concurrent writer would race). Reads stream line by
-line, so memory stays tiny regardless of file size. ``--dry-run`` prints the computed
-counts without writing.
+(Or, if a recording gap is acceptable, run with no flags between stop and start to scan +
+merge in one shot.) Reads stream line by line, so memory stays tiny regardless of file
+size. ``--dry-run`` prints the computed counts without writing.
 
 Attribution mirrors the recorder/reader: book records by top-level ``market`` (condition
 id -> event, via the registry + the meta open set); comments by ``parentEntityID``.
@@ -149,10 +152,26 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("POLYTAPE_REGISTRY_FILE", "/var/log/polytape-admin/registry.json"),
     )
     ap.add_argument("--dry-run", action="store_true", help="print computed counts; do not write")
+    ap.add_argument(
+        "--out",
+        metavar="FILE",
+        help="Scan and write the computed seed to FILE (JSON), WITHOUT touching meta.json. "
+        "Run this while the recorder is LIVE (the slow scan causes no recording gap), then "
+        "apply it in the brief stop->start window with --apply.",
+    )
+    ap.add_argument(
+        "--apply",
+        metavar="FILE",
+        help="Merge a seed FILE written by --out into meta.json (fast, no scan). Run in the "
+        "recorder's stop->start window so a live writer can't race the merge.",
+    )
     args = ap.parse_args(argv)
 
     run_dir = Path(args.run_dir)
-    seed = compute(run_dir, Path(args.registry_file))
+    if args.apply:  # fast path: merge a pre-computed seed, no scan
+        seed = json.loads(Path(args.apply).read_text(encoding="utf-8"))
+    else:
+        seed = compute(run_dir, Path(args.registry_file))
     print(
         f"book={seed['counts'].get('book', 0)} comments={seed['counts'].get('comments', 0)} "
         f"events={len(seed['counts_by_event'])} last_record_at={seed['last_record_at']}",
@@ -160,6 +179,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.dry_run:
         print(json.dumps(seed, ensure_ascii=False, indent=2))
+        return 0
+    if args.out:  # write the side file; meta.json is left untouched (applied later)
+        Path(args.out).write_text(
+            json.dumps(seed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"wrote seed {args.out}", file=sys.stderr)
         return 0
 
     meta_path = run_dir / "meta.json"
