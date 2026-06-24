@@ -155,19 +155,29 @@ def make_comment_backfill(
 ) -> BackfillCallback:
     """Build a backfill callback that recovers comments missed during a gap.
 
-    Pages Gamma from the stream's last-seen comment id and writes recovered
+    Pages Gamma from each parent's last-seen comment id and writes recovered
     comments through the writer (dedup prevents overlap with the live stream).
-    Returns the number of *newly written* comments.
+    Each parent is paged with its correct ``parent_entity_type`` — Event ids as
+    ``"Event"``, series ids as ``"Series"`` — because the comment feed for some
+    products (e.g. the World Cup) hangs off the parent Series, where an Event-typed
+    query returns nothing. Returns the number of *newly written* comments.
     """
+    # (parent_id, parent_entity_type) for every parent this run records.
+    targets: list[tuple[str, str]] = [(eid, "Event") for eid in stream.event_ids]
+    targets += [(sid, "Series") for sid in stream.series_ids]
 
     async def _backfill() -> int:
         count = 0
-        # One firehose, N events: page each event from its own cursor and tag the
-        # recovered comments with that event id (dedup guards against overlap).
-        for event_id in stream.event_ids:
-            missed = await gamma.backfill_since(event_id, stream.last_comment_id_for(event_id))
+        # One firehose, N parents: page each from its own cursor and tag the
+        # recovered comments with that parent id (dedup guards against overlap).
+        for parent_id, parent_type in targets:
+            missed = await gamma.backfill_since(
+                parent_id,
+                stream.last_comment_id_for(parent_id),
+                parent_entity_type=parent_type,
+            )
             for comment in missed:
-                if writer.write(stream.stream, comment, event_id=event_id):
+                if writer.write(stream.stream, comment, event_id=parent_id):
                     count += 1
         if count:
             logger.info("%s: backfilled %d missed comment(s)", stream.stream, count)
