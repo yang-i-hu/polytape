@@ -87,13 +87,15 @@ ProtectHome=true
 # scratch here — they use POLYTAPE_SCRATCH_DIR on /data instead (see above).
 PrivateTmp=true
 # Hard memory cap. The dashboard reads counts/freshness from meta.json (a few KB) — it no
-# longer scans the multi-GB log — and the download extractor streams the run in bounded
-# chunks, so the resident set is just the Python/FastAPI baseline + small buffers. This cap
-# sits comfortably above that and guarantees the sidecar can NEVER OOM the recorder.
-# NOTE: if a prior runtime override was set (systemctl set-property MemoryMax=2G during the
-# old drain era), clear it on deploy with `systemctl revert polytape-admin` so this applies.
-MemoryHigh=256M
-MemoryMax=384M
+# longer scans the multi-GB log — so the resident set is just the Python/FastAPI baseline
+# (~200-300 MB) plus the download extractor's bounded streaming buffers. 768M is the proven
+# pre-drain value with comfortable headroom for extract builds, and guarantees the sidecar
+# can NEVER OOM the recorder. (The old drain forced a 2G runtime override; that era is over.)
+# NOTE: if a prior 2G override was set via `systemctl set-property`, clear its drop-in under
+# /etc/systemd/system.control/polytape-admin.service.d/ on deploy so this unit value applies
+# (do NOT `systemctl revert` — there is no vendor unit, so revert would delete this file).
+MemoryHigh=512M
+MemoryMax=768M
 
 [Install]
 WantedBy=multi-user.target
