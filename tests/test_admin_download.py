@@ -272,9 +272,7 @@ def client_factory(tmp_path):
     _setup_run(tmp_path)
 
     def _make(*, secret: str | None = "secret", scratch_dir=None):
-        reader = RunReader(
-            tmp_path, env_file=tmp_path / "missing.env", matches_file=tmp_path / "missing.json"
-        )
+        reader = RunReader(tmp_path, env_file=tmp_path / "missing.env")
         audit = control.AuditLog(tmp_path / "audit.jsonl")
         app = create_app(
             reader,

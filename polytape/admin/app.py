@@ -87,7 +87,6 @@ def create_app(
     registry_refresh_s: float = 600.0,
     extract_dir: str | Path | None = None,
     extract_refresh_s: float = 600.0,
-    checkpoint_every: int = 30,
     scratch_dir: str | Path | None = None,
     session_file: str | Path | None = None,
     broker=None,
@@ -133,32 +132,18 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        # Warm start: resume the scan from a valid checkpoint (reading FORWARD from the
-        # saved offsets) instead of re-draining the whole multi-GB log from byte 0 — which
-        # would make last_record_age_s track the read position and show every match stale
-        # for ~15–40 min. A missing/stale/mismatched checkpoint is a safe no-op (re-drain).
-        # Both run off the event loop, before serving, so the first request already has data.
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(reader.load_checkpoint)
+        # Warm once before serving so the first request already has data. update() just
+        # reads meta.json + the registry (a few KB) — no log scan, instant, low memory.
         with contextlib.suppress(Exception):
             await asyncio.to_thread(reader.update)
 
         async def _loop() -> None:
-            # update() runs in a WORKER THREAD so its bounded multi-GB catch-up scan
-            # never blocks the event loop. It holds the reader's lock across that scan, so
-            # the read endpoints below ALSO run via asyncio.to_thread — a request that
-            # arrives mid-scan waits on a worker, never on the event-loop thread, leaving
-            # the loop free to keep serving everything else.
-            tick = 0
+            # Refresh the meta + registry snapshot every poll. update() reads two small JSON
+            # files (no log scan), off the event loop so a slow stat never blocks it and a
+            # read endpoint that races it waits on a worker, never the loop thread.
             while True:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(reader.update)
-                tick += 1
-                # Periodic checkpoint (off-loop; a no-op when disabled): cheap enough not
-                # to stall the poll, so a future restart resumes from near the live edge.
-                if checkpoint_every and tick % checkpoint_every == 0:
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(reader.save_checkpoint)
                 await asyncio.sleep(poll_interval)
 
         async def _registry_loop() -> None:
@@ -180,35 +165,32 @@ def create_app(
 
         async def _extract_loop() -> None:
             # Pre-build per-match archives for FINISHED matches so their downloads are
-            # near-instant. Off the event loop; gated on caught_up() so its full-run scan
-            # never piles CPU onto the post-restart catch-up drain.
+            # near-instant. Off the event loop. The admin no longer drains the log, so there
+            # is nothing to wait to "catch up" on — finished matches (from meta counts) are
+            # extracted as soon as they roll out. Each build is one filter_run scan per match
+            # (one-off, not per request).
             while True:
                 try:
-                    # caught_up() takes the reader lock; run it (and the other reader
-                    # probes) OFF the loop so a mid-scan lock-wait never stalls the loop.
-                    if await asyncio.to_thread(reader.caught_up):
-                        extractable = await asyncio.to_thread(reader.extractable_event_ids)
-                        pending = [
-                            e
-                            for e in extractable
-                            if not extractor.has_complete_extract(extract_dir, e)
-                        ]
-                        if pending:
-                            meta = await asyncio.to_thread(dl.load_run_meta, reader.run_dir)
-                            registry = await asyncio.to_thread(reader.download_registry, meta)
-                            # Trim the resident cache BEFORE adding a batch (make room), then
-                            # again after (trim the additions) — bounds peak disk either side.
-                            await asyncio.to_thread(extractor.enforce_cap, extract_dir)
-                            await asyncio.to_thread(
-                                extractor.build_extracts,
-                                reader.run_dir,
-                                extract_dir,
-                                pending,
-                                registry=registry,
-                                meta=meta,
-                                scratch_dir=scratch_dir,
-                            )
-                            await asyncio.to_thread(extractor.enforce_cap, extract_dir)
+                    extractable = await asyncio.to_thread(reader.extractable_event_ids)
+                    pending = [
+                        e for e in extractable if not extractor.has_complete_extract(extract_dir, e)
+                    ]
+                    if pending:
+                        meta = await asyncio.to_thread(dl.load_run_meta, reader.run_dir)
+                        registry = await asyncio.to_thread(reader.download_registry, meta)
+                        # Trim the resident cache BEFORE adding a batch (make room), then
+                        # again after (trim the additions) — bounds peak disk either side.
+                        await asyncio.to_thread(extractor.enforce_cap, extract_dir)
+                        await asyncio.to_thread(
+                            extractor.build_extracts,
+                            reader.run_dir,
+                            extract_dir,
+                            pending,
+                            registry=registry,
+                            meta=meta,
+                            scratch_dir=scratch_dir,
+                        )
+                        await asyncio.to_thread(extractor.enforce_cap, extract_dir)
                 except Exception:  # noqa: BLE001 - never let the extractor loop die
                     logger.warning("extract pass failed", exc_info=True)
                 await asyncio.sleep(extract_refresh_s)
@@ -226,10 +208,6 @@ def create_app(
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-            # Final checkpoint on graceful shutdown so the next start resumes from the
-            # very edge of the log (a no-op when checkpointing is disabled).
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(reader.save_checkpoint)
 
     app = FastAPI(title="polytape-admin", docs_url=None, redoc_url=None, lifespan=lifespan)
 
@@ -237,8 +215,9 @@ def create_app(
     async def index() -> str:
         return PAGE
 
-    # Each read method takes the reader's lock (held across update()'s catch-up scan), so
-    # they run via asyncio.to_thread: a request waits on a worker, never the loop thread.
+    # Read methods take the reader's lock briefly; they run via asyncio.to_thread so a
+    # request waits on a worker, never the loop thread. All data comes from meta.json +
+    # the registry (a few KB) — no log scan, instant.
 
     @app.get("/api/status")
     async def status() -> JSONResponse:
@@ -247,17 +226,6 @@ def create_app(
     @app.get("/api/matches")
     async def matches() -> JSONResponse:
         return JSONResponse(await asyncio.to_thread(reader.matches))
-
-    @app.get("/api/matches/{event_id}")
-    async def match(event_id: str) -> JSONResponse:
-        return JSONResponse(await asyncio.to_thread(reader.match_view, event_id))
-
-    @app.get("/api/live")
-    async def live() -> JSONResponse:
-        # Poll-based live view (rates + recent records + gaps): reads only state the
-        # update() loop already maintains (no file I/O), off-loop so a mid-scan lock-wait
-        # doesn't stall the loop.
-        return JSONResponse(await asyncio.to_thread(reader.live))
 
     # -- guarded control plane (present only when a secret is configured) ---- #
 
@@ -556,10 +524,6 @@ def main(argv: list[str] | None = None) -> int:
         "--env-file", default=os.environ.get("POLYTAPE_ENV_FILE", "/etc/polytape/polytape.env")
     )
     parser.add_argument(
-        "--matches-file",
-        default=os.environ.get("POLYTAPE_MATCHES_FILE", "/etc/polytape/wc_matches.json"),
-    )
-    parser.add_argument(
         "--registry-file",
         default=os.environ.get("POLYTAPE_REGISTRY_FILE", "/var/log/polytape-admin/registry.json"),
         help="Cumulative run registry (all matches, finished + open); refreshed from Gamma.",
@@ -569,12 +533,6 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("POLYTAPE_EXTRACT_DIR"),
         help="Dir for pre-built per-match download archives (finished matches). "
         "Unset disables the extractor (downloads fall back to a full scan).",
-    )
-    parser.add_argument(
-        "--checkpoint-file",
-        default=os.environ.get("POLYTAPE_READER_CHECKPOINT_FILE"),
-        help="Persist the reader's scan offsets + aggregates here so a restart resumes "
-        "forward in seconds instead of re-draining the whole log. Unset disables it.",
     )
     parser.add_argument(
         "--scratch-dir",
@@ -593,12 +551,10 @@ def main(argv: list[str] | None = None) -> int:
         args.run_dir,
         unit=args.unit,
         env_file=args.env_file,
-        matches_file=args.matches_file,
         registry_file=args.registry_file,
-        checkpoint_file=args.checkpoint_file,
     )
-    # The lifespan warms the reader on startup (after loading any checkpoint), so the
-    # first request has data without re-draining the log here ahead of the checkpoint load.
+    # The lifespan warms the reader on startup (reads meta.json + registry), so the first
+    # request has data — no log scan here.
 
     # Controls are OFF unless a shared secret is configured (defense in depth: the
     # localhost bind + SSH tunnel are necessary but not sufficient on their own).

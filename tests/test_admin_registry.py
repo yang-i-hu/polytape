@@ -29,15 +29,20 @@ def _write_jsonl(path, records):
 
 
 def _meta_open() -> dict:
-    """What the recorder writes: ONLY the current open set (finished 0900 is gone)."""
+    """What the recorder writes: the current open set in ``events`` (finished 0900 is gone
+    from there), but CUMULATIVE per-event counts + freshness that still include 0900 (the
+    recorder carries them across roll-overs). Open matches are fresh -> "live"."""
 
     def mk(c):
         return {"id": "m", "conditionId": c, "clobTokenIds": [c + "-Y", c + "-N"]}
 
+    fresh = utc_now_iso()
     return {
         "started_at": "2026-06-21T00:00:00Z",
         "run_name": "wc",
-        "counts_by_event": {"1001": {"book": 1}, "1002": {"book": 1}},
+        "counts_by_event": {"0900": {"book": 2}, "1001": {"book": 1}, "1002": {"book": 1}},
+        "last_ts_by_event": {"1001": fresh, "1002": fresh},
+        "last_record_at": fresh,
         "events": [
             {
                 "id": "1001",
@@ -106,7 +111,6 @@ def _reader(tmp_path):
     return RunReader(
         tmp_path,
         env_file=tmp_path / "x.env",
-        matches_file=tmp_path / "x.json",
         registry_file=tmp_path / "registry.json",
     )
 
@@ -197,14 +201,6 @@ def test_status_open_set_overrides_closed_flag(tmp_path):
     r.update()
     by = {m["event_id"]: m for m in r.matches()}
     assert by["1001"]["status"] in ("live", "quiet", "pending")  # never "finished"
-
-
-def test_match_view_historical_flag(tmp_path):
-    _setup(tmp_path)
-    r = _reader(tmp_path)
-    r.update()
-    assert r.match_view("0900")["historical"] is True  # finished -> frozen, not live
-    assert r.match_view("1001")["historical"] is False  # open
 
 
 def test_registry_absent_degrades_to_meta(tmp_path):
