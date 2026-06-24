@@ -214,6 +214,15 @@ def test_corrupt_meta_keeps_prior_snapshot(tmp_path):
     assert r.status()["records"]["book"] == 5
 
 
+def test_admin_page_has_download_all_finished():
+    # Cheap regression net for the dashboard's inline JS (no JS runner): the
+    # "download all finished" button + handler must be wired.
+    from polytape.admin.page import PAGE
+
+    for tok in ('id="dl-finished"', "downloadFinished", "download all finished"):
+        assert tok in PAGE, f"admin page missing download-all-finished wiring: {tok}"
+
+
 def test_app_endpoints_status_matches_only(tmp_path):
     # End-to-end: status + matches serve from meta; the removed live/preview routes 404.
     pytest.importorskip("fastapi")
