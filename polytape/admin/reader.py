@@ -11,7 +11,10 @@ Event attribution mirrors the recorder: book records route by top-level ``market
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -24,12 +27,19 @@ from typing import Any
 from polytape.admin import registry as _reg
 from polytape.envelope import iso_to_datetime, utc_now_iso
 
+logger = logging.getLogger("polytape.admin.reader")
+
 # Bound the bytes read per _consume call. Without this, the FIRST scan of a
 # multi-GB book.jsonl does handle.read() of the whole file — ~1.5 GB of bytes + a
 # decoded str + a million-element line list at once — which OOM-kills the sidecar on
 # a small VM. With the cap, a large backlog simply catches up over several update()
 # ticks (the recorder appends far slower than a 64 MiB/tick read drains it).
 _MAX_READ_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# Reader-checkpoint format version. Persisted alongside the offsets + aggregates so an
+# old checkpoint left by a previous build is safely REBUILT (a full re-drain from 0)
+# rather than mis-read after the payload shape changes — bump on any shape change.
+_CHECKPOINT_SCHEMA = 1
 
 
 def _slug_date(slug: str | None) -> str | None:
@@ -66,6 +76,7 @@ class RunReader:
         now: Callable[[], str] = utc_now_iso,
         mono: Callable[[], float] = time.monotonic,
         max_read_bytes: int = _MAX_READ_BYTES,
+        checkpoint_file: str | Path | None = None,
     ) -> None:
         self._dir = Path(run_dir)
         self._unit = unit
@@ -77,6 +88,9 @@ class RunReader:
         self._now = now
         self._mono = mono
         self._max_read = max_read_bytes
+        # Where to persist the scan checkpoint (offsets + aggregates). None disables it;
+        # a warm start then re-drains from 0 exactly as before. See save/load_checkpoint.
+        self._checkpoint_file = Path(checkpoint_file) if checkpoint_file else None
         # update() runs in a worker thread (off the event loop); this guards every
         # read/write of the reader's mutable state. Reentrant so a read method can call
         # helpers freely. _systemctl() (a subprocess) is deliberately kept OFF this lock.
@@ -361,6 +375,211 @@ class RunReader:
             dict(self._counts),
             {eid: dict(counts) for eid, counts in self._by_event.items()},
         )
+
+    # -- scan checkpoint (resume forward instead of re-draining the log) ----- #
+    #
+    # The cumulative scan state (offsets + counts + per-event counts + last-seen
+    # timestamps + markets seen) lives only in RAM, so a restart rebuilds it from byte
+    # 0 — minutes of re-drain over a multi-GB book.jsonl, during which last_record_age_s
+    # tracks the READ position and the dashboard wrongly shows every match stale.
+    # Persisting that state lets a restart RESUME reading forward from the saved offsets.
+    # The on-demand L2 book reconstruction (_book/_last_trade/_price_hist) is deliberately
+    # NOT persisted — it self-heals from the next full ``book`` snapshot after a resume.
+
+    def _file_identity(self, stream: str) -> dict[str, int] | None:
+        """``{dev, ino, size}`` for a stream's file, or None if it can't be stat'd.
+
+        dev/ino pin the checkpoint to the SAME underlying file (a rotate/replace gets a
+        new inode -> the checkpoint is discarded); size lets load reject an offset past
+        EOF (a truncation).
+        """
+        try:
+            st = self._file(stream).stat()
+        except OSError:
+            return None
+        return {"dev": st.st_dev, "ino": st.st_ino, "size": st.st_size}
+
+    def _checkpoint_snapshot(self) -> dict[str, Any]:
+        """Build the on-disk checkpoint payload. MUST run under ``self._lock`` so the
+        offsets and the aggregates are a consistent snapshot of the SAME scan position.
+
+        Offsets are always at a complete-line boundary (``_consume`` never advances past
+        the last newline), so a resume can never split or double-count a record.
+        """
+        return {
+            "schema": _CHECKPOINT_SCHEMA,
+            "saved_at": self._now(),
+            # Advisory only (diagnostics) — NOT an adoption gate. The recorder appends to
+            # the SAME book.jsonl across its own restarts while rewriting started_at, so a
+            # mismatch does not mean the prefix changed; file identity below is the real
+            # integrity guard. Gating resume on started_at would re-drain on every co-restart.
+            "run": {"started_at": self._started_at},
+            "files": {s: ident for s in self._offsets if (ident := self._file_identity(s))},
+            "offsets": dict(self._offsets),
+            "counts": dict(self._counts),
+            "by_event": {eid: dict(c) for eid, c in self._by_event.items()},
+            "last_ts": dict(self._last_ts),
+            "markets_seen": sorted(self._markets_seen),
+        }
+
+    def save_checkpoint(self) -> bool:
+        """Atomically persist the scan state so a restart resumes forward. Returns True
+        iff a checkpoint was written.
+
+        A no-op when checkpointing is disabled or before the first meta load (no run
+        identity yet to validate a resume against). The consistent snapshot is taken
+        under the lock; the disk write (temp + ``os.replace``, 0600) happens OFF the lock
+        so a slow disk never stalls ``update()`` or a read endpoint. Best-effort: a write
+        failure is logged, never raised — losing a checkpoint just means the next start
+        re-drains, exactly today's behaviour.
+        """
+        if self._checkpoint_file is None:
+            return False
+        with self._lock:
+            if self._started_at is None:
+                return False
+            payload = self._checkpoint_snapshot()
+        # Per-pid temp name so a second writer can never O_TRUNC ours mid-write; the
+        # os.replace then publishes atomically (a reader never sees a torn file).
+        tmp = self._checkpoint_file.with_name(f"{self._checkpoint_file.name}.{os.getpid()}.tmp")
+        try:
+            self._checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+            data = json.dumps(payload).encode("utf-8")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                view = memoryview(data)
+                while view:  # POSIX permits a short write — loop until all bytes land
+                    view = view[os.write(fd, view) :]
+                os.fsync(fd)  # durable before publish, so a hard reboot can't expose a torn file
+            finally:
+                os.close(fd)
+            os.replace(tmp, self._checkpoint_file)
+            self._fsync_dir(self._checkpoint_file.parent)  # make the rename itself durable
+        except OSError:
+            # Never leave the temp behind (e.g. ENOSPC mid-write); best-effort cleanup.
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            logger.warning(
+                "reader checkpoint persist failed (%s)", self._checkpoint_file, exc_info=True
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        """fsync a directory so a rename within it is durable. Best-effort: a directory
+        fd can't be opened/fsync'd on Windows, so this is a harmless no-op there."""
+        try:
+            dfd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dfd)
+        except OSError:
+            pass
+        finally:
+            os.close(dfd)
+
+    def _checkpoint_is_current(self, data: dict[str, Any]) -> bool:
+        """Whether a parsed checkpoint may be trusted for THIS run's CURRENT files.
+
+        Two integrity gates (caller holds the lock):
+
+        - FILE IDENTITY: every stream with a saved offset > 0 must still resolve to the
+          SAME underlying file (st_dev/st_ino) whose size still covers the offset — so the
+          append-only prefix we already counted is byte-for-byte unchanged. A rotate/
+          replace (new inode) or truncation (size < offset) -> reject. ``started_at`` is
+          deliberately NOT a gate: the recorder appends to the same book.jsonl across its
+          OWN restarts while rewriting meta.json's started_at, and that grown prefix is
+          still valid to resume — gating on it would re-drain on every VM reboot / co-restart.
+
+        - OFFSET<->COUNT CONSISTENCY: any stream carrying adopted aggregate state (a
+          nonzero stream count, a per-event bucket, or markets seen) MUST sit on such a
+          validated positive offset. Otherwise resume would re-read that stream from byte 0
+          and double-count on top of the adopted totals -> reject.
+
+        An offset of 0 with no state resumes a stream from scratch, which is always safe.
+        """
+        files = data.get("files") if isinstance(data.get("files"), dict) else {}
+        offsets = data.get("offsets") if isinstance(data.get("offsets"), dict) else {}
+        # Streams whose (dev, ino, size) authorize resuming from a positive saved offset.
+        validated: set[str] = set()
+        for stream, raw_off in offsets.items():
+            try:
+                off = int(raw_off)
+            except (TypeError, ValueError):
+                return False
+            if off <= 0:
+                continue
+            ident = self._file_identity(stream)
+            if ident is None or ident["size"] < off:
+                return False  # file gone, rotated to empty, truncated, or offset past EOF
+            saved = files.get(stream)
+            if not isinstance(saved, dict) or (saved.get("dev"), saved.get("ino")) != (
+                ident["dev"],
+                ident["ino"],
+            ):
+                return False  # different underlying file (rotated/replaced)
+            validated.add(str(stream))
+        # Every stream carrying adopted state must rest on a validated positive offset.
+        stateful: set[str] = set()
+        try:
+            for stream, count in (data.get("counts") or {}).items():
+                if int(count) > 0:
+                    stateful.add(str(stream))
+            for bucket in (data.get("by_event") or {}).values():
+                for stream, count in (bucket or {}).items():
+                    if int(count) > 0:
+                        stateful.add(str(stream))
+        except (TypeError, ValueError, AttributeError):
+            return False  # malformed counts -> safe re-drain
+        if data.get("markets_seen"):
+            stateful.add("book")  # markets are only ever seen while scanning the book stream
+        return stateful <= validated
+
+    def load_checkpoint(self) -> bool:
+        """Resume the scan from a persisted checkpoint instead of re-draining from 0.
+
+        Validates schema + per-stream file identity/size + offset<->count consistency
+        BEFORE adopting anything (see :meth:`_checkpoint_is_current`); ANY problem (corrupt,
+        stale schema, rotated/truncated/replaced file, offset past EOF, or counts without a
+        matching offset) discards the checkpoint and leaves the reader at offset 0 for a
+        full, safe re-drain. Returns True iff adopted.
+
+        Restores the offsets and the aggregates computed up to them. The rate baseline is
+        reset (the next tick re-establishes it and emits no rate, like a cold start — a
+        persisted *monotonic* deadline is meaningless after a restart). The L2 book
+        reconstruction is intentionally left empty; it re-heals from new ``book`` records.
+        """
+        if self._checkpoint_file is None:
+            return False
+        try:
+            data = json.loads(self._checkpoint_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        if not isinstance(data, dict) or data.get("schema") != _CHECKPOINT_SCHEMA:
+            return False
+        with self._lock:
+            if not self._checkpoint_is_current(data):
+                return False
+            try:
+                offsets = {str(s): int(o) for s, o in (data.get("offsets") or {}).items()}
+                counts = {str(s): int(c) for s, c in (data.get("counts") or {}).items()}
+                by_event = {
+                    str(eid): {str(s): int(n) for s, n in (c or {}).items()}
+                    for eid, c in (data.get("by_event") or {}).items()
+                }
+                last_ts = {str(eid): str(ts) for eid, ts in (data.get("last_ts") or {}).items()}
+                markets_seen = {str(m) for m in (data.get("markets_seen") or [])}
+            except (TypeError, ValueError, AttributeError):
+                return False  # malformed payload -> safe full re-drain
+            self._offsets = offsets
+            self._counts = {"comments": 0, "book": 0, **counts}
+            self._by_event = by_event
+            self._last_ts = last_ts
+            self._markets_seen = markets_seen
+            self._rate_prev = None  # fresh baseline; first tick emits no rate (cold-start-like)
+        return True
 
     def match_view(self, event_id: str) -> dict[str, Any]:
         """Reconstructed preview for one match: each outcome's book, last trade, price line."""

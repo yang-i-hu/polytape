@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from polytape.admin.reader import RunReader
 from polytape.envelope import utc_now_iso
 
@@ -313,3 +315,252 @@ def test_consume_reads_in_bounded_chunks(tmp_path):
         r.update()
     assert r.status()["records"]["book"] == 20  # fully caught up
     assert r._offsets["book"] == size  # offset reached EOF
+
+
+# --------------------------------------------------------------------------- #
+# Scan checkpoint: resume forward on restart instead of re-draining from byte 0
+# --------------------------------------------------------------------------- #
+
+
+def _reader_ck(tmp_path, ckpt, **kw):
+    """A reader (with meta.json written) that persists its scan checkpoint to ``ckpt``."""
+    (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    return RunReader(tmp_path, env_file=tmp_path / "missing.env", checkpoint_file=ckpt, **kw)
+
+
+def _seed_checkpoint(tmp_path, ckpt):
+    """Write two book + one comment record and persist a valid checkpoint over them."""
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1"), _book("0xB1")])
+    _write_jsonl(tmp_path / "comments.jsonl", [_comment(1001, "c1")])
+    r = _reader_ck(tmp_path, ckpt)
+    r.update()
+    assert r.save_checkpoint() is True
+    return r
+
+
+def test_checkpoint_resume_equals_full_drain(tmp_path):
+    # Golden test: state rebuilt by resuming from a checkpoint (then reading only the
+    # appended tail) must EXACTLY equal state built by a full drain of the final log.
+    book = tmp_path / "book.jsonl"
+    comments = tmp_path / "comments.jsonl"
+    _write_jsonl(book, [_book("0xA1"), _book("0xA1"), _book("0xB1")])
+    _write_jsonl(comments, [_comment(1001, "c1"), _comment(1002, "c2")])
+    ckpt = tmp_path / "reader-checkpoint.json"
+
+    warm = _reader_ck(tmp_path, ckpt)
+    warm.update()
+    assert warm.save_checkpoint() is True
+    saved_book_off = json.loads(ckpt.read_text(encoding="utf-8"))["offsets"]["book"]
+
+    # Append more records to BOTH streams after the checkpoint was taken.
+    with open(book, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(_book("0xA2")) + "\n")
+        fh.write(json.dumps(_book("0xB1")) + "\n")
+    with open(comments, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(_comment(1001, "c3")) + "\n")
+
+    resumed = _reader_ck(tmp_path, ckpt)
+    assert resumed.load_checkpoint() is True
+    assert resumed._offsets["book"] == saved_book_off  # resumed AT the boundary, not 0
+    resumed.update()
+
+    ref = _reader(tmp_path)  # fresh full drain over the same final files
+    ref.update()
+
+    assert resumed.status()["records"] == ref.status()["records"] == {"book": 5, "comments": 3}
+    assert {m["event_id"]: m["counts"] for m in resumed.matches()} == {
+        m["event_id"]: m["counts"] for m in ref.matches()
+    }
+    assert resumed._markets_seen == ref._markets_seen
+    assert resumed._last_ts == ref._last_ts
+    assert resumed._offsets == ref._offsets  # both reached the same EOF, no double-count
+
+
+def test_checkpoint_warm_start_reads_only_tail(tmp_path):
+    # A warm start catches up to the live edge in ONE bounded tick (it reads only the
+    # small tail), where a cold start would need many ticks to re-drain the big prefix.
+    book = tmp_path / "book.jsonl"
+    _write_jsonl(book, [_book("0xA1") for _ in range(40)])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    prefix_size = book.stat().st_size
+    cap = max(prefix_size // 8, 250)  # ~8 bounded ticks to cold-drain the prefix
+    ckpt = tmp_path / "reader-checkpoint.json"
+
+    warm = _reader_ck(tmp_path, ckpt, max_read_bytes=cap)
+    for _ in range(40):  # drain the whole prefix, then checkpoint at EOF
+        warm.update()
+    assert warm._offsets["book"] == prefix_size
+    assert warm.save_checkpoint() is True
+
+    with open(book, "a", encoding="utf-8") as fh:  # a small fresh tail (< cap)
+        fh.write(json.dumps(_book("0xB1")) + "\n")
+        fh.write(json.dumps(_book("0xB1")) + "\n")
+    full_size = book.stat().st_size
+
+    resumed = _reader_ck(tmp_path, ckpt, max_read_bytes=cap)
+    assert resumed.load_checkpoint() is True
+    resumed.update()  # a SINGLE tick
+    assert resumed._offsets["book"] == full_size  # already at the live edge
+    assert resumed.status()["records"]["book"] == 42
+
+    # Contrast: a cold reader is still mid-drain after the same single tick.
+    cold = RunReader(tmp_path, env_file=tmp_path / "missing.env", max_read_bytes=cap)
+    cold.update()
+    assert cold.status()["records"]["book"] < 42
+
+
+def test_checkpoint_rejected_when_corrupt(tmp_path):
+    ckpt = tmp_path / "reader-checkpoint.json"
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1"), _book("0xB1")])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    ckpt.write_text("{ this is not valid json", encoding="utf-8")
+    r = _reader_ck(tmp_path, ckpt)
+    assert r.load_checkpoint() is False
+    assert r._offsets == {}  # nothing adopted
+    r.update()
+    assert r.status()["records"]["book"] == 2  # full re-drain from byte 0
+
+
+def test_checkpoint_rejected_on_schema_change(tmp_path):
+    ckpt = tmp_path / "reader-checkpoint.json"
+    _seed_checkpoint(tmp_path, ckpt)
+    data = json.loads(ckpt.read_text(encoding="utf-8"))
+    data["schema"] = 999  # a payload shape this build does not understand
+    ckpt.write_text(json.dumps(data), encoding="utf-8")
+    r = _reader_ck(tmp_path, ckpt)
+    assert r.load_checkpoint() is False
+    assert r._offsets == {}
+
+
+def test_checkpoint_resumes_across_recorder_restart(tmp_path):
+    # A recorder restart APPENDS to the same book.jsonl (stable inode, file only grows)
+    # but rewrites meta.json with a fresh started_at. The checkpoint MUST still resume —
+    # the prefix we counted is byte-for-byte unchanged. started_at is advisory, not a gate;
+    # gating on it would re-drain on every VM reboot / co-restart (the regression we fixed).
+    ckpt = tmp_path / "reader-checkpoint.json"
+    book = tmp_path / "book.jsonl"
+    _seed_checkpoint(tmp_path, ckpt)  # 2 book + 1 comment, checkpoint started_at = default
+    saved_off = json.loads(ckpt.read_text(encoding="utf-8"))["offsets"]["book"]
+    with open(book, "a", encoding="utf-8") as fh:  # recorder appended after its restart
+        fh.write(json.dumps(_book("0xA2")) + "\n")
+    meta = _meta()
+    meta["started_at"] = "2026-06-25T10:00:00.000000Z"  # fresh started_at from the restart
+    (tmp_path / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    r = RunReader(tmp_path, env_file=tmp_path / "missing.env", checkpoint_file=ckpt)
+    assert r.load_checkpoint() is True  # adopted despite the new started_at (same inode)
+    assert r._offsets["book"] == saved_off
+    r.update()
+    assert r.status()["records"]["book"] == 3  # 2 resumed + 1 appended; no re-drain, no double
+
+
+def test_checkpoint_rejected_when_counts_without_offset(tmp_path):
+    # Defense-in-depth: a checkpoint that claims book counts but a zero/absent book offset
+    # would re-read book.jsonl from byte 0 on the next tick and DOUBLE-count on top of the
+    # adopted total. _checkpoint_is_current must reject it (offset<->count consistency).
+    ckpt = tmp_path / "reader-checkpoint.json"
+    _seed_checkpoint(tmp_path, ckpt)  # offsets.book > 0, counts.book == 2
+    data = json.loads(ckpt.read_text(encoding="utf-8"))
+    data["offsets"]["book"] = 0  # counts.book stays 2 -> inconsistent (adopting would double)
+    ckpt.write_text(json.dumps(data), encoding="utf-8")
+    r = _reader_ck(tmp_path, ckpt)
+    assert r.load_checkpoint() is False
+    assert r._offsets == {}
+    r.update()
+    assert r.status()["records"]["book"] == 2  # full re-drain — not doubled
+
+    # Same hole if the stream is dropped from offsets entirely.
+    data = json.loads(ckpt.read_text(encoding="utf-8"))
+    del data["offsets"]["book"]
+    ckpt.write_text(json.dumps(data), encoding="utf-8")
+    r2 = _reader_ck(tmp_path, ckpt)
+    assert r2.load_checkpoint() is False
+
+
+def test_checkpoint_rejected_when_offset_past_eof(tmp_path):
+    ckpt = tmp_path / "reader-checkpoint.json"
+    _seed_checkpoint(tmp_path, ckpt)
+    saved_off = json.loads(ckpt.read_text(encoding="utf-8"))["offsets"]["book"]
+    assert saved_off > 0
+    # Truncate book.jsonl so the saved offset now points past EOF (rotation/truncation).
+    (tmp_path / "book.jsonl").write_text(json.dumps(_book("0xA1")) + "\n", encoding="utf-8")
+    assert (tmp_path / "book.jsonl").stat().st_size < saved_off
+    r = _reader_ck(tmp_path, ckpt)
+    assert r.load_checkpoint() is False
+    assert r._offsets == {}
+
+
+def test_checkpoint_rejected_on_file_replace(tmp_path):
+    ckpt = tmp_path / "reader-checkpoint.json"
+    _seed_checkpoint(tmp_path, ckpt)
+    data = json.loads(ckpt.read_text(encoding="utf-8"))
+    # Same run + size still covers the offset, but a DIFFERENT inode: the file was
+    # rotated/replaced under us, so the prefix we counted is no longer trustworthy.
+    data["files"]["book"]["ino"] = int(data["files"]["book"]["ino"]) + 1
+    ckpt.write_text(json.dumps(data), encoding="utf-8")
+    r = _reader_ck(tmp_path, ckpt)
+    assert r.load_checkpoint() is False
+    assert r._offsets == {}
+
+
+def test_checkpoint_disabled_is_noop(tmp_path):
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1")])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    r = _reader(tmp_path)  # no checkpoint_file configured
+    assert r.save_checkpoint() is False
+    assert r.load_checkpoint() is False
+    assert not list(tmp_path.glob("*checkpoint*"))  # nothing written to disk
+
+
+def test_checkpoint_save_skipped_without_run_identity(tmp_path):
+    # No meta.json -> no started_at -> no run identity to validate a resume against, so
+    # there is nothing safe to persist yet: save is a no-op and writes no file.
+    ckpt = tmp_path / "reader-checkpoint.json"
+    _write_jsonl(tmp_path / "book.jsonl", [_book("0xA1")])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    r = RunReader(tmp_path, env_file=tmp_path / "missing.env", checkpoint_file=ckpt)
+    r.update()
+    assert r.save_checkpoint() is False
+    assert not ckpt.exists()
+
+
+def test_app_lifespan_saves_and_resumes_checkpoint(tmp_path):
+    # End-to-end through the real app lifespan: a clean shutdown writes the checkpoint,
+    # and a fresh app's STARTUP loads it — reaching the live edge after a single bounded
+    # read, which a cold byte-0 re-drain with this small cap provably cannot do.
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from polytape.admin.app import create_app
+
+    (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    book = tmp_path / "book.jsonl"
+    _write_jsonl(book, [_book("0xA1") for _ in range(40)])
+    (tmp_path / "comments.jsonl").write_text("", encoding="utf-8")
+    prefix_size = book.stat().st_size
+    cap = max(prefix_size // 8, 250)  # cold start needs ~8 bounded ticks to reach EOF
+    ckpt = tmp_path / "reader-checkpoint.json"
+
+    r1 = RunReader(
+        tmp_path, env_file=tmp_path / "missing.env", checkpoint_file=ckpt, max_read_bytes=cap
+    )
+    for _ in range(40):  # drain the prefix deterministically, not via the poll loop
+        r1.update()
+    app1 = create_app(r1, poll_interval=3600, registry_refresh_s=0, extract_refresh_s=0)
+    assert not ckpt.exists()
+    with TestClient(app1):  # enter + exit the lifespan -> final save on shutdown
+        pass
+    assert ckpt.exists()
+
+    with open(book, "a", encoding="utf-8") as fh:  # a small fresh tail (< cap)
+        fh.write(json.dumps(_book("0xB1")) + "\n")
+    full_size = book.stat().st_size
+
+    r2 = RunReader(
+        tmp_path, env_file=tmp_path / "missing.env", checkpoint_file=ckpt, max_read_bytes=cap
+    )
+    app2 = create_app(r2, poll_interval=3600, registry_refresh_s=0, extract_refresh_s=0)
+    with TestClient(app2) as c:
+        st = c.get("/api/status").json()
+    assert st["records"]["book"] == 41  # resumed: prefix (40) + the tail (1)
+    assert r2._offsets["book"] == full_size  # at the live edge after startup, not mid-drain
