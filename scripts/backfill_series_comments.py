@@ -209,11 +209,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"resuming: {len(seen)} envelope id(s) already in {out_path}")
 
     total = 0
-    with httpx.Client(
-        base_url=GAMMA_BASE_URL,
-        timeout=30.0,
-        headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
-    ) as client, out_path.open("a", encoding="utf-8", newline="\n") as out:
+    with (
+        httpx.Client(
+            base_url=GAMMA_BASE_URL,
+            timeout=30.0,
+            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        ) as client,
+        out_path.open("a", encoding="utf-8", newline="\n") as out,
+    ):
         for parent_id, parent_type in targets:
             total += backfill_parent(
                 client,
