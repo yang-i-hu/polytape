@@ -292,6 +292,67 @@ def create_app(
         if not selected:
             return JSONResponse({"error": "no known match selected"}, status_code=400)
 
+        # Native fast-path: since the per-match-output deploy the recorder dual-writes each
+        # event to matches/event-<id>/, so a per-match download is served STRAIGHT from
+        # those files — no full-run scan and no cache build. Only the small per-event
+        # meta.json is regenerated into scratch (kept identical to the filtered-slice
+        # shape); book/comments stream verbatim. Returns None (falls through to the cache +
+        # filter paths below) if any selected match predates per-match output.
+        async def _serve_native():
+            # Cheap existence check first, so a non-native request (pre-deploy match) does
+            # NO extra work and routes through the cache/filter paths unchanged.
+            if not await asyncio.to_thread(dl.have_native_matches, run_dir, selected):
+                return None
+            try:
+                scratch = await asyncio.to_thread(
+                    dl.make_scratch_dir, scratch_dir, prefix="polytape-native-"
+                )
+            except OSError as exc:
+                logger.warning("native scratch unavailable: %s", exc)
+                return None
+            try:
+                entries = await asyncio.to_thread(
+                    dl.native_match_entries,
+                    run_dir,
+                    selected,
+                    scratch,
+                    meta=meta,
+                    registry=registry,
+                    exported_at=utc_now_iso(),
+                )
+            except OSError as exc:
+                shutil.rmtree(scratch, ignore_errors=True)
+                logger.warning("native per-match build failed: %s", exc)
+                return None
+            if entries is None:
+                shutil.rmtree(scratch, ignore_errors=True)  # a match predates per-match output
+                return None
+            audit.write(
+                action="download",
+                result="ok",
+                source=src,
+                session_fp=fp,
+                scope=",".join(selected),
+                served="native",
+            )
+            fname = (
+                dl.match_archive_name(selected[0], registry.get(selected[0]))
+                if len(selected) == 1
+                else f"polytape-{len(selected)}-matches.tar.gz"
+            )
+            headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+            return StreamingResponse(
+                dl.stream_targz(
+                    entries, on_done=lambda: shutil.rmtree(scratch, ignore_errors=True)
+                ),
+                media_type="application/gzip",
+                headers=headers,
+            )
+
+        native = await _serve_native()
+        if native is not None:
+            return native
+
         # Cache fast-path: a selection of FINISHED matches is immutable, so serve it from
         # the pre-built per-match extracts instead of re-scanning the whole run — one match
         # streams its cached tarball verbatim; several are stitched member-by-member into a

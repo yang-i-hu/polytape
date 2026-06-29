@@ -430,6 +430,69 @@ def filter_run(
     return entries
 
 
+def have_native_matches(run_dir: Path, event_ids: Iterable[str]) -> bool:
+    """True iff EVERY selected event has a recorder-written per-match ``book.jsonl``.
+
+    A cheap existence check the download route uses to decide the native fast path
+    BEFORE creating any scratch — so a request that must fall back to filtering does no
+    extra work (and pre-deploy matches, which have no ``matches/`` dir, route normally).
+    """
+    base = run_dir / "matches"
+    return all(
+        (base / f"event-{eid}" / "book.jsonl").exists() for eid in {str(e) for e in event_ids}
+    )
+
+
+def native_match_entries(
+    run_dir: Path,
+    event_ids: Iterable[str],
+    scratch_dir: Path,
+    *,
+    meta: dict[str, Any] | None = None,
+    registry: dict[str, dict[str, Any]] | None = None,
+    exported_at: str,
+) -> list[tuple[str, Path]] | None:
+    """Archive entries served STRAIGHT from the recorder's per-match files — no scan.
+
+    Since the per-match-output deploy the recorder dual-writes each event to
+    ``run_dir/matches/event-<id>/<stream>.jsonl`` (alongside the monolithic backup), so a
+    per-match download no longer needs a full-run scan: the bulky ``book.jsonl`` /
+    ``comments.jsonl`` are referenced verbatim from those files (append-only, so a tar
+    reads a clean line-aligned snapshot even while a match is still recording), and only
+    the small per-event ``meta.json`` is (re)generated into ``scratch_dir`` so the archive
+    shape stays identical to the filtered-slice export.
+
+    Returns ``None`` (caller falls back to the filtering path) if ANY selected event has
+    no native per-match ``book.jsonl`` — e.g. a match recorded before the deploy. Nothing
+    is written to ``scratch_dir`` in that case.
+    """
+    meta = meta if meta is not None else load_run_meta(run_dir)
+    base = run_dir / "matches"
+    wanted = sorted({str(e) for e in event_ids})
+    # All-or-nothing: a single non-native event falls the whole request back to filtering.
+    if any(not (base / f"event-{eid}" / "book.jsonl").exists() for eid in wanted):
+        return None
+    entries: list[tuple[str, Path]] = []
+    for eid in wanted:
+        native_dir = base / f"event-{eid}"
+        scratch_event = scratch_dir / f"event-{eid}"
+        scratch_event.mkdir(parents=True, exist_ok=True)
+        meta_path = scratch_event / "meta.json"
+        meta_path.write_text(
+            json.dumps(
+                per_event_meta(meta, eid, exported_at=exported_at, registry=registry), indent=2
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        entries.append((f"event-{eid}/meta.json", meta_path))
+        for name in ("book.jsonl", "comments.jsonl"):
+            path = native_dir / name
+            if path.exists():
+                entries.append((f"event-{eid}/{name}", path))
+    return entries
+
+
 def whole_run_entries(run_dir: Path, meta: dict[str, Any] | None = None) -> list[tuple[str, Path]]:
     """Archive entries for the whole run verbatim — the three combined files."""
     root = run_dir.name or "run"
