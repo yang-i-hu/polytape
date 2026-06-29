@@ -169,6 +169,17 @@ def test_native_match_entries_serves_from_recorder_files(tmp_path):
     assert meta["counts"] == {"book": 2, "comments": 2}  # authoritative counts_by_event
 
 
+def test_have_native_matches_requires_complete_files(tmp_path):
+    _setup_native(tmp_path)  # event-1001 has 2 book lines; meta counts_by_event 1001 book=2
+    meta = _meta()
+    assert dl.have_native_matches(tmp_path, ["1001"], meta) is True  # 2 >= 2 -> complete
+    # a PARTIAL native file (straddled the deploy: fewer lines than the monolith count)
+    _write_jsonl(tmp_path / "matches" / "event-1001" / "book.jsonl", [_book("0x?", "only1")])
+    assert dl.have_native_matches(tmp_path, ["1001"], meta) is False  # 1 < 2 -> fall back to scan
+    # a selected match with no native dir at all also fails the gate
+    assert dl.have_native_matches(tmp_path, ["1001", "9999"], meta) is False
+
+
 def test_native_match_entries_returns_none_when_a_match_is_not_native(tmp_path):
     _setup_native(tmp_path)  # only 1001 & 1002 are native
     scratch = tmp_path / "scratch"
