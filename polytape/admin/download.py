@@ -430,17 +430,37 @@ def filter_run(
     return entries
 
 
-def have_native_matches(run_dir: Path, event_ids: Iterable[str]) -> bool:
-    """True iff EVERY selected event has a recorder-written per-match ``book.jsonl``.
+def _count_lines(path: Path, chunk: int = _READ_CHUNK) -> int:
+    """Count newlines in a file with a flat-memory streaming read (never loads it whole)."""
+    n = 0
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                return n
+            n += block.count(b"\n")
 
-    A cheap existence check the download route uses to decide the native fast path
-    BEFORE creating any scratch — so a request that must fall back to filtering does no
-    extra work (and pre-deploy matches, which have no ``matches/`` dir, route normally).
+
+def have_native_matches(run_dir: Path, event_ids: Iterable[str], meta: dict[str, Any]) -> bool:
+    """True iff EVERY selected event has a COMPLETE recorder-written per-match ``book.jsonl``.
+
+    Gates the native fast path. "Complete" means the native file holds at least the event's
+    authoritative monolith book count (``meta.counts_by_event[id].book``). A match that
+    straddled the per-match deploy has a PARTIAL native file (only the post-deploy tail —
+    fewer lines than the monolith count) and returns False, so the caller falls back to the
+    (complete) full-run scan rather than serving truncated data. The line count is a
+    flat-memory streaming read — still vastly cheaper than scanning the whole monolith.
     """
     base = run_dir / "matches"
-    return all(
-        (base / f"event-{eid}" / "book.jsonl").exists() for eid in {str(e) for e in event_ids}
-    )
+    counts = meta.get("counts_by_event") or {}
+    for eid in {str(e) for e in event_ids}:
+        book = base / f"event-{eid}" / "book.jsonl"
+        if not book.exists():
+            return False
+        want = (counts.get(eid) or {}).get("book", 0)
+        if want and _count_lines(book) < want:
+            return False  # partial native (straddled the deploy) -> use the complete scan
+    return True
 
 
 def native_match_entries(

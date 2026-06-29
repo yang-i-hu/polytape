@@ -301,7 +301,7 @@ def create_app(
         async def _serve_native():
             # Cheap existence check first, so a non-native request (pre-deploy match) does
             # NO extra work and routes through the cache/filter paths unchanged.
-            if not await asyncio.to_thread(dl.have_native_matches, run_dir, selected):
+            if not await asyncio.to_thread(dl.have_native_matches, run_dir, selected, meta):
                 return None
             try:
                 scratch = await asyncio.to_thread(
