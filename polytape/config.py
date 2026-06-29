@@ -38,6 +38,11 @@ class Config:
         hash_usernames: Whether to salt-and-hash identifier fields (privacy default).
         market_ids: Optional explicit market id(s) to record instead of every
             market in each event. Empty means "auto-resolve".
+        per_match: Also write each event-tagged record to a per-match file under
+            ``event_dir/matches/event-<id>/<stream>.jsonl`` (the PRIMARY, ready-to-use
+            per-match output), in addition to the monolithic ``<stream>.jsonl`` (kept
+            as the complete append-only backup). Lets a finished match be consumed /
+            offloaded without scanning the whole run. On by default.
         dry_run: Feed synthetic messages through the pipeline with no network.
         log_level: Python logging level name (upper-case).
     """
@@ -50,6 +55,7 @@ class Config:
     book: bool = True
     hash_usernames: bool = True
     market_ids: tuple[str, ...] = ()
+    per_match: bool = True
     dry_run: bool = False
     log_level: str = "INFO"
 

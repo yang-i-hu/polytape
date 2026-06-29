@@ -85,6 +85,16 @@ class CaptureWriter:
         self._now = now
         self._dir: Path = config.event_dir
         self._files: dict[str, TextIO] = {}
+        # Per-match (PRIMARY) output: one append handle per (stream, event_id), opened
+        # lazily on the first record for that event. The monolithic self._files stays the
+        # complete append-only backup; these are the ready-to-use per-match files that let
+        # a finished match be consumed/offloaded without scanning the whole run. See
+        # write_envelope for the lossless dual-write.
+        self._per_match: bool = bool(getattr(config, "per_match", True))
+        self._event_files: dict[tuple[str, str], TextIO] = {}
+        self._event_snapshots: dict[str, dict[str, Any]] = {
+            e.event_id: self._snapshot(e) for e in self._event_infos
+        }
         self._seen: dict[str, OrderedDict[str, None]] = {}
         self._counts: dict[str, int] = {}
         # Per-event, per-stream written counts (multi-event runs). Records still go
@@ -143,6 +153,12 @@ class CaptureWriter:
                 handle.close()
             except OSError:
                 logger.exception("error closing %s file", stream)
+        for (stream, eid), handle in self._event_files.items():
+            try:
+                handle.flush()
+                handle.close()
+            except OSError:
+                logger.exception("error closing per-match %s file for event %s", stream, eid)
         self._open = False
         # Best-effort on shutdown: if the disk is full we cannot finalize meta.json,
         # but that must not mask the original cause or crash the cleanup path.
@@ -163,7 +179,7 @@ class CaptureWriter:
         ``raw`` (``parentEntityID`` for comments, ``market`` for book).
         """
         envelope = build_envelope(stream, raw, hasher=self._hasher, ts_recv=self._now())
-        wrote = self.write_envelope(envelope)
+        wrote = self.write_envelope(envelope, event_id=event_id)
         if wrote:
             ts = envelope["ts_recv"]
             self._last_record_at = ts
@@ -174,8 +190,24 @@ class CaptureWriter:
                 self._last_ts_by_event[eid] = ts
         return wrote
 
-    def write_envelope(self, envelope: dict[str, Any]) -> bool:
-        """Write a pre-built envelope, de-duplicating by id within the stream."""
+    def write_envelope(self, envelope: dict[str, Any], *, event_id: str | None = None) -> bool:
+        """Write a pre-built envelope, de-duplicating by id within the stream.
+
+        Writes the SAME line to two places, both synchronously and flushed before
+        returning. The recorder's hot loop has no ``await`` between receiving a frame
+        and this returning (see ``streams/base.py``), so the pair is atomic w.r.t. every
+        other write — a record can never be split across, or lost at, a per-match
+        boundary:
+
+        1. the monolithic ``<stream>.jsonl`` — the complete append-only BACKUP, and
+        2. (when ``event_id`` is set and ``per_match`` is on) the per-match PRIMARY file
+           ``matches/event-<id>/<stream>.jsonl``.
+
+        The monolith is written FIRST and is the source of truth: if the per-match write
+        fails (e.g. ENOSPC), the record is still safely in the backup — and per-match
+        files are rebuildable from it — while the failure still surfaces as a fatal disk
+        error so the process restarts instead of silently dropping data.
+        """
         if not self._open:
             raise RuntimeError("writer is not open")
         stream = envelope["stream"]
@@ -189,13 +221,34 @@ class CaptureWriter:
         seen[message_id] = None
         if len(seen) > _SEEN_CAP:
             seen.popitem(last=False)  # evict oldest; the dedup window stays recency-bounded
+        line = json.dumps(envelope, ensure_ascii=False) + "\n"
         try:
-            handle.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+            handle.write(line)  # monolithic backup (source of truth) — written first
             handle.flush()
+            if event_id is not None and self._per_match:
+                per = self._event_handle(stream, str(event_id))  # per-match PRIMARY
+                per.write(line)
+                per.flush()
         except OSError as exc:
             raise FatalRecorderError(f"write to {stream!r} failed: {exc}") from exc
         self._counts[stream] += 1
         return True
+
+    def _event_handle(self, stream: str, event_id: str) -> TextIO:
+        """Lazily open + cache the per-match append handle for one ``(stream, event)``.
+
+        Synchronous (mkdir + open, no ``await``) so the dual write stays atomic with the
+        rest of the hot loop. Any failure raises ``OSError`` to the caller, which turns
+        it into a :class:`FatalRecorderError` exactly like the monolithic path.
+        """
+        key = (stream, event_id)
+        handle = self._event_files.get(key)
+        if handle is None:
+            event_dir = self._dir / "matches" / f"event-{event_id}"
+            event_dir.mkdir(parents=True, exist_ok=True)
+            handle = open(event_dir / f"{stream}.jsonl", "a", encoding="utf-8", newline="\n")
+            self._event_files[key] = handle
+        return handle
 
     def record_gap(
         self,
@@ -350,3 +403,48 @@ class CaptureWriter:
             os.replace(tmp, path)
         except OSError as exc:
             raise FatalRecorderError(f"writing meta.json failed: {exc}") from exc
+        self._write_event_metas()
+
+    def _event_meta(self, event_id: str) -> dict[str, Any]:
+        """A self-contained per-match meta dict (event snapshot + that event's counts)."""
+        return {
+            "polytape_version": __version__,
+            "event_id": event_id,
+            "run_name": self._config.run_name,
+            "streams": list(self._config.enabled_streams),
+            "holdings_captured": STREAM_COMMENTS in self._config.enabled_streams,
+            "hashing": {
+                "enabled": self._hasher is not None,
+                "salt_fingerprint": self._hasher.fingerprint if self._hasher else None,
+            },
+            "started_at": self._started_at,
+            "stopped_at": self._stopped_at,
+            "counts": dict(self._counts_by_event.get(event_id, {})),
+            "last_record_at": self._last_ts_by_event.get(event_id),
+            "event": self._event_snapshots.get(event_id),
+        }
+
+    def _write_event_metas(self) -> None:
+        """Persist a small ``meta.json`` next to each per-match file's directory.
+
+        Makes ``matches/event-<id>/`` a ready-to-use archive (data + meta), mirroring the
+        per-match download layout. Best-effort: a per-match meta failure is logged but
+        NEVER escalates to fatal — the ``book.jsonl`` data is what matters and the meta is
+        derivable from it (the monolith stays the source of truth). Only events that have
+        an open per-match handle are written (so finished, rolled-out matches keep their
+        last-written meta).
+        """
+        if not self._per_match:
+            return
+        for event_id in {eid for (_stream, eid) in self._event_files}:
+            event_dir = self._dir / "matches" / f"event-{event_id}"
+            try:
+                tmp = event_dir / "meta.json.tmp"
+                with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(self._event_meta(event_id), handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+                os.replace(tmp, event_dir / "meta.json")
+            except OSError:
+                logger.warning(
+                    "could not write per-match meta for event %s", event_id, exc_info=True
+                )
