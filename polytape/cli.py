@@ -81,6 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write usernames/identifiers verbatim instead of salted-hashing them.",
     )
     parser.add_argument(
+        "--per-match",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also write per-match files (matches/event-<id>/<stream>.jsonl) alongside "
+        "the monolithic backup log (use --no-per-match to write only the monolith).",
+    )
+    parser.add_argument(
         "--market-id",
         action="append",
         metavar="ID",
@@ -149,6 +156,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         book=args.book,
         hash_usernames=not args.no_hash,
         market_ids=tuple(args.market_id or ()),
+        per_match=args.per_match,
         dry_run=args.dry_run,
         log_level=args.log_level,
     )

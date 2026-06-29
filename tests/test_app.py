@@ -79,7 +79,7 @@ async def test_run_fatal_writer_error_returns_2(
         by_url={"live-data": [json.dumps(cframe)], "clob": [json.dumps(bframe)]}, blocking=True
     )
 
-    def _boom(self, envelope):
+    def _boom(self, envelope, *, event_id=None):
         raise FatalRecorderError("disk full")
 
     monkeypatch.setattr(CaptureWriter, "write_envelope", _boom)
