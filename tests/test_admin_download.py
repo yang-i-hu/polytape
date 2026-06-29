@@ -131,6 +131,58 @@ def _ids(path) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Native per-match fast path (recorder-written matches/ files, served without a scan)
+# --------------------------------------------------------------------------- #
+
+
+def _setup_native(run_dir):
+    """Recorder dual-writes per-match files under matches/event-<id>/ (1001 & 1002)."""
+    (run_dir / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
+    for eid, books, comments in (("1001", ["b1", "b2"], ["c1"]), ("1002", ["b3"], ["c2"])):
+        d = run_dir / "matches" / f"event-{eid}"
+        d.mkdir(parents=True)
+        _write_jsonl(d / "book.jsonl", [_book("0x?", b) for b in books])
+        _write_jsonl(d / "comments.jsonl", [_comment(int(eid), c) for c in comments])
+        (d / "meta.json").write_text("{}", encoding="utf-8")  # recorder stub; regenerated on export
+
+
+def test_native_match_entries_serves_from_recorder_files(tmp_path):
+    _setup_native(tmp_path)
+    scratch = tmp_path / "scratch"
+    entries = dl.native_match_entries(
+        tmp_path, ["1001"], scratch, meta=_meta(), exported_at="2026-06-21T00:00:00Z"
+    )
+    arc = dict(entries)
+    assert set(arc) == {
+        "event-1001/meta.json",
+        "event-1001/book.jsonl",
+        "event-1001/comments.jsonl",
+    }
+    # bulky data is referenced verbatim from the recorder's native files (no scan / no copy)
+    native_book = tmp_path / "matches" / "event-1001" / "book.jsonl"
+    assert arc["event-1001/book.jsonl"] == native_book
+    assert _ids(arc["event-1001/book.jsonl"]) == ["b1", "b2"]
+    # meta.json is regenerated into scratch in the filtered-slice shape (not the recorder stub)
+    assert arc["event-1001/meta.json"].parent == scratch / "event-1001"
+    meta = json.loads(arc["event-1001/meta.json"].read_text(encoding="utf-8"))
+    assert meta["event_id"] == "1001"
+    assert meta["counts"] == {"book": 2, "comments": 2}  # authoritative counts_by_event
+
+
+def test_native_match_entries_returns_none_when_a_match_is_not_native(tmp_path):
+    _setup_native(tmp_path)  # only 1001 & 1002 are native
+    scratch = tmp_path / "scratch"
+    # 1003 has no matches/ dir -> whole request falls back to the filtering path, untouched
+    assert (
+        dl.native_match_entries(
+            tmp_path, ["1001", "1003"], scratch, meta=_meta(), exported_at="2026-06-21T00:00:00Z"
+        )
+        is None
+    )
+    assert not scratch.exists()  # nothing written on the fall-back path
+
+
+# --------------------------------------------------------------------------- #
 # Pure: filtering + attribution + archiving
 # --------------------------------------------------------------------------- #
 
