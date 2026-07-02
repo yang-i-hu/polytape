@@ -1,0 +1,16 @@
+# Checks /data usage every ~5 minutes (and shortly after boot) and grows the
+# disk if it crosses the threshold. Install alongside polytape-autogrow.service:
+#   sudo install -m 0755 deploy/polytape-autogrow.sh /opt/polytape/polytape-autogrow.sh
+#   sudo cp deploy/polytape-autogrow.{service,timer} /etc/systemd/system/
+#   sudo cp deploy/autogrow.env.example /etc/polytape/autogrow.env   # then edit AUTOGROW_DISK
+#   sudo systemctl daemon-reload && sudo systemctl enable --now polytape-autogrow.timer
+[Unit]
+Description=Run polytape data-disk auto-grow check every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

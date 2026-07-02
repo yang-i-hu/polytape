@@ -1,0 +1,16 @@
+# Oneshot: grow the data disk + filesystem if /data has crossed the usage
+# threshold (see polytape-autogrow.sh). Driven by the timer. Runs as root —
+# needs gcloud (disk resize), growpart, and resize2fs/xfs_growfs.
+#
+# The instance SERVICE ACCOUNT must be able to resize the disk (IAM
+# compute.disks.resize + a compute-rw/cloud-platform scope) or every run fails
+# at the resize step. See the prerequisites in polytape-autogrow.sh.
+[Unit]
+Description=polytape data-disk auto-grow (resize when /data is full)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/polytape/autogrow.env
+ExecStart=/opt/polytape/polytape-autogrow.sh

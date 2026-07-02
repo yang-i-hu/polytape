@@ -96,7 +96,12 @@ PrivateTmp=true
 # NOTE: clear any stale `systemctl set-property` drop-in under
 # /etc/systemd/system.control/polytape-admin.service.d/ on deploy so this unit value applies
 # (do NOT `systemctl revert` — there is no vendor unit, so revert would delete this file).
-MemoryMax=768M
+# Raised 768M -> 1536M (2026-06-27): per-match / whole-run download builds (filter_run
+# buffers the run scan into per-match writers) were exceeding 768M and getting OOM-killed
+# mid-build — failing downloads AND orphaning scratch that then filled /data. 1536M fits
+# per-match builds; the cgroup cap is KEPT (still well under the 3.8G VM) so a runaway
+# whole-run build still OOM-kills ONLY the admin, never the recorder.
+MemoryMax=1536M
 
 [Install]
 WantedBy=multi-user.target

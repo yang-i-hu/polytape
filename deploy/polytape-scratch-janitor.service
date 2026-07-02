@@ -1,0 +1,11 @@
+# Oneshot: prune orphaned admin download/extract scratch that an OOM-killed build
+# left in POLYTAPE_SCRATCH_DIR (see polytape-scratch-janitor.sh). Driven by the
+# timer. Runs as root — the scratch dir is mode 2770 polytape:polytape, so root is
+# needed to traverse + remove it.
+[Unit]
+Description=polytape admin-scratch janitor (prune orphaned download/extract scratch)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/polytape/autogrow.env
+ExecStart=/opt/polytape/polytape-scratch-janitor.sh

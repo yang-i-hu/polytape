@@ -1,0 +1,15 @@
+# Sweeps orphaned admin scratch hourly (and shortly after boot), so an OOM-killed
+# build's leftover multi-GB dir can never accumulate to ENOSPC on /data. Install:
+#   sudo install -m 0755 deploy/polytape-scratch-janitor.sh /opt/polytape/polytape-scratch-janitor.sh
+#   sudo cp deploy/polytape-scratch-janitor.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now polytape-scratch-janitor.timer
+[Unit]
+Description=Run polytape admin-scratch janitor hourly
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
