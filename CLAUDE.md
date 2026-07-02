@@ -19,7 +19,11 @@ lives in the sibling **PolyQuant** repo. Do not add analysis code here.
 # Architecture
 - `polytape/` — recorder core (`app`, `cli`, `streams`, `supervisor`, `writer`, `envelope`, `gamma`)
 - `polytape/admin/`, `polytape/monitor/`, `polytape/viewer/` — dashboards/UIs over recorded captures
-- `deploy/` — systemd units for the production recorder VM (GCP)
+- `polytape/admin/offload.py` — moves FINISHED matches' per-match native files to a Coldline
+  GCS bucket and deletes them locally (the monolith stays the backstop); the admin serves
+  offloaded matches via a signed-URL 302. `google-cloud-storage` is in the `[admin]` extra
+  (imported lazily). Run: `python -m polytape.admin.offload --list` / (no flag) to offload.
+- `deploy/` — systemd units for the production recorder VM (GCP), incl. `polytape-offload.{service,timer}`
 - `scripts/` — operational helpers (capture validation, demo capture, WC match listing, meta seeding)
 
 # Conventions
@@ -34,3 +38,6 @@ lives in the sibling **PolyQuant** repo. Do not add analysis code here.
 - The recorder resolves an Event ID → markets/token IDs via the public Gamma API.
 - Old captures on disk may still hold a `comments.jsonl` from before comment recording
   was removed (2026-07); readers ignore it and downloads no longer ship it.
+- A `matches/event-<id>.offloaded.json` marker means that match's native files were moved
+  to GCS (local dir deleted). The admin serves it via a signed URL; a multi-select download
+  still works via the monolith scan. Never delete a marker without also removing its GCS object.
