@@ -12,13 +12,14 @@ Tournament/group/outright events (``World Cup Winner``, ``Group A Winner``, ...)
 are *not* matches — their markets carry no ``sportsMarketType``. We keep only
 events that have at least one ``moneyline`` market and emit just those markets.
 
-Read-only and unauthenticated. Pages the whole ``fifa-world-cup`` tag (open and,
-by default, closed too) with a polite delay, de-dupes by event id, and writes a
-JSON file plus a printed summary.
+Read-only and unauthenticated. Pages the whole campaign tag (``--tag``, defaulting
+to ``$POLYTAPE_TAG_SLUG`` then ``fifa-world-cup``; open and, by default, closed
+too) with a polite delay, de-dupes by event id, and writes a JSON file plus a
+printed summary.
 
 Usage::
 
-    python scripts/list_wc_matches.py [--out wc_matches.json] [--open-only]
+    python scripts/list_wc_matches.py [--out wc_matches.json] [--open-only] [--tag TAG]
 """
 
 from __future__ import annotations
@@ -31,8 +32,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from polytape.admin.registry import DEFAULT_TAG_SLUG, resolve_tag_slug, slug_date
+
 GAMMA = "https://gamma-api.polymarket.com"
-TAG_SLUG = "fifa-world-cup"  # tag id 102232 (the 2026 World Cup)
 USER_AGENT = "polytape-wc-discovery (read-only)"
 PAGE = 100
 PAGE_DELAY = 0.25
@@ -66,8 +68,8 @@ def _parse_json_array(raw: object) -> list:
     return raw if isinstance(raw, list) else []
 
 
-def fetch_all_events(closed: bool) -> list[dict]:
-    """Page every event under the FIFA World Cup tag for the given closed state."""
+def fetch_all_events(tag_slug: str, *, closed: bool) -> list[dict]:
+    """Page every event under the campaign tag for the given closed state."""
     out: list[dict] = []
     offset = 0
     while True:
@@ -75,7 +77,7 @@ def fetch_all_events(closed: bool) -> list[dict]:
             _get(
                 "/events",
                 {
-                    "tag_slug": TAG_SLUG,
+                    "tag_slug": tag_slug,
                     "closed": str(closed).lower(),
                     "limit": PAGE,
                     "offset": offset,
@@ -96,16 +98,6 @@ def is_match_event(ev: dict) -> bool:
     return any(m.get("sportsMarketType") == "moneyline" for m in (ev.get("markets") or []))
 
 
-def _slug_date(slug: str | None) -> str | None:
-    """Trailing ``YYYY-MM-DD`` in a ``fifwc-...-2026-06-19`` slug, if present."""
-    if not slug:
-        return None
-    tail = slug.rsplit("-", 3)[-3:]
-    if len(tail) == 3 and tail[0].isdigit() and len(tail[0]) == 4:
-        return "-".join(tail)
-    return None
-
-
 def extract_match(ev: dict) -> dict:
     moneyline = [m for m in (ev.get("markets") or []) if m.get("sportsMarketType") == "moneyline"]
     markets = [
@@ -124,7 +116,7 @@ def extract_match(ev: dict) -> dict:
         "event_id": str(ev.get("id")),
         "title": (ev.get("title") or "").strip(),
         "slug": ev.get("slug"),
-        "match_date": _slug_date(ev.get("slug")),
+        "match_date": slug_date(ev.get("slug")),
         "gameStartTime": ev.get("gameStartTime"),
         "startDate": ev.get("startDate"),
         "endDate": ev.get("endDate"),
@@ -142,12 +134,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--open-only", action="store_true", help="Only open events (skip closed/resolved)"
     )
+    ap.add_argument(
+        "--tag",
+        default=None,
+        help="Gamma tag slug for the campaign "
+        f"(default: $POLYTAPE_TAG_SLUG, else {DEFAULT_TAG_SLUG!r})",
+    )
     args = ap.parse_args(argv)
+    tag = resolve_tag_slug(args.tag)
 
     try:
-        raw = fetch_all_events(closed=False)
+        raw = fetch_all_events(tag, closed=False)
         if not args.open_only:
-            raw += fetch_all_events(closed=True)
+            raw += fetch_all_events(tag, closed=True)
     except urllib.error.URLError as exc:
         print(f"error fetching from Gamma: {exc}", file=sys.stderr)
         return 1
@@ -166,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     n_open = sum(1 for m in matches if not m["closed"])
     n_closed = len(matches) - n_open
     n_markets = sum(len(m["moneyline_markets"]) for m in matches)
-    print(f"FIFA World Cup match events (win/tie/lose): {len(matches)}")
+    print(f"match events (win/tie/lose) under tag '{tag}': {len(matches)}")
     print(f"  open/upcoming: {n_open}   closed/resolved: {n_closed}")
     print(f"  moneyline markets total: {n_markets}   -> {args.out}")
     print()

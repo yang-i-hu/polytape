@@ -28,16 +28,6 @@ from polytape.envelope import iso_to_datetime, utc_now_iso
 logger = logging.getLogger("polytape.admin.reader")
 
 
-def _slug_date(slug: str | None) -> str | None:
-    """Trailing ``YYYY-MM-DD`` in a ``fifwc-...-2026-06-19`` slug, if present."""
-    if not slug:
-        return None
-    tail = slug.rsplit("-", 3)[-3:]
-    if len(tail) == 3 and tail[0].isdigit() and len(tail[0]) == 4:
-        return "-".join(tail)
-    return None
-
-
 class RunReader:
     """Metadata-driven, read-only view of one run directory (e.g. ``/data/run-wc``)."""
 
@@ -137,7 +127,7 @@ class RunReader:
             eid = str(event.get("id"))
             ids.append(eid)
             title[eid] = (event.get("title") or "").strip()
-            date[eid] = _slug_date(event.get("slug"))
+            date[eid] = _reg.slug_date(event.get("slug"))
             conds: list[str] = []
             for market in event.get("markets") or []:
                 cond = market.get("conditionId")
@@ -346,7 +336,7 @@ class RunReader:
                         "event_id": eid,
                         "title": (ev.get("title") or "").strip() or eid,
                         "slug": ev.get("slug"),
-                        "date": _slug_date(ev.get("slug")),
+                        "date": _reg.slug_date(ev.get("slug")),
                         "closed": False,
                         "markets": [
                             {

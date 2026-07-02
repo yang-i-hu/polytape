@@ -1,4 +1,4 @@
-"""Cumulative run registry: every World Cup match (finished + open) of the run.
+"""Cumulative run registry: every campaign match (finished + open) of the run.
 
 The recorder overwrites ``meta.json`` to the CURRENT open set on each restart, so
 a finished match's *identity* (id / title / conditionIds) is lost from
@@ -34,12 +34,33 @@ from typing import Any
 logger = logging.getLogger("polytape.admin.registry")
 
 _GAMMA = "https://gamma-api.polymarket.com"
-_TAG_SLUG = "fifa-world-cup"  # the 2026 World Cup tag (mirrors scripts/list_wc_matches.py)
+DEFAULT_TAG_SLUG = "fifa-world-cup"  # the 2026 World Cup tag (the campaign this run records)
 _USER_AGENT = "polytape-admin-registry (read-only)"
 _PAGE = 100
 _PAGE_DELAY = 0.25
 _TIMEOUT = 40.0
 REGISTRY_SCHEMA = 1
+
+
+def resolve_tag_slug(tag_slug: str | None = None) -> str:
+    """The campaign's Gamma tag: explicit value, else ``POLYTAPE_TAG_SLUG``, else the
+    World Cup default — the single resolution point (``scripts/list_wc_matches.py``
+    and the admin CLI both defer here), so the next campaign is a config change."""
+    return tag_slug or os.environ.get("POLYTAPE_TAG_SLUG") or DEFAULT_TAG_SLUG
+
+
+def slug_date(slug: str | None) -> str | None:
+    """Trailing ``YYYY-MM-DD`` of a ``fifwc-...-2026-06-19``-style slug, if present.
+
+    The one shared copy of the slug-date heuristic (the reader and
+    ``scripts/list_wc_matches.py`` import it from here).
+    """
+    if not slug:
+        return None
+    tail = slug.rsplit("-", 3)[-3:]
+    if len(tail) == 3 and tail[0].isdigit() and len(tail[0]) == 4:
+        return "-".join(tail)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -75,16 +96,6 @@ def _parse_json_array(raw: Any) -> list:
     return raw if isinstance(raw, list) else []
 
 
-def _slug_date(slug: str | None) -> str | None:
-    """Trailing ``YYYY-MM-DD`` of a ``fifwc-...-2026-06-19`` slug, if present."""
-    if not slug:
-        return None
-    tail = slug.rsplit("-", 3)[-3:]
-    if len(tail) == 3 and tail[0].isdigit() and len(tail[0]) == 4:
-        return "-".join(tail)
-    return None
-
-
 def _is_match_event(ev: dict) -> bool:
     return any(m.get("sportsMarketType") == "moneyline" for m in (ev.get("markets") or []))
 
@@ -104,13 +115,13 @@ def _event_to_entry(ev: dict) -> dict:
         "event_id": str(ev.get("id")),
         "title": (ev.get("title") or "").strip(),
         "slug": slug,
-        "date": _slug_date(slug),
+        "date": slug_date(slug),
         "closed": bool(ev.get("closed")),
         "markets": markets,
     }
 
 
-def _fetch_state(closed: bool) -> list[dict]:
+def _fetch_state(tag_slug: str, *, closed: bool) -> list[dict]:
     out: list[dict] = []
     offset = 0
     while True:
@@ -118,7 +129,7 @@ def _fetch_state(closed: bool) -> list[dict]:
             _get(
                 "/events",
                 {
-                    "tag_slug": _TAG_SLUG,
+                    "tag_slug": tag_slug,
                     "closed": str(closed).lower(),
                     "limit": _PAGE,
                     "offset": offset,
@@ -135,13 +146,15 @@ def _fetch_state(closed: bool) -> list[dict]:
     return out
 
 
-def fetch_registry() -> list[dict]:
+def fetch_registry(tag_slug: str | None = None) -> list[dict]:
     """Discover every run match (open + closed) from Gamma — synchronous; off-loop only.
 
+    ``tag_slug`` resolves via :func:`resolve_tag_slug` (explicit → env → default).
     Returns a list of registry entries. Raises on a hard network error; the caller
     suppresses it and keeps the last good persisted registry.
     """
-    raw = _fetch_state(closed=False) + _fetch_state(closed=True)
+    tag = resolve_tag_slug(tag_slug)
+    raw = _fetch_state(tag, closed=False) + _fetch_state(tag, closed=True)
     by_id: dict[str, dict] = {}
     for ev in raw:
         if _is_match_event(ev):

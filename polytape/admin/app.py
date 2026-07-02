@@ -85,6 +85,7 @@ def create_app(
     admin_token: str | None = None,
     registry_file: str | Path | None = None,
     registry_refresh_s: float = 600.0,
+    tag_slug: str | None = None,
     extract_dir: str | Path | None = None,
     extract_refresh_s: float = 600.0,
     scratch_dir: str | Path | None = None,
@@ -101,7 +102,8 @@ def create_app(
     shared secret. With it unset the control endpoints return 503 and the recorder
     cannot be touched from the dashboard at all. ``broker``/``audit``/``sessions``/
     ``rate_limiter`` are injectable so the control plane is tested with no real
-    ``systemctl`` or privileged filesystem.
+    ``systemctl`` or privileged filesystem. ``tag_slug`` is the campaign's Gamma tag
+    for registry discovery; ``None`` defers to ``POLYTAPE_TAG_SLUG`` / the default.
     """
     from contextlib import asynccontextmanager
 
@@ -154,7 +156,7 @@ def create_app(
             # so a slow Gamma can never stall reader.update().
             while True:
                 try:
-                    events = await asyncio.to_thread(reg.fetch_registry)
+                    events = await asyncio.to_thread(reg.fetch_registry, tag_slug)
                     if events:
                         await asyncio.to_thread(
                             reg.write_registry_atomic, registry_file, events, now_iso=utc_now_iso()
@@ -590,6 +592,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Cumulative run registry (all matches, finished + open); refreshed from Gamma.",
     )
     parser.add_argument(
+        "--tag-slug",
+        default=None,
+        help="Gamma tag the registry discovers the campaign's events under "
+        f"(default: $POLYTAPE_TAG_SLUG, else {reg.DEFAULT_TAG_SLUG!r}).",
+    )
+    parser.add_argument(
         "--extract-dir",
         default=os.environ.get("POLYTAPE_EXTRACT_DIR"),
         help="Dir for pre-built per-match download archives (finished matches). "
@@ -628,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
             reader,
             admin_token=admin_token,
             registry_file=args.registry_file,
+            tag_slug=args.tag_slug,
             extract_dir=args.extract_dir,
             scratch_dir=args.scratch_dir,
         ),

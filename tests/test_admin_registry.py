@@ -120,6 +120,33 @@ def _reader(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def test_slug_date_parses_trailing_date():
+    assert reg.slug_date("fifwc-mex-pol-2026-06-19") == "2026-06-19"
+    assert reg.slug_date("world-cup-winner") is None  # no trailing date
+    assert reg.slug_date("a-06-19") is None  # year must be 4 digits
+    assert reg.slug_date(None) is None
+    assert reg.slug_date("") is None
+
+
+def test_fetch_registry_tag_explicit_env_default(monkeypatch):
+    """Campaign tag resolution: explicit arg > POLYTAPE_TAG_SLUG > World Cup default."""
+    seen: list[str] = []
+
+    def fake_get(path, params):
+        seen.append(params["tag_slug"])
+        return []  # empty page -> no paging, no sleep
+
+    monkeypatch.setattr(reg, "_get", fake_get)
+    monkeypatch.delenv("POLYTAPE_TAG_SLUG", raising=False)
+    reg.fetch_registry()
+    assert seen[-1] == "fifa-world-cup"  # default untouched -> live WC deploy unaffected
+    monkeypatch.setenv("POLYTAPE_TAG_SLUG", "premier-league")
+    reg.fetch_registry()
+    assert seen[-1] == "premier-league"
+    reg.fetch_registry("copa-america")
+    assert seen[-1] == "copa-america"  # explicit beats env
+
+
 def test_cond_collision_keeps_first_claim():
     evs = [
         {

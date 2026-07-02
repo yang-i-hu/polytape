@@ -45,6 +45,9 @@ SupplementaryGroups=polytape
 Environment=PYTHONUNBUFFERED=1
 Environment=POLYTAPE_RUN_DIR=/data/run-wc
 Environment=POLYTAPE_UNIT=polytape
+# Gamma tag the run registry discovers the campaign's events under. Unset defaults to
+# fifa-world-cup — set this (with POLYTAPE_RUN_DIR) when the next campaign starts.
+#Environment=POLYTAPE_TAG_SLUG=fifa-world-cup
 # Read heartbeat-armed state from the salt-free heartbeat.env, NOT polytape.env.
 Environment=POLYTAPE_ENV_FILE=/etc/polytape/heartbeat.env
 Environment=POLYTAPE_INTENT_DIR=/run/polytape-admin/intent

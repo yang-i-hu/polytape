@@ -240,3 +240,37 @@ def test_app_endpoints_status_matches_only(tmp_path):
         assert {m["event_id"] for m in ms} == {"1001", "1002"}
         assert c.get("/api/live").status_code == 404  # live feed removed
         assert c.get("/api/matches/1001").status_code == 404  # order-book preview removed
+
+
+def test_registry_loop_fetches_configured_tag(tmp_path, monkeypatch):
+    # The campaign tag flows create_app(tag_slug=...) -> fetch_registry, so the next
+    # campaign needs config, not code. Gamma is faked; the loop runs once at startup.
+    pytest.importorskip("fastapi")
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from polytape.admin import registry as reg
+    from polytape.admin.app import create_app
+
+    seen: list[str | None] = []
+    fetched = threading.Event()
+
+    def fake_fetch(tag_slug=None):
+        seen.append(tag_slug)
+        fetched.set()
+        return []  # empty fetch -> never overwrites a registry file
+
+    monkeypatch.setattr(reg, "fetch_registry", fake_fetch)
+    reader = _reader(tmp_path, _meta())
+    app = create_app(
+        reader,
+        poll_interval=3600,
+        registry_file=tmp_path / "registry.json",
+        registry_refresh_s=3600,
+        tag_slug="next-campaign",
+        extract_refresh_s=0,
+    )
+    with TestClient(app):
+        assert fetched.wait(timeout=5), "registry loop never fetched"
+    assert seen[0] == "next-campaign"
