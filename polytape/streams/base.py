@@ -2,9 +2,9 @@
 
 A :class:`WebSocketStream` models a *single* connection session: connect,
 subscribe, keep the socket alive with an application-level text ping, and pipe
-every received message into the writer. Reconnection and backfill are layered on
-top by the supervisor (see ``polytape/supervisor.py``); a stream object here only
-knows how to run one session via :meth:`run_once`.
+every received message into the writer. Reconnection is layered on top by the
+supervisor (see ``polytape/supervisor.py``); a stream object here only knows how
+to run one session via :meth:`run_once`.
 
 The ``connect`` factory is injectable so the consume loop can be exercised
 offline with a fake connection (no network).
@@ -97,11 +97,7 @@ class WebSocketStream:
         raise NotImplementedError
 
     def should_record(self, raw: dict[str, Any]) -> bool:
-        """Whether a decoded message belongs to this capture.
-
-        Default accepts everything; the comment stream overrides this to filter
-        the firehose down to its event (server-side filtering is unavailable).
-        """
+        """Whether a decoded message belongs to this capture. Default accepts everything."""
         return True
 
     def on_written(self, raw: dict[str, Any]) -> None:
@@ -110,9 +106,8 @@ class WebSocketStream:
     def resolve_event_id(self, raw: dict[str, Any]) -> str | None:
         """Return the event id a message belongs to, for per-event accounting.
 
-        Default ``None`` (single-event / untagged). The comment stream returns the
-        ``parentEntityID`` (or a reaction's resolved event); the book stream maps
-        the top-level ``market`` (condition id) to its event.
+        Default ``None`` (single-event / untagged). The book stream maps the
+        top-level ``market`` (condition id) to its event.
         """
         return None
 
@@ -160,7 +155,7 @@ class WebSocketStream:
         Args:
             on_connect: Optional async callback run right after subscribing (the
                 keepalive is already active). The supervisor uses it to reset
-                backoff and to backfill missed comments on reconnect.
+                backoff and record the gap on reconnect.
 
         Raises:
             Propagates connection errors (e.g. ``websockets.ConnectionClosedError``)

@@ -1,7 +1,7 @@
 """CLOB order-book stream consumer.
 
 Connects to Polymarket's CLOB market channel and records order-book activity for
-a set of CLOB token ids. See ``PROTOCOL.md`` §2 for the verified subscribe frame,
+a set of CLOB token ids. See ``PROTOCOL.md`` §1 for the verified subscribe frame,
 keepalive, and message shapes.
 
 Message types delivered on this channel (all recorded verbatim, type preserved
@@ -33,7 +33,7 @@ CLOB_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 # Application-level keepalive: the CLOB market channel expects the literal
 # uppercase text "PING"; the server drops idle connections after ~10s, so 5s is
-# comfortably within the window (PROTOCOL.md §2.3).
+# comfortably within the window (PROTOCOL.md §1.3).
 _PING_TEXT = "PING"
 _PING_INTERVAL = 5.0
 

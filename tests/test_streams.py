@@ -10,32 +10,7 @@ import pytest
 from polytape.gamma import EventInfo, Market, cond_to_event
 from polytape.streams.base import StreamInactivityError, WebSocketStream
 from polytape.streams.clob import BookStream, book_subscribe_frame, shard_tokens
-from polytape.streams.rtds import CommentStream, comment_subscribe_frame
 from polytape.writer import CaptureWriter
-
-
-def test_comment_subscribe_frame_is_unfiltered_firehose():
-    # Server-side filtering returns nothing live, so we subscribe to the firehose.
-    frame = json.loads(comment_subscribe_frame())
-    assert frame["action"] == "subscribe"
-    sub = frame["subscriptions"][0]
-    assert sub["topic"] == "comments" and sub["type"] == "*"
-    assert "filters" not in sub
-
-
-def test_comment_should_record_filters_by_event():
-    cs = CommentStream(event_id="20200", writer=None)
-    assert cs.should_record(
-        {"type": "comment_created", "payload": {"id": "x", "parentEntityID": 20200}}
-    )
-    assert not cs.should_record(
-        {"type": "comment_created", "payload": {"id": "y", "parentEntityID": 999}}
-    )
-    # reaction only attributed once its parent comment has been seen
-    reaction = {"type": "reaction_created", "payload": {"id": "r", "commentID": "x"}}
-    assert not cs.should_record(reaction)
-    cs._comment_to_event["x"] = "20200"  # parent comment now seen this session
-    assert cs.should_record(reaction)
 
 
 def test_book_subscribe_frame():
@@ -55,36 +30,8 @@ def test_decode_variants():
     assert s.decode("42") == []  # scalar
 
 
-async def test_comment_stream_dedup_and_cursor(make_config, make_connect):
-    cfg = make_config(book=False)
-
-    def c(cid):
-        return {
-            "type": "comment_created",
-            "payload": {"id": cid, "parentEntityID": 20200, "userAddress": "0xa"},
-        }
-
-    # reaction to c1 (seen before it arrives) plus one to an unseen comment (dropped)
-    react = {"type": "reaction_created", "payload": {"id": "r1", "commentID": "c1"}}
-    other_event = {"type": "comment_created", "payload": {"id": "z1", "parentEntityID": 999}}
-    frames = [
-        json.dumps(c("c1")),
-        json.dumps(react),
-        json.dumps(other_event),  # different event -> filtered out client-side
-        json.dumps([c("c2"), c("c3")]),
-        json.dumps(c("c1")),  # dup
-    ]
-    connect = make_connect(frames)
-    with CaptureWriter(cfg) as w:
-        cs = CommentStream(event_id="20200", writer=w, connect=connect)
-        await cs.run_once()
-        assert w.counts["comments"] == 4  # c1, r1, c2, c3 (other-event + dup c1 skipped)
-        assert cs.last_comment_id == "c3"  # reaction ignored for the cursor
-    assert connect.ws.sent == [comment_subscribe_frame()]
-
-
 async def test_book_stream_ids(make_config, make_connect):
-    cfg = make_config(comments=False)
+    cfg = make_config()
     book = {"event_type": "book", "asset_id": "t1", "hash": "0xH", "timestamp": "1700000000000"}
     pc = {
         "event_type": "price_change",
@@ -106,25 +53,25 @@ def test_book_stream_empty_tokens_no_frame():
 async def test_watchdog_raises_on_inactivity(make_config, make_connect):
     # Socket open but no frame ever arrives (a silent freeze / migration blackout):
     # the read deadline must fire so the supervisor reconnects and records a gap.
-    cfg = make_config(book=False)
+    cfg = make_config()
     connect = make_connect([], blocking=True)
     with CaptureWriter(cfg) as w:
-        cs = CommentStream(event_id="20200", writer=w, connect=connect)
-        cs.read_timeout = 0.05
+        bs = BookStream(token_ids=["t1"], writer=w, connect=connect)
+        bs.read_timeout = 0.05
         with pytest.raises(StreamInactivityError):
-            await asyncio.wait_for(cs.run_once(), timeout=2.0)
+            await asyncio.wait_for(bs.run_once(), timeout=2.0)
 
 
 async def test_watchdog_does_not_trip_while_data_flows(make_config, make_connect):
     # A frame within the deadline must not trip the watchdog; a clean close returns.
-    cfg = make_config(book=False)
-    c = {"type": "comment_created", "payload": {"id": "c1", "parentEntityID": 20200}}
-    connect = make_connect([json.dumps(c)])
+    cfg = make_config()
+    book = {"event_type": "book", "asset_id": "t1", "hash": "0xH", "timestamp": "1700000000000"}
+    connect = make_connect([json.dumps(book)])
     with CaptureWriter(cfg) as w:
-        cs = CommentStream(event_id="20200", writer=w, connect=connect)
-        cs.read_timeout = 0.5
-        await asyncio.wait_for(cs.run_once(), timeout=2.0)
-        assert w.counts["comments"] == 1
+        bs = BookStream(token_ids=["t1"], writer=w, connect=connect)
+        bs.read_timeout = 0.5
+        await asyncio.wait_for(bs.run_once(), timeout=2.0)
+        assert w.counts["book"] == 1
 
 
 # -- multi-event (Phase 3) ------------------------------------------------- #
@@ -170,39 +117,6 @@ def test_book_stream_single_event_accepts_all():
     bs = BookStream(token_ids=["t"], writer=None)  # no routing map (single-event back-compat)
     assert bs.should_record({"market": "anything"}) is True
     assert bs.resolve_event_id({"market": "anything"}) is None
-
-
-def test_comment_stream_multi_event_routing():
-    cs = CommentStream(event_ids={"1001", "1002"}, writer=None)
-    a = {"type": "comment_created", "payload": {"id": "ca", "parentEntityID": 1001}}
-    b = {"type": "comment_created", "payload": {"id": "cb", "parentEntityID": 1002}}
-    other = {"type": "comment_created", "payload": {"id": "cx", "parentEntityID": 9999}}
-    assert cs.should_record(a) and cs.should_record(b) and not cs.should_record(other)
-    assert cs.resolve_event_id(a) == "1001" and cs.resolve_event_id(b) == "1002"
-    cs.on_written(a)
-    cs.on_written(b)
-    assert cs.last_comment_id_for("1001") == "ca" and cs.last_comment_id_for("1002") == "cb"
-    assert cs.last_comment_id is None  # ambiguous for a multi-event stream
-    react = {"type": "reaction_created", "payload": {"id": "r", "commentID": "ca"}}
-    assert cs.should_record(react) and cs.resolve_event_id(react) == "1001"
-
-
-def test_comment_stream_records_series_parented_comments():
-    # World Cup case: every match comment is parented to the Series (11433), not the
-    # event. The firehose filter must accept the series id, or 100% of comments drop.
-    cs = CommentStream(event_ids={"351771", "351765"}, series_ids={"11433"}, writer=None)
-    series_comment = {"type": "comment_created", "payload": {"id": "s1", "parentEntityID": 11433}}
-    event_comment = {"type": "comment_created", "payload": {"id": "e1", "parentEntityID": 351771}}
-    foreign = {"type": "comment_created", "payload": {"id": "x1", "parentEntityID": 99999}}
-    assert cs.should_record(series_comment)  # series-parented -> kept
-    assert cs.should_record(event_comment)  # event-parented -> kept
-    assert not cs.should_record(foreign)  # unrelated parent -> dropped
-    assert cs.resolve_event_id(series_comment) == "11433"
-    # The series cursor advances and seeds reaction attribution to the series.
-    cs.on_written(series_comment)
-    assert cs.last_comment_id_for("11433") == "s1"
-    react = {"type": "reaction_created", "payload": {"id": "r1", "commentID": "s1"}}
-    assert cs.should_record(react) and cs.resolve_event_id(react) == "11433"
 
 
 def test_cond_to_event_maps_condition_ids():

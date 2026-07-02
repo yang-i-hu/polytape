@@ -53,7 +53,7 @@ class RunReader:
         self._lock = threading.RLock()
         # All of the following are refreshed from meta.json on each update() — meta is the
         # authoritative, cumulative source the recorder maintains.
-        self._counts: dict[str, int] = {"comments": 0, "book": 0}
+        self._counts: dict[str, int] = {"book": 0}
         self._by_event: dict[str, dict[str, int]] = {}
         self._last_ts: dict[str, str] = {}  # event id -> last record ts_recv
         self._last_record_at: str | None = None  # overall last record ts_recv
@@ -97,7 +97,7 @@ class RunReader:
         )
         # Counts straight from the recorder's cumulative accounting.
         counts = meta.get("counts")
-        merged = {"comments": 0, "book": 0}
+        merged = {"book": 0}
         if isinstance(counts, dict):
             merged.update({str(s): n for s, n in counts.items() if isinstance(n, int) and n >= 0})
         self._counts = merged
@@ -178,8 +178,7 @@ class RunReader:
             for eid in self._registry.order:
                 if eid in open_set:
                     continue
-                counts = self._by_event.get(eid, {})
-                if counts.get("book") or counts.get("comments"):
+                if self._by_event.get(eid, {}).get("book"):
                     out.append(eid)
             return out
 
@@ -299,7 +298,7 @@ class RunReader:
                         "status": status,
                         "open": eid in open_set,
                         # On disk and selectable — data was actually recorded for it.
-                        "downloadable": bool(counts.get("book") or counts.get("comments")),
+                        "downloadable": bool(counts.get("book")),
                     }
                 )
             # STABLE schedule order: by date (undated last), then event_id. No recency.

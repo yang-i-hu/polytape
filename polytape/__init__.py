@@ -1,4 +1,4 @@
-"""polytape — record Polymarket's public real-time comment and order-book feeds.
+"""polytape — record Polymarket's public real-time order-book feed.
 
 A passive, read-only recorder. It never authenticates, never trades, and talks
 only to public Polymarket endpoints. See ``README.md`` for the user-facing

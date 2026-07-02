@@ -14,7 +14,6 @@ from importlib import resources
 
 import pytest
 
-from polytape.envelope import utc_now_iso
 from polytape.monitor.reader import CaptureMonitor, _delay_ms, _percentile, _StreamTail
 from polytape.monitor.server import make_server
 from polytape.writer import CaptureWriter
@@ -56,20 +55,18 @@ def _book_line(i: int) -> str:
 
 
 def test_exact_count_on_attach_and_incremental_tail(make_config):
-    cfg = make_config()  # comments + book under tmp_path/event-20200
+    cfg = make_config()  # book under tmp_path/event-20200
     w = CaptureWriter(cfg)
     w.open()
     try:
         w.write("book", {"event_type": "book", "hash": "h1", "timestamp": "1700000000000"})
         w.write("book", {"event_type": "price_change", "timestamp": "1700000000500"})
-        w.write("comments", {"payload": {"id": "c1", "createdAt": "2026-01-01T00:00:00Z"}})
 
         mon = CaptureMonitor(cfg.out_dir)
         snap = mon.snapshot()  # first poll: attach counts existing lines exactly
         assert snap["selected_event"] == "20200"
         assert snap["streams"]["book"]["count"] == 2
-        assert snap["streams"]["comments"]["count"] == 1
-        assert snap["totals"]["count"] == 3
+        assert snap["totals"]["count"] == 2
         assert snap["recent"] == []  # attach does not replay history
 
         # Append after attach -> shows up as counted + in the recent ticker.
@@ -91,7 +88,7 @@ def test_exact_count_on_attach_and_incremental_tail(make_config):
 
 
 def test_type_mix_and_delay(make_config):
-    cfg = make_config(comments=False)
+    cfg = make_config()
     w = CaptureWriter(cfg)
     w.open()
     try:
@@ -203,30 +200,24 @@ def test_attach_does_not_double_count_lines_appended_during_scan(tmp_path):
     assert tail.count == 4  # 4th line counted exactly once (was 5 before the fix)
 
 
-def test_historical_backfill_delay_excluded_from_percentiles(make_config):
-    """Backfilled comments (old createdAt) must not pollute the live delay window."""
-    cfg = make_config(book=False)
+def test_stale_server_ts_excluded_from_percentiles(make_config):
+    """A wildly stale ts_server must not pollute the live delay window."""
+    cfg = make_config()
     w = CaptureWriter(cfg)
     w.open()
     try:
         mon = CaptureMonitor(cfg.out_dir)
         mon.snapshot()  # attach
-        # A live comment (createdAt ~now) and a historical/backfilled one (year 2000).
+        # A live record (server time ~now) and a historical one (year 2000).
         w.write(
-            "comments",
-            {"type": "comment_created", "payload": {"id": "live", "createdAt": utc_now_iso()}},
+            "book",
+            {"event_type": "book", "hash": "live", "timestamp": str(int(time.time() * 1000))},
         )
-        w.write(
-            "comments",
-            {
-                "type": "comment_created",
-                "payload": {"id": "old", "createdAt": "2000-01-01T00:00:00Z"},
-            },
-        )
-        c = mon.snapshot()["streams"]["comments"]
-        assert c["count"] == 2  # both recorded
-        assert c["with_server_ts"] == 2  # both had a server timestamp
-        assert c["delay_ms"]["n"] == 1  # but only the live one is in the percentile window
+        w.write("book", {"event_type": "book", "hash": "old", "timestamp": "946684800000"})
+        b = mon.snapshot()["streams"]["book"]
+        assert b["count"] == 2  # both recorded
+        assert b["with_server_ts"] == 2  # both had a server timestamp
+        assert b["delay_ms"]["n"] == 1  # but only the live one is in the percentile window
     finally:
         w.close()
 
@@ -252,7 +243,7 @@ def test_status_no_data_when_empty(tmp_path):
 
 
 def test_status_live_then_stopped(make_config):
-    cfg = make_config(comments=False)
+    cfg = make_config()
     w = CaptureWriter(cfg)
     w.open()
     w.write("book", {"event_type": "book", "hash": "h", "timestamp": "1700000000000"})
@@ -265,7 +256,7 @@ def test_status_live_then_stopped(make_config):
 
 
 def test_idle_when_last_message_is_stale(make_config):
-    cfg = make_config(comments=False)
+    cfg = make_config()
     w = CaptureWriter(cfg)
     w.open()
     w.write("book", {"event_type": "book", "hash": "h", "timestamp": "1700000000000"})
@@ -279,7 +270,7 @@ def test_idle_when_last_message_is_stale(make_config):
 
 def test_discovery_multiple_events_and_picker(make_config, tmp_path):
     for eid in ("1", "2"):
-        cfg = make_config(event_id=eid, comments=False)
+        cfg = make_config(event_id=eid)
         with CaptureWriter(cfg) as w:
             w.write("book", {"event_type": "book", "hash": "h", "timestamp": "1700000000000"})
     mon = CaptureMonitor(tmp_path)
@@ -291,7 +282,7 @@ def test_discovery_multiple_events_and_picker(make_config, tmp_path):
 
 
 def test_single_event_dir_as_root(make_config):
-    cfg = make_config(comments=False)
+    cfg = make_config()
     with CaptureWriter(cfg) as w:
         w.write("book", {"event_type": "book", "hash": "h", "timestamp": "1700000000000"})
     mon = CaptureMonitor(cfg.event_dir)  # point directly at event-<id>
@@ -300,29 +291,26 @@ def test_single_event_dir_as_root(make_config):
     assert snap["streams"]["book"]["count"] == 1
 
 
-def test_no_pii_in_snapshot(make_config):
-    """Recent ticker and stats must never carry payload content / identifiers."""
-    cfg = make_config(book=False, hash_usernames=False)
-    w = CaptureWriter(cfg, hasher=None)
+def test_no_payload_content_in_snapshot(make_config):
+    """Recent ticker and stats must never carry payload content."""
+    cfg = make_config()
+    w = CaptureWriter(cfg)
     w.open()
     mon = CaptureMonitor(cfg.out_dir)
     mon.snapshot()
     w.write(
-        "comments",
+        "book",
         {
-            "type": "comment_created",
-            "payload": {
-                "id": "c1",
-                "createdAt": "2026-01-01T00:00:00Z",
-                "userAddress": "0xSECRET",
-                "body": "secret text",
-            },
+            "event_type": "book",
+            "hash": "h1",
+            "timestamp": "1700000000000",
+            "bids": [{"price": "0.123456", "size": "999777"}],
         },
     )
     snap = mon.snapshot()
     blob = json.dumps(snap)
-    assert "0xSECRET" not in blob and "secret text" not in blob
-    assert snap["recent"][0]["type"] == "comment_created"
+    assert "0.123456" not in blob and "999777" not in blob
+    assert snap["recent"][0]["type"] == "book"
     w.close()
 
 
@@ -333,7 +321,7 @@ def test_no_pii_in_snapshot(make_config):
 
 @pytest.fixture
 def running_server(make_config):
-    cfg = make_config(comments=False)
+    cfg = make_config()
     with CaptureWriter(cfg) as w:
         w.write("book", {"event_type": "book", "hash": "h", "timestamp": "1700000000000"})
     mon = CaptureMonitor(cfg.out_dir)

@@ -18,7 +18,6 @@
     --blue: #58a6ff;
     --grey: #6e7b8f;
     --red: #f85149;
-    --comments: #58a6ff;
     --book: #3fb950;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -96,15 +95,11 @@
   th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
   td.mono, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .empty { color: var(--dim); padding: 10px; font-size: 13px; }
-  .empty.hint { color: var(--muted); line-height: 1.55; border-left: 2px solid var(--blue);
-    padding: 10px 12px; background: rgba(80,140,220,.06); border-radius: 0 6px 6px 0; }
-  .empty.hint b { color: var(--txt); }
 
   .ticker { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; max-height: 240px; overflow: auto; }
   .ticker .item { display: grid; grid-template-columns: 64px 1fr auto auto; gap: 12px; padding: 7px 14px; border-bottom: 1px solid var(--line); font-size: 12.5px; align-items: center; }
   .ticker .item:last-child { border-bottom: 0; }
   .tag { font-size: 10.5px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); }
-  .tag.comments { color: var(--comments); border-color: #1d3a5c; }
   .tag.book { color: var(--book); border-color: #1c3a24; }
   .ticker .type { color: var(--txt); } .ticker .delay, .ticker .ago { color: var(--muted); font-family: var(--mono); }
 
@@ -177,10 +172,6 @@
   .rel-row .rtitle { color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rel-row .rid { font-family: var(--mono); color: var(--dim); font-size: 11px; }
   .rel-row .spacer { flex: 1; }
-  #activechat .rel-row { flex-wrap: wrap; }
-  .rel-row .chat-count { font-family: var(--mono); color: var(--dim); font-size: 11px; white-space: nowrap; }
-  .rel-row .chat-sample { flex-basis: 100%; color: var(--muted); font-size: 11.5px; font-style: italic;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 2px; }
 
   .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
   .toast { background: var(--panel-2); border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px;
@@ -217,16 +208,11 @@
       </div>
       <span class="field"><label for="in-eventid">event</label><input type="text" id="in-eventid" style="width:280px" placeholder="id, slug, or paste a polymarket.com URL" /></span>
       <button class="btn ghost sm" id="relatedbtn" title="List the other events in this one's series (e.g. all matches in the tournament)">Find related ↦</button>
-      <button class="btn ghost sm" id="activechatbtn" title="Sample the live comment feed and list the events with the busiest chat right now">⚡ Live chat now</button>
-      <label class="check" id="f-comments"><input type="checkbox" id="in-comments" checked /> comments</label>
-      <label class="check" id="f-book"><input type="checkbox" id="in-book" checked /> book</label>
-      <label class="check" id="f-hash"><input type="checkbox" id="in-hash" checked /> hash usernames</label>
       <span class="field" id="f-rate" style="display:none"><label for="in-rate">rate /s</label><input type="number" id="in-rate" value="8" min="1" max="200" /></span>
       <label class="check" id="f-newtab" title="Open the new recording in its own browser tab/session"><input type="checkbox" id="in-newtab" checked /> open in new tab</label>
       <button class="btn primary" id="startbtn">Start recording</button>
     </div>
     <div class="related" id="related" style="display:none"></div>
-    <div class="related" id="activechat" style="display:none"></div>
   </section>
 
   <section class="recorder" id="events" style="display:none">
@@ -245,9 +231,9 @@
     <div class="grid2" id="cards"></div>
 
     <section class="block">
-      <h3>Disconnects &amp; backfill</h3>
+      <h3>Disconnects</h3>
       <div class="card" style="padding:0;overflow:auto">
-        <table id="gaps"><thead><tr><th>Stream</th><th>Down at</th><th>Back at</th><th class="mono">Downtime</th><th class="mono">Backfilled</th><th>Note</th></tr></thead><tbody></tbody></table>
+        <table id="gaps"><thead><tr><th>Stream</th><th>Down at</th><th>Back at</th><th class="mono">Downtime</th><th>Note</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 
@@ -282,7 +268,7 @@
 "use strict";
 const POLL_MS = 1000;
 const $ = (id) => document.getElementById(id);
-const COLORS = { comments: getCss("--comments"), book: getCss("--book") };
+const COLORS = { book: getCss("--book") };
 function getCss(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || "#58a6ff"; }
 
 let selectedEvent = new URLSearchParams(location.search).get("event") || null;
@@ -336,13 +322,7 @@ function streamCard(name, s) {
     <div class="bar"><span class="lbl" title="${esc(k)}">${esc(k)}</span>
       <span class="track"><span class="fill" style="width:${(v/total*100).toFixed(1)}%;background:${color}"></span></span>
       <span class="n">${fmt(v)}</span></div>`).join("");
-  // Comments are bursty + far sparser than trades, so a 0 here is usually "nobody
-  // typed yet", not a fault. Explain it (sports/market chat usually lives on the
-  // parent SERIES, which every event capture records automatically).
-  const emptyMsg = name === "comments"
-    ? `<div class="empty hint">No chat on this event <i>yet</i> — it appears here live the moment someone posts. Comments are far sparser than trades (which is why <b>book</b> can race ahead while this stays at 0).<br><br>Sports &amp; market chat usually lives on the parent <b>series</b>, and that chat is recorded automatically with every event capture. Hit <b>⚡ Live chat now</b> to jump to an event that's actively chatting.</div>`
-    : `<div class="empty">no messages yet</div>`;
-  const mix = bars || emptyMsg;
+  const mix = bars || `<div class="empty">no messages yet</div>`;
   return `
   <div class="card">
     <h2><span class="swatch" style="background:${color}"></span>${esc(name)}</h2>
@@ -376,15 +356,10 @@ function render(d) {
   // title + meta line
   const m = d.meta || {};
   $("title").textContent = m.title || m.slug || ("event " + (d.selected_event || "?"));
-  const hashing = m.hashing || {};
-  const hashBadge = hashing.enabled === false
-    ? `<span class="badge off" title="usernames written verbatim">hashing off</span>`
-    : `<span class="badge on" title="identifiers salted+hashed">hashing on</span>`;
   $("metaline").innerHTML = [
     `event <b>${esc(d.selected_event || "?")}</b>`,
     m.slug ? `<span>${esc(m.slug)}</span>` : "",
     `<span>streams <b>${esc((m.streams||[]).join(", ") || "—")}</b></span>`,
-    hashBadge,
     m.polytape_version ? `<span class="badge">v${esc(m.polytape_version)}</span>` : "",
   ].filter(Boolean).join("");
 
@@ -395,8 +370,8 @@ function render(d) {
   $("t-uptime").textContent = dur(d.uptime_seconds);
   $("t-gaps").textContent = fmt((d.gaps || []).length);
 
-  // stream cards (stable order: comments, book, then any others)
-  const order = ["comments", "book"];
+  // stream cards (stable order: book, then any others)
+  const order = ["book"];
   const names = Object.keys(d.streams || {}).sort((a,b) => (order.indexOf(a)+1||9) - (order.indexOf(b)+1||9));
   $("cards").innerHTML = names.map(n => streamCard(n, d.streams[n])).join("") || `<div class="empty">no streams</div>`;
   document.querySelectorAll("canvas.spark").forEach(c => {
@@ -409,9 +384,9 @@ function render(d) {
   gb.innerHTML = gaps.length ? gaps.map(g => `<tr>
     <td>${esc(g.stream)}</td><td class="mono">${esc((g.disconnected_at||"").slice(11,23))}</td>
     <td class="mono">${esc((g.reconnected_at||"").slice(11,23))}</td>
-    <td class="mono">${g.downtime_seconds ?? "—"}s</td><td class="mono">${fmt(g.backfilled)}</td>
+    <td class="mono">${g.downtime_seconds ?? "—"}s</td>
     <td>${esc(g.note||"")}</td></tr>`).join("")
-    : `<tr><td colspan="6" class="empty">no disconnects recorded — clean run</td></tr>`;
+    : `<tr><td colspan="5" class="empty">no disconnects recorded — clean run</td></tr>`;
 
   // recent activity ticker
   $("ticker").innerHTML = (d.recent || []).length ? d.recent.map(r => `
@@ -434,12 +409,8 @@ function setMode(mode) {
   currentMode = mode;
   document.querySelectorAll("#modeseg button").forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
   const live = mode === "live";
-  $("f-comments").style.display = live ? "" : "none";
-  $("f-book").style.display = live ? "" : "none";
-  $("f-hash").style.display = live ? "" : "none";
   $("relatedbtn").style.display = live ? "" : "none";
-  $("activechatbtn").style.display = live ? "" : "none";
-  if (!live) { $("related").style.display = "none"; $("activechat").style.display = "none"; }
+  if (!live) { $("related").style.display = "none"; }
   $("f-rate").style.display = live ? "none" : "";
   $("in-eventid").placeholder = live ? "id, slug, or paste a polymarket.com URL" : "demo";
 }
@@ -505,8 +476,7 @@ function openEventTab(id) {
 }
 
 function liveBody(eventId) {
-  return { mode: "live", event_id: eventId, comments: $("in-comments").checked,
-    book: $("in-book").checked, hash: $("in-hash").checked };
+  return { mode: "live", event_id: eventId };
 }
 
 // Post a start request; opens the new recording in its own tab (per the checkbox).
@@ -573,53 +543,6 @@ function renderRelated(d) {
       ${e.closed ? `<span class="badge off">closed</span>` : ``}
       <button class="btn primary sm" data-record="${esc(e.event_id)}">Record ▶</button>
     </div>`).join("");
-  box.innerHTML = head + `<div class="rel-scroll">${rows}</div>`;
-}
-
-// ---- active chat (sample the firehose -> events with the busiest chat now) --
-async function findActiveChat() {
-  const box = $("activechat");
-  box.style.display = "";
-  box.innerHTML = `<div class="rel-head">sampling the live comment feed (~8s) …</div>`;
-  $("activechatbtn").disabled = true;
-  try {
-    renderActiveChat(await post("/api/active-chat", { seconds: 8 }));
-  } catch (err) {
-    box.innerHTML = `<div class="rel-head">${esc(err.message)}</div>`;
-  } finally {
-    $("activechatbtn").disabled = false;
-  }
-}
-
-function renderActiveChat(d) {
-  const events = d.events || [];
-  const box = $("activechat");
-  box.style.display = "";
-  const head = `<div class="rel-head">busiest chat in the last <b>${esc(d.sampled_seconds ?? 0)}s</b>`
-    + ` — ${esc(d.total_comments ?? 0)} comment(s) across ${esc(d.total_events ?? 0)} event(s)`
-    + ` · <b>Record ▶</b> captures that chat (comments only)</div>`;
-  if (!events.length) {
-    box.innerHTML = head + `<div class="empty">no chat anywhere right now — try again during a live match/event</div>`;
-    return;
-  }
-  const rows = events.map(e => {
-    const isSeries = e.parent_entity_type === "Series";
-    const name = e.title || e.slug || ((isSeries ? "series " : "event ") + e.event_id);
-    const sample = e.sample ? `<div class="chat-sample">${esc(e.last_author ? e.last_author + ": " : "")}${esc(e.sample)}</div>` : "";
-    // A bare Series chat can't be recorded directly (the recorder takes event
-    // ids only) — but every event capture includes its parent series chat.
-    const recBtn = isSeries
-      ? `<button class="btn primary sm" disabled title="series chat records automatically with any of its events — record an event instead">Record ▶</button>`
-      : `<button class="btn primary sm" data-chatrec="${esc(e.event_id)}">Record ▶</button>`;
-    return `<div class="rel-row" data-pick="${esc(e.event_id)}" data-picktype="${esc(e.parent_entity_type || "Event")}" title="Use ${esc(e.event_id)}">
-      <span class="rtitle">${esc(name)}${isSeries ? ` <span class="badge">series</span>` : ""}</span>
-      <span class="rid">${esc(e.event_id)}</span>
-      <span class="chat-count" title="comments seen in the sample">💬 ${esc(e.comments ?? 0)}</span>
-      <span class="spacer"></span>
-      ${recBtn}
-      ${sample}
-    </div>`;
-  }).join("");
   box.innerHTML = head + `<div class="rel-scroll">${rows}</div>`;
 }
 
@@ -723,30 +646,11 @@ $("modeseg").addEventListener("click", (e) => { if (e.target.dataset.mode) setMo
 $("startbtn").addEventListener("click", startRecording);
 $("in-eventid").addEventListener("keydown", (e) => { if (e.key === "Enter") startRecording(); });
 $("relatedbtn").addEventListener("click", findRelated);
-$("activechatbtn").addEventListener("click", findActiveChat);
 $("related").addEventListener("click", (e) => {
   const recId = e.target.closest("[data-record]")?.getAttribute("data-record");
   if (recId) { const b = e.target; b.disabled = true; doStart(liveBody(recId), "Recording").finally(() => { b.disabled = false; }); return; }
   const pickId = e.target.closest("[data-pick]")?.getAttribute("data-pick");
   if (pickId) { $("in-eventid").value = pickId; $("related").style.display = "none"; }
-});
-$("activechat").addEventListener("click", (e) => {
-  // Record straight from a busy event: chat only (comments), book off. Series
-  // rows have no live Record button — a Series id is a parent-league/tournament
-  // chat, not an /events/ id, and it's captured with any of its events anyway.
-  const recBtn = e.target.closest("[data-chatrec]");
-  if (recBtn) {
-    const b = e.target; b.disabled = true;
-    const body = { mode: "live", event_id: recBtn.getAttribute("data-chatrec"),
-      comments: true, book: false, hash: $("in-hash").checked };
-    doStart(body, "Chat recording").finally(() => { b.disabled = false; });
-    return;
-  }
-  const pickRow = e.target.closest("[data-pick]");
-  if (pickRow) {
-    $("in-eventid").value = pickRow.getAttribute("data-pick");
-    $("in-book").checked = false;  // a chat id usually has no book; default it off
-  }
 });
 $("pausebtn").addEventListener("click", () => setPaused(!paused));
 $("eventlist").addEventListener("click", (e) => {

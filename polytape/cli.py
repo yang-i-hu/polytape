@@ -26,9 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="polytape",
         description=(
-            "Record Polymarket's public real-time comment (RTDS) and order-book "
-            "(CLOB) feeds for a live event to timestamped JSONL. Read-only; never "
-            "authenticates and never trades."
+            "Record Polymarket's public real-time order-book (CLOB) feed for a "
+            "live event to timestamped JSONL. Read-only; never authenticates and "
+            "never trades."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -62,23 +62,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="./data",
         metavar="DIR",
         help="Output root directory; data is written to DIR/event-<id>/ (or DIR/run-<name>/).",
-    )
-    parser.add_argument(
-        "--comments",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Record the RTDS comment stream (use --no-comments to skip).",
-    )
-    parser.add_argument(
-        "--book",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Record the CLOB order-book stream (use --no-book to skip).",
-    )
-    parser.add_argument(
-        "--no-hash",
-        action="store_true",
-        help="Write usernames/identifiers verbatim instead of salted-hashing them.",
     )
     parser.add_argument(
         "--per-match",
@@ -152,9 +135,6 @@ def config_from_args(args: argparse.Namespace) -> Config:
         event_ids=event_ids,
         run_name=args.run_name,
         out_dir=Path(args.out),
-        comments=args.comments,
-        book=args.book,
-        hash_usernames=not args.no_hash,
         market_ids=tuple(args.market_id or ()),
         per_match=args.per_match,
         dry_run=args.dry_run,
@@ -201,13 +181,12 @@ def main(argv: list[str] | None = None) -> int:
     config = parse_args(argv)
     setup_logging(config.log_level)
     logger.info(
-        "polytape %s | events=%d (primary=%s) streams=%s out=%s hash=%s dry_run=%s",
+        "polytape %s | events=%d (primary=%s) streams=%s out=%s dry_run=%s",
         __version__,
         len(config.event_ids),
         config.event_id,
         ",".join(config.enabled_streams),
         config.event_dir,
-        config.hash_usernames,
         config.dry_run,
     )
     if config.dry_run:

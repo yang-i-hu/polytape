@@ -25,7 +25,7 @@ Design notes
   out of the way of the writer's atomic ``os.replace`` finalization.
 - **No payload content leaves this process.** Only aggregate counters and
   non-identifying metadata (stream, message type, timestamps, delay) are
-  surfaced — never comment bodies or (under ``--no-hash``) raw usernames.
+  surfaced — never record payloads.
 
 The reader is not thread-safe; the server serializes calls with a lock.
 """
@@ -52,16 +52,15 @@ _DELAY_WINDOW = 512
 _SPARK_WINDOW = 90
 _RECENT_WINDOW = 40
 
-#: Samples above this (ms) are excluded from the live receive-delay percentiles.
-#: For comments ``ts_server`` is the content's ``createdAt``, so REST backfill of
-#: historical comments after a disconnect yields delays of minutes-to-hours that
-#: are *content age*, not live receive latency — letting them into the window
-#: would pin p95/max on stale data. (Genuine recorder lag surfaces instead via
-#: staleness / the "idle" status.) The per-message ticker still shows raw values.
+#: Samples above this (ms) are excluded from the live receive-delay percentiles —
+#: a wildly stale ``ts_server`` (clock skew, or an old capture replayed) is content
+#: age, not live receive latency, and would pin p95/max on one bad sample.
+#: (Genuine recorder lag surfaces instead via staleness / the "idle" status.)
+#: The per-message ticker still shows raw values.
 _MAX_LIVE_DELAY_MS = 5 * 60 * 1000
 
 #: A stream with no new line for this long (and not stopped) is reported "idle"
-#: rather than "live" — low comment volume is normal, so this is informational.
+#: rather than "live" — a quiet market is normal, so this is informational.
 DEFAULT_IDLE_THRESHOLD = 20.0
 
 
@@ -85,13 +84,13 @@ def _delay_ms(server_iso: Any, recv_iso: Any) -> float | None:
     return round((recv - server).total_seconds() * 1000.0, 1)
 
 
-def _message_type(stream: str, raw: Any) -> str:
-    """Non-identifying message type label (book ``event_type`` / comment ``type``)."""
+def _message_type(raw: Any) -> str:
+    """Non-identifying message type label (the ``event_type`` / ``type`` field)."""
     if isinstance(raw, dict):
         kind = raw.get("event_type") or raw.get("type")
         if isinstance(kind, str) and kind:
             return kind
-    return "backfill" if stream == "comments" else "other"
+    return "other"
 
 
 class _StreamTail:
@@ -224,7 +223,7 @@ class _StreamTail:
         ts_recv = rec.get("ts_recv")
         if isinstance(ts_recv, str):
             self.last_ts = ts_recv
-        kind = _message_type(self.name, rec.get("raw"))
+        kind = _message_type(rec.get("raw"))
         self.types[kind] += 1
         ts_server = rec.get("ts_server")
         delay = None
@@ -232,7 +231,7 @@ class _StreamTail:
             self.with_server_ts += 1
             self.last_server_ts = ts_server
             delay = _delay_ms(ts_server, ts_recv)
-            # Keep historical replay (backfill) out of the live percentiles, but
+            # Keep wildly stale server timestamps out of the live percentiles, but
             # still report the raw per-message value in the ticker.
             if delay is not None and delay <= _MAX_LIVE_DELAY_MS:
                 self._delays.append(delay)
@@ -406,7 +405,6 @@ class _EventState:
                 "streams": meta.get("streams") or list(self.streams),
                 "market_ids": meta.get("market_ids") or [],
                 "clob_token_ids": meta.get("clob_token_ids") or [],
-                "hashing": meta.get("hashing") or {},
                 "started_at": meta.get("started_at"),
                 "stopped_at": meta.get("stopped_at"),
                 "out_dir": meta.get("out_dir"),

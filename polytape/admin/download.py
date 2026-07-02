@@ -2,12 +2,11 @@
 selected matches — for the admin dashboard's (login-gated) download endpoint.
 
 A "match" is **not** a directory. The multi-event recorder writes one combined
-``book.jsonl`` / ``comments.jsonl`` / ``meta.json`` for the whole run, and every
-record is attributed to an event: book records by ``raw.market`` (a condition id,
-mapped to its event via ``meta.events[].markets[].conditionId``), comments by
-``parentEntityID``. So a per-match export is a *filtered slice* of the combined
-files, re-emitted under the familiar ``event-<id>/`` layout; the whole-run export
-is the three combined files verbatim.
+``book.jsonl`` / ``meta.json`` for the whole run, and every record is attributed
+to an event: book records by ``raw.market`` (a condition id, mapped to its event
+via ``meta.events[].markets[].conditionId``). So a per-match export is a
+*filtered slice* of the combined files, re-emitted under the familiar
+``event-<id>/`` layout; the whole-run export is the combined files verbatim.
 
 Everything here is read-only — it never opens the recorder's files for writing.
 Filtering streams line-by-line into a scratch dir (flat memory even on a multi-GB
@@ -34,7 +33,7 @@ from polytape.admin import registry as _reg
 
 logger = logging.getLogger("polytape.admin.download")
 
-_STREAMS = ("book", "comments")
+_STREAMS = ("book",)
 _READ_CHUNK = 8 * 1024 * 1024  # 8 MiB scan chunks; flat memory on a multi-GB file.
 
 
@@ -173,42 +172,6 @@ def _book_event(raw: dict[str, Any], cond2event: dict[str, str]) -> str | None:
     return cond2event.get(str(market)) if market is not None else None
 
 
-def _core(raw: dict[str, Any]) -> dict[str, Any]:
-    payload = raw.get("payload")
-    return payload if isinstance(payload, dict) else raw
-
-
-class _CommentRouter:
-    """Attribute comments by ``parentEntityID`` and reactions by ``commentID``.
-
-    Mirrors the recorder's RTDS routing (``CommentStream.resolve_event_id`` /
-    ``on_written`` in ``polytape/streams/rtds.py``): a reaction carries no
-    ``parentEntityID`` and is routed via a ``commentID -> event`` map seeded from
-    the comments seen *earlier in the file*. The recorder only keeps a reaction
-    whose parent comment it had already seen, so the parent always precedes the
-    reaction in append order — a single forward pass attributes every recorded
-    reaction. (A reaction to an unseen comment is dropped, exactly as the recorder
-    drops it.) Without this, per-match slices would silently lose every reaction
-    while still shipping a ``counts.comments`` that tallied them.
-    """
-
-    def __init__(self) -> None:
-        self._comment_event: dict[str, str] = {}
-
-    def __call__(self, raw: dict[str, Any]) -> str | None:
-        core = _core(raw)
-        parent = core.get("parentEntityID")
-        if parent is not None:
-            cid = core.get("id")
-            if cid is not None:
-                self._comment_event[str(cid)] = str(parent)  # seed reaction attribution
-            return str(parent)
-        comment_id = core.get("commentID")
-        if comment_id is not None:
-            return self._comment_event.get(str(comment_id))
-        return None
-
-
 def per_event_meta(
     meta: dict[str, Any],
     event_id: str,
@@ -242,10 +205,6 @@ def per_event_meta(
         identity, markets = None, []
     conds = [m.get("conditionId") for m in markets if m.get("conditionId")]
     tokens = [t for m in markets for t in (m.get("clobTokenIds") or [])]
-    # Whitelist the hashing fields rather than copying the dict wholesale: only the
-    # non-reversible fingerprint should ever leave the box, never a raw salt if one
-    # were ever (mis)placed there.
-    hashing = meta.get("hashing") or {}
     # Membership test (not ``or``): a live match's recorder count is authoritative even
     # if it were ever an empty dict; only a finished match (absent entirely) uses the tally.
     counts_by_event = meta.get("counts_by_event") or {}
@@ -255,11 +214,6 @@ def per_event_meta(
         "event_id": event_id,
         "run_name": meta.get("run_name"),
         "streams": meta.get("streams"),
-        "holdings_captured": meta.get("holdings_captured"),
-        "hashing": {
-            "enabled": hashing.get("enabled"),
-            "salt_fingerprint": hashing.get("salt_fingerprint"),
-        },
         "started_at": meta.get("started_at"),
         "stopped_at": meta.get("stopped_at"),
         "counts": counts,
@@ -392,13 +346,9 @@ def filter_run(
             src = run_dir / f"{stream}.jsonl"
             if not src.exists():
                 continue
-            attribute: Callable[[dict[str, Any]], str | None]
-            if stream == "book":
-                attribute = partial(_book_event, cond2event=cond2event)
-            else:
-                # Stateful: seeds a commentID->event map as it scans so reactions
-                # (no parentEntityID) are attributed, mirroring the recorder.
-                attribute = _CommentRouter()
+            attribute: Callable[[dict[str, Any]], str | None] = partial(
+                _book_event, cond2event=cond2event
+            )
             for key, n in _scan_and_route(
                 src, stream, wanted, attribute, writer_for, chunk_bytes
             ).items():
@@ -423,7 +373,7 @@ def filter_run(
             + "\n",
             encoding="utf-8",
         )
-        for name in ("meta.json", "book.jsonl", "comments.jsonl"):
+        for name in ("meta.json", "book.jsonl"):
             path = ev_dir / name
             if path.exists():
                 entries.append((f"event-{eid}/{name}", path))
@@ -476,11 +426,11 @@ def native_match_entries(
 
     Since the per-match-output deploy the recorder dual-writes each event to
     ``run_dir/matches/event-<id>/<stream>.jsonl`` (alongside the monolithic backup), so a
-    per-match download no longer needs a full-run scan: the bulky ``book.jsonl`` /
-    ``comments.jsonl`` are referenced verbatim from those files (append-only, so a tar
-    reads a clean line-aligned snapshot even while a match is still recording), and only
-    the small per-event ``meta.json`` is (re)generated into ``scratch_dir`` so the archive
-    shape stays identical to the filtered-slice export.
+    per-match download no longer needs a full-run scan: the bulky ``book.jsonl`` is
+    referenced verbatim from those files (append-only, so a tar reads a clean
+    line-aligned snapshot even while a match is still recording), and only the small
+    per-event ``meta.json`` is (re)generated into ``scratch_dir`` so the archive shape
+    stays identical to the filtered-slice export.
 
     Returns ``None`` (caller falls back to the filtering path) if ANY selected event has
     no native per-match ``book.jsonl`` — e.g. a match recorded before the deploy. Nothing
@@ -506,18 +456,17 @@ def native_match_entries(
             encoding="utf-8",
         )
         entries.append((f"event-{eid}/meta.json", meta_path))
-        for name in ("book.jsonl", "comments.jsonl"):
-            path = native_dir / name
-            if path.exists():
-                entries.append((f"event-{eid}/{name}", path))
+        book = native_dir / "book.jsonl"
+        if book.exists():
+            entries.append((f"event-{eid}/book.jsonl", book))
     return entries
 
 
 def whole_run_entries(run_dir: Path, meta: dict[str, Any] | None = None) -> list[tuple[str, Path]]:
-    """Archive entries for the whole run verbatim — the three combined files."""
+    """Archive entries for the whole run verbatim — the combined files."""
     root = run_dir.name or "run"
     entries: list[tuple[str, Path]] = []
-    for name in ("meta.json", "book.jsonl", "comments.jsonl"):
+    for name in ("meta.json", "book.jsonl"):
         path = run_dir / name
         if path.exists():
             entries.append((f"{root}/{name}", path))

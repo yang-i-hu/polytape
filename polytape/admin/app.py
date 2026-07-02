@@ -244,7 +244,7 @@ def create_app(
     @app.get("/api/download")
     async def download_archive(request: Request):
         # A raw export ships payload content the read-only views deliberately never do
-        # (comment bodies, book records), so it rides the SAME gate as control: a
+        # (book records), so it rides the SAME gate as control: a
         # configured secret + a valid login session. It is read-only (no intent broker).
         # Being a GET it can't carry the json/control header, but the SameSite=strict
         # session cookie authenticates a same-origin <a download> and a cross-site page
@@ -298,7 +298,7 @@ def create_app(
         # event to matches/event-<id>/, so a per-match download is served STRAIGHT from
         # those files — no full-run scan and no cache build. Only the small per-event
         # meta.json is regenerated into scratch (kept identical to the filtered-slice
-        # shape); book/comments stream verbatim. Returns None (falls through to the cache +
+        # shape); book streams verbatim. Returns None (falls through to the cache +
         # filter paths below) if any selected match predates per-match output.
         async def _serve_native():
             # Cheap existence check first, so a non-native request (pre-deploy match) does

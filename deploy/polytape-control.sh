@@ -15,9 +15,9 @@ set -uo pipefail
 
 RUN_DIR="/run/polytape-admin"
 INTENT_DIR="$RUN_DIR/intent"
-# heartbeat.env holds ONLY POLYTAPE_HEARTBEAT_URL — POLYTAPE_SALT lives in
-# polytape.env (0600, owner polytape) and is NEVER read or written here, so this
-# plane can neither leak nor clobber it.
+# heartbeat.env holds ONLY POLYTAPE_HEARTBEAT_URL — the recorder's other settings
+# live in polytape.env (0600, owner polytape), which is NEVER read or written here,
+# so this plane can neither leak nor clobber them.
 HEARTBEAT_ENV="/etc/polytape/heartbeat.env"
 LOCK="/run/polytape-control.lock"          # shared with polytape-refresh.sh
 REFRESH="/opt/polytape/polytape-refresh.sh"

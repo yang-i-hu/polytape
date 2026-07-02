@@ -65,6 +65,8 @@ def _reader(tmp_path, meta, *, registry=None, **kw):
 
 
 def test_status_counts_and_coverage_from_meta(tmp_path):
+    # The "comments" keys mirror a LEGACY meta.json (recorded before comment recording
+    # was removed); the reader must pass such counts through without choking on them.
     meta = _meta(
         counts={"book": 1234, "comments": 56},
         by_event={"1001": {"book": 1234, "comments": 56}},  # only 1001 has book data
@@ -181,10 +183,10 @@ def test_heartbeat_armed_from_env_file(tmp_path):
     (tmp_path / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
     env = tmp_path / "p.env"
     env.write_text(
-        "POLYTAPE_SALT=s\nPOLYTAPE_HEARTBEAT_URL=https://hc-ping.com/x\n", encoding="utf-8"
+        "POLYTAPE_EVENT_ID=1\nPOLYTAPE_HEARTBEAT_URL=https://hc-ping.com/x\n", encoding="utf-8"
     )
     assert RunReader(tmp_path, env_file=env).status()["heartbeat_armed"] is True
-    env.write_text("POLYTAPE_SALT=s\n", encoding="utf-8")
+    env.write_text("POLYTAPE_EVENT_ID=1\n", encoding="utf-8")
     assert RunReader(tmp_path, env_file=env).status()["heartbeat_armed"] is False
 
 

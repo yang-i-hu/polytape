@@ -49,19 +49,14 @@ def _setup(tmp_path):
     (tmp_path / "book.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in book), encoding="utf-8"
     )
-    (tmp_path / "comments.jsonl").write_text(
-        json.dumps(_rec("comments", "c1", {"payload": {"parentEntityID": 11433}})) + "\n",
-        encoding="utf-8",
-    )
 
 
 def test_compute_counts_and_attribution(tmp_path):
     _setup(tmp_path)
     out = seed.compute(tmp_path, tmp_path / "registry.json")
-    assert out["counts"] == {"book": 4, "comments": 1}  # totals incl. the unattributed record
+    assert out["counts"] == {"book": 4}  # total incl. the unattributed record
     assert out["counts_by_event"]["1001"]["book"] == 1  # via meta open set
     assert out["counts_by_event"]["0900"]["book"] == 2  # finished match via the registry
-    assert out["counts_by_event"]["11433"]["comments"] == 1  # comment parent (series id)
     assert out["last_record_at"] == "2026-06-20T00:00:09Z"  # newest ts overall
 
 
@@ -70,7 +65,7 @@ def test_main_writes_meta_preserving_other_fields(tmp_path):
     rc = seed.main(["--run-dir", str(tmp_path), "--registry-file", str(tmp_path / "registry.json")])
     assert rc == 0
     meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))
-    assert meta["counts"] == {"book": 4, "comments": 1}
+    assert meta["counts"] == {"book": 4}
     assert meta["counts_by_event"]["0900"]["book"] == 2
     assert meta["started_at"] == "2026-06-19T00:00:00Z"  # untouched
     assert meta["events"][0]["id"] == "1001"  # untouched
@@ -93,7 +88,7 @@ def test_out_then_apply_is_gap_free_path(tmp_path):
             str(side),
         ]
     )
-    assert json.loads(side.read_text(encoding="utf-8"))["counts"] == {"book": 4, "comments": 1}
+    assert json.loads(side.read_text(encoding="utf-8"))["counts"] == {"book": 4}
     assert (tmp_path / "meta.json").read_text(encoding="utf-8") == before  # --out left meta alone
     # apply merges the side file without re-scanning
     seed.main(["--run-dir", str(tmp_path), "--apply", str(side)])

@@ -29,13 +29,11 @@ def _meta() -> dict:
     return {
         "polytape_version": "0.1.0",
         "run_name": "wc",
-        "streams": ["comments", "book"],
-        "holdings_captured": True,
-        "hashing": {"enabled": True, "salt_fingerprint": "abcd1234"},
+        "streams": ["book"],
         "started_at": "2026-06-19T16:20:00.000000Z",
         "stopped_at": None,
-        "counts": {"book": 4, "comments": 5},
-        "counts_by_event": {"1001": {"book": 2, "comments": 2}, "1002": {"book": 1, "comments": 2}},
+        "counts": {"book": 4},
+        "counts_by_event": {"1001": {"book": 2}, "1002": {"book": 1}},
         "events": [
             {
                 "id": "1001",
@@ -64,7 +62,9 @@ def _book(market: str, rid: str) -> dict:
     }
 
 
-def _comment(parent: int, cid: str) -> dict:
+def _legacy_comment(parent: int, cid: str) -> dict:
+    # Shape of a record from an OLD capture's comments.jsonl; the download path
+    # must simply ignore such files now.
     ts = utc_now_iso()
     return {
         "stream": "comments",
@@ -72,19 +72,6 @@ def _comment(parent: int, cid: str) -> dict:
         "ts_recv": ts,
         "ts_server": ts,
         "raw": {"type": "comment_created", "payload": {"id": cid, "parentEntityID": parent}},
-    }
-
-
-def _reaction(comment_id: str, rid: str) -> dict:
-    ts = utc_now_iso()
-    # A reaction carries no parentEntityID; it references the comment it reacts to,
-    # so it must be attributed via the commentID -> event map.
-    return {
-        "stream": "comments",
-        "id": rid,
-        "ts_recv": ts,
-        "ts_server": ts,
-        "raw": {"type": "reaction_created", "payload": {"id": rid, "commentID": comment_id}},
     }
 
 
@@ -103,18 +90,8 @@ def _setup_run(run_dir):
             _book("0xZZ", "b4"),  # -> unknown market, attributed to no event
         ],
     )
-    _write_jsonl(
-        run_dir / "comments.jsonl",
-        [
-            _comment(1001, "c1"),  # -> event 1001
-            _reaction("c1", "r1"),  # reaction to c1 -> event 1001 (via commentID map)
-            _comment(1002, "c2"),  # -> event 1002
-            _reaction("c2", "r2"),  # reaction to c2 -> event 1002
-            _reaction(
-                "cX", "r3"
-            ),  # reaction to an unseen comment -> dropped (as the recorder drops it)
-        ],
-    )
+    # A legacy comments.jsonl from an old capture; today's exports must ignore it.
+    _write_jsonl(run_dir / "comments.jsonl", [_legacy_comment(1001, "c1")])
 
 
 def _members(raw: bytes) -> dict[str, bytes]:
@@ -138,11 +115,12 @@ def _ids(path) -> list[str]:
 def _setup_native(run_dir):
     """Recorder dual-writes per-match files under matches/event-<id>/ (1001 & 1002)."""
     (run_dir / "meta.json").write_text(json.dumps(_meta()), encoding="utf-8")
-    for eid, books, comments in (("1001", ["b1", "b2"], ["c1"]), ("1002", ["b3"], ["c2"])):
+    for eid, books in (("1001", ["b1", "b2"]), ("1002", ["b3"])):
         d = run_dir / "matches" / f"event-{eid}"
         d.mkdir(parents=True)
         _write_jsonl(d / "book.jsonl", [_book("0x?", b) for b in books])
-        _write_jsonl(d / "comments.jsonl", [_comment(int(eid), c) for c in comments])
+        # a legacy per-match comments.jsonl from an old capture; must be ignored
+        _write_jsonl(d / "comments.jsonl", [_legacy_comment(int(eid), f"c{eid}")])
         (d / "meta.json").write_text("{}", encoding="utf-8")  # recorder stub; regenerated on export
 
 
@@ -156,7 +134,6 @@ def test_native_match_entries_serves_from_recorder_files(tmp_path):
     assert set(arc) == {
         "event-1001/meta.json",
         "event-1001/book.jsonl",
-        "event-1001/comments.jsonl",
     }
     # bulky data is referenced verbatim from the recorder's native files (no scan / no copy)
     native_book = tmp_path / "matches" / "event-1001" / "book.jsonl"
@@ -166,7 +143,7 @@ def test_native_match_entries_serves_from_recorder_files(tmp_path):
     assert arc["event-1001/meta.json"].parent == scratch / "event-1001"
     meta = json.loads(arc["event-1001/meta.json"].read_text(encoding="utf-8"))
     assert meta["event_id"] == "1001"
-    assert meta["counts"] == {"book": 2, "comments": 2}  # authoritative counts_by_event
+    assert meta["counts"] == {"book": 2}  # authoritative counts_by_event
 
 
 def test_have_native_matches_requires_complete_files(tmp_path):
@@ -203,26 +180,12 @@ def test_filter_run_attributes_records_to_the_right_event(tmp_path):
     dest = tmp_path / "out"
     entries = dl.filter_run(tmp_path, ["1001"], dest, exported_at="2026-06-21T00:00:00Z")
     names = {arc for arc, _ in entries}
-    assert "event-1001/book.jsonl" in names
-    assert "event-1001/comments.jsonl" in names
-    assert "event-1001/meta.json" in names
+    assert names == {"event-1001/book.jsonl", "event-1001/meta.json"}
     assert not any(arc.startswith("event-1002/") for arc in names)  # only 1001 selected
 
     assert _ids(dest / "event-1001/book.jsonl") == ["b1", "b2"]  # not b3 (1002)/b4 (unknown)
-    assert _ids(dest / "event-1001/comments.jsonl") == ["c1", "r1"]  # comment + its reaction
-
-
-def test_filter_run_includes_reactions_via_comment_map(tmp_path):
-    # Reactions carry no parentEntityID; they must be attributed by commentID, so a
-    # per-match slice keeps the match's reactions (not just its top-level comments).
-    _setup_run(tmp_path)
-    dl.filter_run(tmp_path, ["1001"], tmp_path / "a", exported_at="2026-06-21T00:00:00Z")
-    dl.filter_run(tmp_path, ["1002"], tmp_path / "b", exported_at="2026-06-21T00:00:00Z")
-    assert _ids(tmp_path / "a/event-1001/comments.jsonl") == ["c1", "r1"]
-    assert _ids(tmp_path / "b/event-1002/comments.jsonl") == [
-        "c2",
-        "r2",
-    ]  # r3 (orphan) never appears
+    # the legacy comments.jsonl on disk is ignored entirely
+    assert not (dest / "event-1001/comments.jsonl").exists()
 
 
 def test_filter_run_multi_select_single_pass(tmp_path):
@@ -255,9 +218,8 @@ def test_per_event_meta_slice(tmp_path):
     meta = _meta()
     sliced = dl.per_event_meta(meta, "1001", exported_at="2026-06-21T00:00:00Z")
     assert sliced["event_id"] == "1001"
-    assert sliced["counts"] == {"book": 2, "comments": 2}  # per-event counts, not run totals
+    assert sliced["counts"] == {"book": 2}  # per-event counts, not run totals
     assert sliced["market_ids"] == ["0xA1", "0xA2"]
-    assert sliced["hashing"] == {"enabled": True, "salt_fingerprint": "abcd1234"}  # whitelisted
     assert sliced["event"]["title"] == "A vs. B"
     assert sliced["source"]["kind"] == "filtered-slice"
 
@@ -266,10 +228,10 @@ def test_whole_run_entries(tmp_path):
     _setup_run(tmp_path)
     entries = dl.whole_run_entries(tmp_path)
     root = tmp_path.name
+    # the legacy comments.jsonl on disk is NOT shipped
     assert {arc for arc, _ in entries} == {
         f"{root}/meta.json",
         f"{root}/book.jsonl",
-        f"{root}/comments.jsonl",
     }
     # Whole-run streams the combined files VERBATIM: every entry points straight at the
     # run dir, so no filtered copy is made and this path never needs (or overflows)

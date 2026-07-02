@@ -16,8 +16,9 @@
 # ── control-plane setup (run as root; verify on the VM before trusting) ──────
 #   useradd --system --no-create-home --shell /usr/sbin/nologin polytape-admin
 #   usermod -aG polytape polytape-admin                 # ONLY to read heartbeat.env (group polytape)
-#   # Heartbeat URL in its OWN file so the admin reads armed-state but NEVER the salt;
-#   # leave /etc/polytape/polytape.env at 0600 owner polytape (admin must not read it):
+#   # Heartbeat URL in its OWN file so the admin reads armed-state but never the
+#   # recorder's main env; leave /etc/polytape/polytape.env at 0600 owner polytape
+#   # (admin must not read it):
 #   install -m 0640 -o root -g polytape /dev/null /etc/polytape/heartbeat.env
 #   # The admin secret (NOT in this unit text, NOT readable by the recorder 'polytape'):
 #   install -m 0600 -o polytape-admin -g polytape-admin /dev/null /etc/polytape/admin.env
@@ -48,7 +49,7 @@ Environment=POLYTAPE_UNIT=polytape
 # Gamma tag the run registry discovers the campaign's events under. Unset defaults to
 # fifa-world-cup — set this (with POLYTAPE_RUN_DIR) when the next campaign starts.
 #Environment=POLYTAPE_TAG_SLUG=fifa-world-cup
-# Read heartbeat-armed state from the salt-free heartbeat.env, NOT polytape.env.
+# Read heartbeat-armed state from heartbeat.env, NOT the recorder's polytape.env.
 Environment=POLYTAPE_ENV_FILE=/etc/polytape/heartbeat.env
 Environment=POLYTAPE_INTENT_DIR=/run/polytape-admin/intent
 Environment=POLYTAPE_AUDIT_DIR=/var/log/polytape-admin/audit.jsonl

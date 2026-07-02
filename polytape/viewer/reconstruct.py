@@ -1,7 +1,7 @@
 """Canonical order-book reconstruction from recorded ``book.jsonl`` envelopes.
 
 This is the single source of truth for the snapshot/level-replace/delete/trade
-rules (see ``PROTOCOL.md`` §2). It is pure (no I/O): :func:`normalize_book_event`
+rules (see ``PROTOCOL.md`` §1). It is pure (no I/O): :func:`normalize_book_event`
 turns one ``raw`` feed dict into typed per-asset *changes*, and a
 :class:`Reconstructor` folds changes into per-asset :class:`OrderBook` state. The
 store layer drives this forward over a tailed file; the same change list is

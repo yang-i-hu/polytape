@@ -3,7 +3,7 @@
 The recorder overwrites ``meta.json`` to the CURRENT open set on each restart, so
 a finished match's *identity* (id / title / conditionIds) is lost from
 ``meta.events`` once the refresh rolls it out — yet its *records* remain in the
-append-only ``book.jsonl`` / ``comments.jsonl``. This module recovers the full set
+append-only ``book.jsonl``. This module recovers the full set
 from Gamma discovery (open AND closed events) and persists it, so the admin can
 **list** finished matches in schedule order, **count** them (the reader credits
 their conditionIds during the book scan it already does), and **download** them

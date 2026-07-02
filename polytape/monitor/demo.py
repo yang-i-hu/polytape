@@ -1,6 +1,6 @@
 """``python -m polytape.monitor.demo`` — a live synthetic capture to watch.
 
-Drives realistic, randomized comment and book messages through the **real**
+Drives realistic, randomized book messages through the **real**
 :class:`~polytape.writer.CaptureWriter` (the same sink a live capture uses), so
 you can point the dashboard at it and watch throughput, latency, the type mix,
 and the occasional simulated disconnect move in real time — with no network and
@@ -20,8 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from polytape.config import STREAM_BOOK, STREAM_COMMENTS, Config
-from polytape.envelope import Hasher
+from polytape.config import STREAM_BOOK, Config
 from polytape.mock import synthetic_event
 from polytape.writer import CaptureWriter
 
@@ -33,7 +32,6 @@ _BOOK_TYPES = (
     ("last_trade_price", 0.08),
     ("tick_size_change", 0.02),
 )
-_WORDS = ["nice", "lfg", "no way", "called it", "ouch", "buying more", "gl", "huge", "wow", "rip"]
 
 
 def _iso(dt: datetime) -> str:
@@ -103,41 +101,6 @@ def _book_message(seq: int) -> dict:
     }
 
 
-def _comment_message(event_id: str, seq: int) -> dict:
-    """A synthetic RTDS comment/reaction frame with a recent createdAt."""
-    created = datetime.now(timezone.utc) - timedelta(seconds=random.uniform(0.2, 3.0))
-    if random.random() < 0.25:
-        return {
-            "topic": "comments",
-            "type": "reaction_created",
-            "timestamp": int(created.timestamp() * 1000),
-            "payload": {
-                "id": f"demo-r{seq}",
-                "commentID": f"demo-c{max(0, seq - 1)}",
-                "reactionType": random.choice(["like", "dislike"]),
-                "userAddress": f"0xU{seq % 50}",
-            },
-        }
-    return {
-        "topic": "comments",
-        "type": "comment_created",
-        "timestamp": int(created.timestamp() * 1000),
-        "payload": {
-            "id": f"demo-c{seq}",
-            "parentEntityID": event_id,
-            "parentEntityType": "Event",
-            "createdAt": _iso(created),
-            "userAddress": f"0xU{seq % 50}",
-            "body": random.choice(_WORDS),
-            "profile": {
-                "name": f"user{seq % 50}",
-                "pseudonym": f"anon{seq % 50}",
-                "proxyWallet": f"0xU{seq % 50}",
-            },
-        },
-    }
-
-
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="python -m polytape.monitor.demo",
@@ -150,11 +113,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--rate", type=float, default=8.0, help="Approx book messages/sec. Default: 8")
     p.add_argument("--duration", type=float, default=0.0, help="Seconds to run (0 = until Ctrl-C).")
     p.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible output.")
-    p.add_argument(
-        "--no-hash",
-        action="store_true",
-        help="Do not hash identifiers (matches recorder --no-hash).",
-    )
     return p.parse_args(argv)
 
 
@@ -178,9 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         event_id=str(args.event_id),
         out_dir=Path(args.out),
         dry_run=True,
-        hash_usernames=not args.no_hash,
     )
-    hasher = Hasher() if config.hash_usernames else None
     event = synthetic_event(config)
 
     base_interval = 1.0 / max(0.1, args.rate)
@@ -189,29 +145,21 @@ def main(argv: list[str] | None = None) -> int:
     next_gap = time.monotonic() + random.uniform(20, 45)
 
     logger.info("demo capture -> %s  (rate ~%.0f/s, Ctrl-C to stop)", config.event_dir, args.rate)
-    with CaptureWriter(config, event_info=event, hasher=hasher) as writer:
+    with CaptureWriter(config, event_info=event) as writer:
         try:
             while deadline is None or time.monotonic() < deadline:
                 seq += 1
                 writer.write(STREAM_BOOK, _book_message(seq))
-                if random.random() < 0.08:  # comments are lower-volume than book
-                    writer.write(STREAM_COMMENTS, _comment_message(event.event_id, seq))
 
                 now = time.monotonic()
-                if now >= next_gap:  # simulate a disconnect + backfill recovery
+                if now >= next_gap:  # simulate a disconnect + recovery
                     down = _iso(
                         datetime.now(timezone.utc) - timedelta(seconds=random.uniform(2, 8))
                     )
-                    backfilled = random.randint(0, 5)
-                    for i in range(backfilled):
-                        writer.write(
-                            STREAM_COMMENTS, _comment_message(event.event_id, 10_000 + seq * 10 + i)
-                        )
                     writer.record_gap(
-                        STREAM_COMMENTS,
+                        STREAM_BOOK,
                         down,
                         _iso(datetime.now(timezone.utc)),
-                        backfilled=backfilled,
                         note="demo simulated gap",
                     )
                     next_gap = now + random.uniform(20, 45)

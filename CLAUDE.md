@@ -1,8 +1,8 @@
 # polytape
 
-Passive recorder for two of Polymarket's public real-time feeds (RTDS comments +
-CLOB order book), written to timestamped JSONL. **This repo is purely for getting
-data** — it never trades and never authenticates (public read-only endpoints only).
+Passive recorder for Polymarket's public real-time CLOB order-book feed, written
+to timestamped JSONL. **This repo is purely for getting data** — it never trades
+and never authenticates (public read-only endpoints only).
 
 All quantitative **research** (backtests, microstructure / ML / market-making
 studies, the `polytape_mm` package, notebooks, the raw→parquet→tensor pipeline)
@@ -31,5 +31,6 @@ lives in the sibling **PolyQuant** repo. Do not add analysis code here.
 - `data/` is **live**: it's the recorder's default `--out` and may hold in-progress captures.
   Never `rm -rf data/`, and never run two recorders into the same `event-<id>/` dir (concurrent
   appends corrupt the JSONL). Use an isolated temp `--out` when smoke-testing.
-- The recorder resolves an Event ID → markets/token IDs via the public Gamma API; comment
-  filtering is **client-side** (the server-side `filters` field delivers zero messages).
+- The recorder resolves an Event ID → markets/token IDs via the public Gamma API.
+- Old captures on disk may still hold a `comments.jsonl` from before comment recording
+  was removed (2026-07); readers ignore it and downloads no longer ship it.

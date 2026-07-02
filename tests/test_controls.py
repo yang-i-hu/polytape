@@ -31,7 +31,7 @@ def test_validate_heartbeat_url_rejects_injection_and_bad_scheme():
         "https://hc-ping.com/\x00",  # NUL
         'https://hc-ping.com/"x"',  # quote
         "https://hc-ping.com/`id`",  # backtick
-        "https://hc-ping.com/$SALT",  # dollar (env expansion)
+        "https://hc-ping.com/$HOME",  # dollar (env expansion)
         "https://hc-ping.com/a b",  # raw space
         "ftp://hc-ping.com/x",
         "",

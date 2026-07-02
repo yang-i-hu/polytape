@@ -22,48 +22,29 @@ class FakeGamma:
     async def resolve_events(self, event_ids, market_ids=()):
         return tuple(self.event for _ in event_ids)
 
-    async def backfill_since(self, event_id, last):
-        return []
-
     async def aclose(self):
         self.closed = True
 
 
-async def test_run_records_both_streams_and_finalizes(make_config, sample_event, make_connect):
+async def test_run_records_book_and_finalizes(make_config, sample_event, make_connect):
     cfg = make_config()
-    cframe = {
-        "topic": "comments",
-        "type": "comment_created",
-        "payload": {
-            "id": "c1",
-            "parentEntityID": 20200,
-            "userAddress": "0xW",
-            "createdAt": "2025-01-01T00:00:00Z",
-        },
-    }
     bframe = {"event_type": "book", "asset_id": "t1", "hash": "0xH", "timestamp": "1700000000000"}
-    connect = make_connect(
-        by_url={"live-data": [json.dumps(cframe)], "clob": [json.dumps(bframe)]}, blocking=True
-    )
+    connect = make_connect(by_url={"clob": [json.dumps(bframe)]}, blocking=True)
     gamma = FakeGamma(sample_event)
 
     task = asyncio.create_task(app.run(cfg, gamma=gamma, connect=connect))
-    await asyncio.sleep(0.2)  # let both connect and consume
+    await asyncio.sleep(0.2)  # let it connect and consume
     task.cancel()  # simulate Ctrl-C
     assert await task == 0
     assert gamma.closed is False  # injected gamma is not owned -> not closed
 
     meta = json.loads((cfg.event_dir / "meta.json").read_text(encoding="utf-8"))
-    assert meta["counts"] == {"comments": 1, "book": 1}
+    assert meta["counts"] == {"book": 1}
     assert meta["stopped_at"]
-    crec = json.loads(
-        (cfg.event_dir / "comments.jsonl").read_text(encoding="utf-8").splitlines()[0]
-    )
-    assert crec["raw"]["payload"]["userAddress"] != "0xW"  # hashed by default
 
 
-async def test_run_book_only_without_tokens_returns_1(make_config, make_connect):
-    cfg = make_config(comments=False)
+async def test_run_without_tokens_returns_1(make_config, make_connect):
+    cfg = make_config()
     empty_event = EventInfo(event_id="20200", title=None, slug=None, markets=(), raw={})
     rc = await app.run(cfg, gamma=FakeGamma(empty_event), connect=make_connect([]))
     assert rc == 1
@@ -73,11 +54,8 @@ async def test_run_fatal_writer_error_returns_2(
     make_config, sample_event, make_connect, monkeypatch
 ):
     cfg = make_config()
-    cframe = {"type": "comment_created", "payload": {"id": "c1", "parentEntityID": 20200}}
     bframe = {"event_type": "book", "asset_id": "t1", "hash": "0xH", "timestamp": "1700000000000"}
-    connect = make_connect(
-        by_url={"live-data": [json.dumps(cframe)], "clob": [json.dumps(bframe)]}, blocking=True
-    )
+    connect = make_connect(by_url={"clob": [json.dumps(bframe)]}, blocking=True)
 
     def _boom(self, envelope, *, event_id=None):
         raise FatalRecorderError("disk full")

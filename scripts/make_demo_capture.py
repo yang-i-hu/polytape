@@ -188,7 +188,7 @@ def _hash_seq():
 
 def generate(out_dir: Path, event_id: str, updates: int = 260, seed: int = 7) -> Path:
     rng = random.Random(seed)
-    config = Config(event_id=event_id, out_dir=out_dir, comments=False, book=True, dry_run=True)
+    config = Config(event_id=event_id, out_dir=out_dir, dry_run=True)
     hashes = _hash_seq()
     clock = {"t": datetime(2026, 6, 14, 18, 0, 0, tzinfo=timezone.utc)}
     base_ms = 1_750_000_000_000
@@ -200,7 +200,7 @@ def generate(out_dir: Path, event_id: str, updates: int = 260, seed: int = 7) ->
     no = _BookGen(NO_TOKEN, rng, hashes)
     yes_top, yes_spread = 41, 2
 
-    with CaptureWriter(config, event_info=_event(event_id), hasher=None, now=now) as w:
+    with CaptureWriter(config, event_info=_event(event_id), now=now) as w:
 
         def emit(raw: dict | None) -> None:
             if raw is None:
@@ -241,14 +241,14 @@ def generate(out_dir: Path, event_id: str, updates: int = 260, seed: int = 7) ->
 def append_live(out_dir: Path, event_id: str, seconds: float, interval: float, seed: int) -> int:
     """Append live updates with real sleeps; ``stopped_at`` stays null until done."""
     rng = random.Random(seed)
-    config = Config(event_id=event_id, out_dir=out_dir, comments=False, book=True, dry_run=True)
+    config = Config(event_id=event_id, out_dir=out_dir, dry_run=True)
     hashes = _hash_seq()
     yes = _BookGen(YES_TOKEN, rng, hashes)
     no = _BookGen(NO_TOKEN, rng, hashes)
     yes_top, yes_spread = 41, 2
     written = 0
     base_ms = int(time.time() * 1000)
-    with CaptureWriter(config, event_info=_event(event_id), hasher=None) as w:
+    with CaptureWriter(config, event_info=_event(event_id)) as w:
 
         def emit(raw: dict | None) -> None:
             nonlocal written
