@@ -116,31 +116,25 @@ class RecorderManager:
         comments: bool = True,
         book: bool = True,
         hash_usernames: bool = True,
-        include_series_comments: bool = False,
-        entity_type: str = "Event",
         log_level: str = "INFO",
     ) -> dict[str, Any]:
         """Launch a live ``polytape`` capture.
 
         ``event_id`` may be a numeric id, a slug, or a Polymarket URL — it is
         resolved to a numeric event id first (slugs/URLs need one Gamma lookup).
-        ``entity_type="Series"`` records a parent-series chat directly by its
-        series id (comments only).
+        The parent-series chat is always recorded: the recorder's client-side
+        comment filter automatically includes the event's parent series ids, so
+        there is no toggle to pass. Capturing a bare Series chat by its series
+        id is not supported by the recorder CLI (a series id is not an
+        ``/events/`` id and cannot be resolved).
         """
-        if entity_type not in ("Event", "Series"):
-            raise ControlError("entity_type must be 'Event' or 'Series'")
-        # A series id is not an /events/ slug; resolving it would 404. (Numeric
-        # ids pass through the resolver unchanged either way.)
-        if entity_type == "Event":
-            try:
-                event_id = self._resolver(event_id)
-            except GammaError as exc:
-                raise ControlError(str(exc)) from exc
+        try:
+            event_id = self._resolver(event_id)
+        except GammaError as exc:
+            raise ControlError(str(exc)) from exc
         event_id = _valid_event_id(event_id, numeric=True)
         if not comments and not book:
             raise ControlError("enable at least one of comments / book")
-        if entity_type == "Series" and not comments:
-            raise ControlError("a Series capture records comments only; enable comments")
         argv = [self._python, "-m", "polytape", "--event-id", event_id, "--out", str(self.out_dir)]
         if not comments:
             argv.append("--no-comments")
@@ -148,10 +142,6 @@ class RecorderManager:
             argv.append("--no-book")
         if not hash_usernames:
             argv.append("--no-hash")
-        if include_series_comments:
-            argv.append("--include-series-comments")
-        if entity_type != "Event":
-            argv += ["--entity-type", entity_type]
         argv += ["--log-level", _valid_log_level(log_level)]
         return self._spawn(event_id, "record", argv)
 

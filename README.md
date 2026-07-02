@@ -69,8 +69,7 @@ until you stop it with `Ctrl-C` (SIGINT) or SIGTERM.
 | --- | --- | --- |
 | `--event-id ID` | *(required)* | Polymarket **Event** ID to record (numeric for a live capture; any string under `--dry-run`). |
 | `--out DIR` | `./data` | Output root directory. Data is written to `DIR/event-<id>/`. |
-| `--comments` / `--no-comments` | on | Record (or skip) the RTDS comment stream. |
-| `--include-series-comments` | off | Also record comments on the event's **parent series** (e.g. a sports league/tournament chat). Sports comments often live on the series, not the match — see [below](#sports-comments-live-on-the-series). |
+| `--comments` / `--no-comments` | on | Record (or skip) the RTDS comment stream. Always includes comments on the event's **parent series** (e.g. a sports league/tournament chat) — see [below](#sports-comments-live-on-the-series). |
 | `--book` / `--no-book` | on | Record (or skip) the CLOB order-book stream. |
 | `--market-id ID` | *(auto)* | Override the market(s) to record instead of every market in the event. May be repeated. |
 | `--no-hash` | off | Write usernames/identifiers verbatim instead of hashing them. |
@@ -238,9 +237,10 @@ The dashboard has a **Recorder** panel that can launch and stop captures for you
 
 - **Start** a *Live event* — enter a numeric event id, a slug, or just **paste the
   Polymarket URL** (e.g. `https://polymarket.com/sports/.../fifwc-ksa-ury-2026-06-15`);
-  the slug is resolved to its event id for you. Toggle the comment/book streams,
-  username hashing, and **series chat** (the parent league/tournament comments —
-  see [Sports comments live on the series](#sports-comments-live-on-the-series)).
+  the slug is resolved to its event id for you. Toggle the comment/book streams
+  and username hashing; the parent league/tournament **series chat** is recorded
+  automatically with every event capture (see
+  [Sports comments live on the series](#sports-comments-live-on-the-series)).
   Or start a *Demo feed* (synthetic, no network).
 - **Find related** — paste any event's URL/slug and click *Find related* to list
   the **other events in its series** (e.g. every match in the tournament). Click a
@@ -371,20 +371,23 @@ python scripts/make_demo_capture.py --out ./_vtmp --event-id 80505 --live 10
 
 ### Sports comments live on the series
 
-By default polytape keeps only comments whose `parentEntityID` is the event id.
-For many markets that's right — but **Polymarket's sports chat is attached to the
-parent _series_ (the league/tournament), not the individual match event.** Such a
-match event typically has `commentCount: 0` of its own, so a default capture
-records **zero** comments even while the chat is active.
+**Polymarket's sports chat is attached to the parent _series_ (the
+league/tournament), not the individual match event.** Such a match event
+typically has `commentCount: 0` of its own, so an event-only capture would record
+**zero** comments even while the chat is active.
 
-Pass `--include-series-comments` to also record the event's parent-series comments
-(resolved from the event's `series`). Two things to know:
+polytape therefore **always** records the event's parent-series comments alongside
+the event's own: the client-side comment filter includes the event id *and* its
+parent series ids (resolved from the event's `series`). Things to know:
 
 - It's **tournament-wide**: you get the whole series' chat (e.g. every FIFA World
   Cup comment), because the match has no chat channel of its own to narrow to.
-- It only changes the **comment** filter; book recording is unaffected, and the
-  default (event-only) behavior is unchanged unless you pass the flag. Backfill on
-  reconnect covers each parent (event and series) independently.
+- It only affects the **comment** filter; book recording is unaffected. Backfill
+  on reconnect covers each parent (event and series) independently.
+- Recording a **bare series** chat by its series id is not supported: the recorder
+  takes event ids only (a series id is not an `/events/` id and cannot be
+  resolved). Record any of the series' events instead — its capture carries the
+  full series chat.
 
 ### Holdings (positions) on comments
 

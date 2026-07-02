@@ -118,28 +118,55 @@ def test_active_capture_detection(manager, tmp_path):
     assert manager._active_capture_exists(event_dir) is False  # not finalized but stale
 
 
-def test_start_recording_argv_carries_flags(manager, monkeypatch):
-    """The dashboard options map to the right recorder CLI flags (no real spawn)."""
+class _FakeProc:
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+
+def _capture_spawned_argv(monkeypatch) -> list[list[str]]:
+    """Mock ``subprocess.Popen`` so no process spawns; return the argv log."""
     seen: list[list[str]] = []
-
-    class _FakeProc:
-        def __init__(self, pid):
-            self.pid = pid
-
-        def poll(self):
-            return None
-
     monkeypatch.setattr(
         "polytape.monitor.control.subprocess.Popen",
         lambda argv, **kw: (seen.append(argv), _FakeProc(len(seen)))[1],
     )
-    manager.start_recording("111", include_series_comments=True, hash_usernames=False, book=False)
+    return seen
+
+
+def test_start_recording_argv_carries_flags(manager, monkeypatch):
+    """The dashboard options map to the right recorder CLI flags (no real spawn)."""
+    seen = _capture_spawned_argv(monkeypatch)
+    manager.start_recording("111", hash_usernames=False, book=False)
     manager.start_recording("222")  # all defaults
 
-    assert "--include-series-comments" in seen[0]
     assert "--no-hash" in seen[0] and "--no-book" in seen[0]
-    assert "--include-series-comments" not in seen[1]
     assert "--no-hash" not in seen[1] and "--no-book" not in seen[1]
+
+
+def test_start_recording_argv_parses_with_real_recorder_cli(manager, monkeypatch):
+    """Every argv the manager builds must be accepted by the real ``polytape`` CLI.
+
+    Regression test: the manager once appended flags the recorder never defined
+    (``--include-series-comments``, ``--entity-type``), so those captures died
+    instantly with argparse ``SystemExit(2)`` while the dashboard reported them
+    as running. Round-tripping the built argv through the real parser catches
+    any such drift.
+    """
+    from polytape.cli import build_parser
+
+    seen = _capture_spawned_argv(monkeypatch)
+    manager.start_recording("111")  # all defaults
+    manager.start_recording("222", comments=False)
+    manager.start_recording("333", book=False, hash_usernames=False, log_level="DEBUG")
+
+    parser = build_parser()
+    for argv in seen:
+        recorder_argv = argv[argv.index("polytape") + 1 :]  # after `<python> -m polytape`
+        # SystemExit(2) here means the manager passed a flag the recorder lacks.
+        parser.parse_args(recorder_argv)
 
 
 def test_refuses_second_recorder_for_active_capture(manager, tmp_path):
@@ -157,30 +184,6 @@ def test_refuses_second_recorder_for_active_capture(manager, tmp_path):
 # --------------------------------------------------------------------------- #
 # Start -> running -> stop lifecycle (spawns the demo feeder)
 # --------------------------------------------------------------------------- #
-
-
-def test_start_recording_series_skips_resolver_and_adds_flag(manager, monkeypatch):
-    captured = {}
-
-    def fake_spawn(event_id, kind, argv):
-        captured["argv"] = argv
-        return {"event_id": event_id, "running": True}
-
-    monkeypatch.setattr(manager, "_spawn", fake_spawn)
-
-    def _boom(_ref):  # a Series id must NOT be resolved via /events/ (would 404 / collide)
-        raise AssertionError("resolved a Series id")
-
-    monkeypatch.setattr(manager, "_resolver", _boom)
-    manager.start_recording("11433", entity_type="Series", comments=True, book=False)
-    argv = captured["argv"]
-    assert "--entity-type" in argv and argv[argv.index("--entity-type") + 1] == "Series"
-    assert "--no-book" in argv
-
-
-def test_start_recording_series_requires_comments(manager):
-    with pytest.raises(ControlError):
-        manager.start_recording("11433", entity_type="Series", comments=False, book=True)
 
 
 def test_demo_start_stop_lifecycle(manager, tmp_path):
@@ -288,6 +291,44 @@ def test_unresolvable_event_ref_over_http_returns_400(control_server):
     )
     assert status == 400
     assert "no-such-event-slug" in data["error"]
+
+
+def test_series_entity_type_over_http_returns_400(control_server):
+    """A bare Series chat cannot be recorded; the server must say so clearly."""
+    base, _ = control_server
+    status, data = _http(
+        base + "/api/recordings/start",
+        method="POST",
+        body={"mode": "live", "event_id": "11433", "entity_type": "Series"},
+        headers=_CTRL_HEADERS,
+    )
+    assert status == 400
+    assert "not supported" in data["error"]
+    assert "series chat" in data["error"].lower()
+
+
+def test_legacy_series_comments_key_is_accepted_and_ignored(control_server, monkeypatch):
+    """Old clients may still send ``series_comments``; series chat is always on,
+    so the key is silently ignored and never forwarded to the manager."""
+    base, manager = control_server
+    seen: dict[str, object] = {}
+
+    def fake_start(event_id, **kwargs):
+        seen["event_id"] = event_id
+        seen["kwargs"] = kwargs
+        return {"event_id": event_id, "running": True}
+
+    monkeypatch.setattr(manager, "start_recording", fake_start)
+    status, data = _http(
+        base + "/api/recordings/start",
+        method="POST",
+        body={"mode": "live", "event_id": "123", "series_comments": True},
+        headers=_CTRL_HEADERS,
+    )
+    assert status == 200 and data["ok"] is True
+    assert seen["event_id"] == "123"
+    assert "include_series_comments" not in seen["kwargs"]
+    assert "entity_type" not in seen["kwargs"]
 
 
 def test_malformed_rate_returns_400_not_500(control_server):

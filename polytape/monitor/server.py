@@ -236,13 +236,19 @@ class _Handler(BaseHTTPRequestHandler):
             rate = body.get("rate")
             return self._manager.start_demo(event_id or "demo", rate=8.0 if rate is None else rate)
         if mode == "live":
+            if str(body.get("entity_type") or "Event") == "Series":
+                raise ControlError(
+                    "recording a bare series chat is not supported; every Event "
+                    "capture already includes its parent series chat"
+                )
+            # Legacy clients may still send `series_comments`; accept and ignore
+            # it — series chat is always recorded (the recorder's client-side
+            # comment filter includes parent series ids unconditionally).
             return self._manager.start_recording(
                 event_id,
                 comments=bool(body.get("comments", True)),
                 book=bool(body.get("book", True)),
                 hash_usernames=bool(body.get("hash", True)),
-                include_series_comments=bool(body.get("series_comments", False)),
-                entity_type=str(body.get("entity_type") or "Event"),
             )
         raise ControlError(f"unknown start mode {mode!r}")
 

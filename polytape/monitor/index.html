@@ -221,7 +221,6 @@
       <label class="check" id="f-comments"><input type="checkbox" id="in-comments" checked /> comments</label>
       <label class="check" id="f-book"><input type="checkbox" id="in-book" checked /> book</label>
       <label class="check" id="f-hash"><input type="checkbox" id="in-hash" checked /> hash usernames</label>
-      <label class="check" id="f-series" title="Also record the parent league/tournament chat (where sports comments live). Tournament-wide."><input type="checkbox" id="in-series" /> series chat</label>
       <span class="field" id="f-rate" style="display:none"><label for="in-rate">rate /s</label><input type="number" id="in-rate" value="8" min="1" max="200" /></span>
       <label class="check" id="f-newtab" title="Open the new recording in its own browser tab/session"><input type="checkbox" id="in-newtab" checked /> open in new tab</label>
       <button class="btn primary" id="startbtn">Start recording</button>
@@ -338,10 +337,10 @@ function streamCard(name, s) {
       <span class="track"><span class="fill" style="width:${(v/total*100).toFixed(1)}%;background:${color}"></span></span>
       <span class="n">${fmt(v)}</span></div>`).join("");
   // Comments are bursty + far sparser than trades, so a 0 here is usually "nobody
-  // typed yet", not a fault. Explain it and point at the fix (sports/market chat
-  // usually lives on the parent SERIES, not the single event).
+  // typed yet", not a fault. Explain it (sports/market chat usually lives on the
+  // parent SERIES, which every event capture records automatically).
   const emptyMsg = name === "comments"
-    ? `<div class="empty hint">No chat on this event <i>yet</i> — it appears here live the moment someone posts. Comments are far sparser than trades (which is why <b>book</b> can race ahead while this stays at 0).<br><br>Sports &amp; market chat usually lives on the parent <b>series</b>, not the single event. Turn on <b>series chat</b> when you start, or hit <b>⚡ Live chat now</b> to jump to an event that's actively chatting.</div>`
+    ? `<div class="empty hint">No chat on this event <i>yet</i> — it appears here live the moment someone posts. Comments are far sparser than trades (which is why <b>book</b> can race ahead while this stays at 0).<br><br>Sports &amp; market chat usually lives on the parent <b>series</b>, and that chat is recorded automatically with every event capture. Hit <b>⚡ Live chat now</b> to jump to an event that's actively chatting.</div>`
     : `<div class="empty">no messages yet</div>`;
   const mix = bars || emptyMsg;
   return `
@@ -438,7 +437,6 @@ function setMode(mode) {
   $("f-comments").style.display = live ? "" : "none";
   $("f-book").style.display = live ? "" : "none";
   $("f-hash").style.display = live ? "" : "none";
-  $("f-series").style.display = live ? "" : "none";
   $("relatedbtn").style.display = live ? "" : "none";
   $("activechatbtn").style.display = live ? "" : "none";
   if (!live) { $("related").style.display = "none"; $("activechat").style.display = "none"; }
@@ -508,7 +506,7 @@ function openEventTab(id) {
 
 function liveBody(eventId) {
   return { mode: "live", event_id: eventId, comments: $("in-comments").checked,
-    book: $("in-book").checked, hash: $("in-hash").checked, series_comments: $("in-series").checked };
+    book: $("in-book").checked, hash: $("in-hash").checked };
 }
 
 // Post a start request; opens the new recording in its own tab (per the checkbox).
@@ -608,12 +606,17 @@ function renderActiveChat(d) {
     const isSeries = e.parent_entity_type === "Series";
     const name = e.title || e.slug || ((isSeries ? "series " : "event ") + e.event_id);
     const sample = e.sample ? `<div class="chat-sample">${esc(e.last_author ? e.last_author + ": " : "")}${esc(e.sample)}</div>` : "";
+    // A bare Series chat can't be recorded directly (the recorder takes event
+    // ids only) — but every event capture includes its parent series chat.
+    const recBtn = isSeries
+      ? `<button class="btn primary sm" disabled title="series chat records automatically with any of its events — record an event instead">Record ▶</button>`
+      : `<button class="btn primary sm" data-chatrec="${esc(e.event_id)}">Record ▶</button>`;
     return `<div class="rel-row" data-pick="${esc(e.event_id)}" data-picktype="${esc(e.parent_entity_type || "Event")}" title="Use ${esc(e.event_id)}">
       <span class="rtitle">${esc(name)}${isSeries ? ` <span class="badge">series</span>` : ""}</span>
       <span class="rid">${esc(e.event_id)}</span>
       <span class="chat-count" title="comments seen in the sample">💬 ${esc(e.comments ?? 0)}</span>
       <span class="spacer"></span>
-      <button class="btn primary sm" data-chatrec="${esc(e.event_id)}" data-chattype="${esc(e.parent_entity_type || "Event")}">Record ▶</button>
+      ${recBtn}
       ${sample}
     </div>`;
   }).join("");
@@ -728,15 +731,14 @@ $("related").addEventListener("click", (e) => {
   if (pickId) { $("in-eventid").value = pickId; $("related").style.display = "none"; }
 });
 $("activechat").addEventListener("click", (e) => {
-  // Record straight from a busy event: chat only (comments), book off. entity_type
-  // carries Event vs Series so the recorder filters/backfills the right namespace
-  // (a Series id is a parent-league/tournament chat, not an /events/ id).
+  // Record straight from a busy event: chat only (comments), book off. Series
+  // rows have no live Record button — a Series id is a parent-league/tournament
+  // chat, not an /events/ id, and it's captured with any of its events anyway.
   const recBtn = e.target.closest("[data-chatrec]");
   if (recBtn) {
     const b = e.target; b.disabled = true;
     const body = { mode: "live", event_id: recBtn.getAttribute("data-chatrec"),
-      comments: true, book: false, hash: $("in-hash").checked, series_comments: false,
-      entity_type: recBtn.getAttribute("data-chattype") || "Event" };
+      comments: true, book: false, hash: $("in-hash").checked };
     doStart(body, "Chat recording").finally(() => { b.disabled = false; });
     return;
   }
