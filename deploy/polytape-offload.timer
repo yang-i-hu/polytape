@@ -1,0 +1,16 @@
+# Hourly trigger for the polytape finished-match offloader (see polytape-offload.service).
+# Finished matches roll out of the open set ~continuously during a tournament; an hourly
+# sweep keeps the per-match SSD footprint bounded without racing the recorder.
+
+[Unit]
+Description=Run polytape finished-match offloader hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+# Spread the run off the top of the hour so it doesn't line up with other timers.
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

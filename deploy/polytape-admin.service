@@ -55,8 +55,16 @@ Environment=POLYTAPE_INTENT_DIR=/run/polytape-admin/intent
 Environment=POLYTAPE_AUDIT_DIR=/var/log/polytape-admin/audit.jsonl
 # Persisted login sessions (sha256 verifiers only) so a restart doesn't log everyone out.
 Environment=POLYTAPE_SESSION_FILE=/var/log/polytape-admin/sessions.json
-# Pre-built per-match download archives for FINISHED matches (near-instant downloads).
-Environment=POLYTAPE_EXTRACT_DIR=/var/cache/polytape-admin
+# Pre-warmed per-match extract CACHE — DISABLED (2026-07): superseded by per-match native
+# serving (matches/event-<id>/, served straight, no scan) and now by GCS offload. The
+# pre-warm loop rebuilt every finished match each tick (4 GiB cap << all matches),
+# thrashing scratch. Re-enable only if you drop native serving.
+#Environment=POLYTAPE_EXTRACT_DIR=/var/cache/polytape-admin
+# GCS offload of FINISHED matches: enables signed-URL downloads for matches whose native
+# files were moved to the archive bucket (see polytape-offload.service). Read-only object
+# access; used only to sign GET URLs. Unset = offload disabled (downloads use native/scan).
+Environment=POLYTAPE_GCS_BUCKET=polytape-prod-194347-archive
+Environment=POLYTAPE_GCS_KEY=/etc/polytape/offload-sa.json
 # Scratch for the (multi-GB) filtered-copy of a download/extract. MUST sit on the big
 # run volume (/data, ~68 GB free) — NOT the small root fs that PrivateTmp's /tmp lands
 # on (~14 GB free), where a whole-run-sized selection overflowed with ENOSPC -> 507.

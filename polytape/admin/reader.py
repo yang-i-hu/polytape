@@ -22,6 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from polytape.admin import offload as _offload
 from polytape.admin import registry as _reg
 from polytape.envelope import iso_to_datetime, utc_now_iso
 
@@ -288,6 +289,7 @@ class RunReader:
                 else:  # rolled out of the open set — a finished/past match
                     status = "finished"
                 counts = dict(self._by_event.get(eid, {}))  # copy: row outlives the lock
+                offloaded = _offload.is_offloaded(self._dir / "matches", eid)
                 rows.append(
                     {
                         "event_id": eid,
@@ -297,8 +299,10 @@ class RunReader:
                         "last_seen_age_s": age,
                         "status": status,
                         "open": eid in open_set,
-                        # On disk and selectable — data was actually recorded for it.
-                        "downloadable": bool(counts.get("book")),
+                        # On disk (or archived to GCS) and selectable — data exists for it.
+                        "downloadable": bool(counts.get("book")) or offloaded,
+                        # Finished-match native files moved to GCS to reclaim SSD.
+                        "offloaded": offloaded,
                     }
                 )
             # STABLE schedule order: by date (undated last), then event_id. No recency.

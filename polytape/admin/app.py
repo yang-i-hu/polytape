@@ -28,9 +28,11 @@ import logging
 import os
 import shutil
 from pathlib import Path
+from typing import Any
 
 from polytape.admin import download as dl
 from polytape.admin import extractor
+from polytape.admin import offload as ofl
 from polytape.admin import registry as reg
 from polytape.admin.page import PAGE
 from polytape.admin.reader import RunReader
@@ -89,6 +91,10 @@ def create_app(
     extract_dir: str | Path | None = None,
     extract_refresh_s: float = 600.0,
     scratch_dir: str | Path | None = None,
+    gcs_bucket: str | None = None,
+    gcs_key: str | Path | None = None,
+    gcs_prefix: str = ofl.DEFAULT_OBJECT_PREFIX,
+    gcs_url_ttl_s: int = ofl.DEFAULT_SIGNED_URL_TTL_S,
     session_file: str | Path | None = None,
     broker=None,
     audit=None,
@@ -108,11 +114,31 @@ def create_app(
     from contextlib import asynccontextmanager
 
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
     from polytape.admin import control
 
     controls_on = bool(admin_token)
+
+    # Offloaded finished matches live in GCS; the backend is built lazily on the first
+    # offloaded download (constructing it imports google-cloud-storage) and cached. A
+    # missing lib / bad key leaves it None -> the route falls back to the monolith scan,
+    # so a misconfiguration degrades (slower) rather than fails.
+    _gcs: list[Any] = []  # [] = not tried, [None] = failed, [backend] = ready
+
+    def _gcs_backend():
+        if not gcs_bucket:
+            return None
+        if not _gcs:
+            try:
+                _gcs.append(ofl.GcsBackend(gcs_bucket, key_file=gcs_key, storage_class=None))
+            except Exception:  # noqa: BLE001 - degrade to the monolith-scan fallback
+                logger.warning(
+                    "GCS backend unavailable; offloaded downloads use the scan", exc_info=True
+                )
+                _gcs.append(None)
+        return _gcs[0]
+
     if controls_on:
         # Persist sessions so an admin restart no longer logs everyone out (stores only
         # sha256(sid); the shared secret stays the only thing that can mint one).
@@ -293,6 +319,41 @@ def create_app(
         selected = [e for e in dict.fromkeys(event) if e in known]  # dedupe; keep only known
         if not selected:
             return JSONResponse({"error": "no known match selected"}, status_code=400)
+
+        # Offloaded fast-path: a single finished match whose native dir was archived to
+        # GCS (its local files removed to reclaim disk) is served by a short-lived signed
+        # URL -> 302, so the client fetches the tar.gz straight from GCS (no admin
+        # bandwidth, no scan). A multi-select that includes offloaded matches can't be one
+        # redirect, so it falls through to the monolith filter scan below (still correct —
+        # the monolith retains every record). If the GCS backend is unavailable the same
+        # scan fallback applies.
+        matches_dir = run_dir / "matches"
+        if len(selected) == 1 and ofl.is_offloaded(matches_dir, selected[0]):
+            backend = _gcs_backend()
+            if backend is not None:
+                try:
+                    url = await asyncio.to_thread(
+                        ofl.signed_download_url,
+                        matches_dir,
+                        selected[0],
+                        backend,
+                        ttl_seconds=gcs_url_ttl_s,
+                    )
+                except Exception:  # noqa: BLE001 - fall back to the scan below
+                    logger.warning(
+                        "signed-url failed for %s; using scan", selected[0], exc_info=True
+                    )
+                    url = None
+                if url:
+                    audit.write(
+                        action="download",
+                        result="ok",
+                        source=src,
+                        session_fp=fp,
+                        scope=selected[0],
+                        served="offload",
+                    )
+                    return RedirectResponse(url, status_code=302, headers=headers)
 
         # Native fast-path: since the per-match-output deploy the recorder dual-writes each
         # event to matches/event-<id>/, so a per-match download is served STRAIGHT from
@@ -610,6 +671,21 @@ def main(argv: list[str] | None = None) -> int:
         "Point at the run volume (e.g. /data/tmp/polytape-admin) so it doesn't overflow "
         "the small root fs PrivateTmp defaults to. Unset uses the system temp dir.",
     )
+    parser.add_argument(
+        "--gcs-bucket",
+        default=os.environ.get("POLYTAPE_GCS_BUCKET"),
+        help="Bucket holding offloaded finished-match archives; enables signed-URL "
+        "downloads for matches whose native files were moved to GCS. Unset = no offload.",
+    )
+    parser.add_argument(
+        "--gcs-key",
+        default=os.environ.get("POLYTAPE_GCS_KEY")
+        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
+        help="Service-account JSON key with object access on --gcs-bucket (for signing).",
+    )
+    parser.add_argument(
+        "--gcs-prefix", default=os.environ.get("POLYTAPE_GCS_PREFIX", ofl.DEFAULT_OBJECT_PREFIX)
+    )
     parser.add_argument("--host", default=os.environ.get("POLYTAPE_ADMIN_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("POLYTAPE_ADMIN_PORT", "8080"))
@@ -639,6 +715,9 @@ def main(argv: list[str] | None = None) -> int:
             tag_slug=args.tag_slug,
             extract_dir=args.extract_dir,
             scratch_dir=args.scratch_dir,
+            gcs_bucket=args.gcs_bucket,
+            gcs_key=args.gcs_key,
+            gcs_prefix=args.gcs_prefix,
         ),
         host=args.host,
         port=args.port,

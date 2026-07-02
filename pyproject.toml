@@ -36,6 +36,9 @@ dev = [
 admin = [
   "fastapi>=0.110",
   "uvicorn>=0.29",
+  # Offloading finished matches to Cloud Storage (and signing download URLs). Only the
+  # admin/offloader needs it; the offload module imports it lazily so the dep is optional.
+  "google-cloud-storage>=2.10",
 ]
 
 [project.scripts]

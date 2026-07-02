@@ -1,0 +1,51 @@
+# polytape finished-match offloader — moves FINISHED matches' per-match native files
+# (matches/event-<id>/) to a Coldline GCS bucket and removes them from local disk,
+# reclaiming ~half the run's SSD footprint (the per-match duplicates of the monolith).
+#
+# Oneshot, triggered hourly by polytape-offload.timer. Runs as root so it can remove
+# the root-owned matches/ dirs and read the SA key. SAFE: a native dir is deleted ONLY
+# after its tar.gz is uploaded AND verified in GCS; the monolith book.jsonl is never
+# touched and remains the on-disk backstop. See polytape/admin/offload.py.
+#
+# Setup (once, on the VM):
+#   # scoped SA key (object access on ONLY the archive bucket):
+#   install -m 0600 -o root -g root offload-sa.json /etc/polytape/offload-sa.json
+#   # env file with the bucket + key + scratch (0644 ok; no secrets, just paths):
+#   cat >/etc/polytape/offload.env <<'ENV'
+#   POLYTAPE_RUN_DIR=/data/run-wc
+#   POLYTAPE_GCS_BUCKET=polytape-prod-194347-archive
+#   POLYTAPE_GCS_KEY=/etc/polytape/offload-sa.json
+#   POLYTAPE_GCS_STORAGE_CLASS=COLDLINE
+#   POLYTAPE_SCRATCH_DIR=/data/tmp/polytape-admin
+#   ENV
+#   cp deploy/polytape-offload.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now polytape-offload.timer
+#
+# The uploader uses /opt/polytape/venv (needs the [admin] extra -> google-cloud-storage).
+
+[Unit]
+Description=polytape finished-match offloader (per-match natives -> GCS, reclaim SSD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/polytape/offload.env
+# Be gentle on the shared disk so the live recorder never starves for I/O.
+IOSchedulingClass=idle
+Nice=10
+ExecStart=/opt/polytape/venv/bin/python -m polytape.admin.offload --log-level INFO
+# The offloader writes ONLY under /data (tar scratch + deletes matches/ dirs); everything
+# else read-only. It never touches the recorder's monolith book.jsonl.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/data
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polytape-offload
+
+[Install]
+WantedBy=multi-user.target
