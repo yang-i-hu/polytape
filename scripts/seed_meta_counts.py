@@ -24,7 +24,7 @@ merge in one shot.) Reads stream line by line, so memory stays tiny regardless o
 size. ``--dry-run`` prints the computed counts without writing.
 
 Attribution mirrors the recorder/reader: book records by top-level ``market`` (condition
-id -> event, via the registry + the meta open set); comments by ``parentEntityID``.
+id -> event, via the registry + the meta open set).
 """
 
 from __future__ import annotations
@@ -68,12 +68,6 @@ def _cond_to_event(run_dir: Path, registry_file: Path) -> dict[str, str]:
     except (OSError, json.JSONDecodeError):
         pass
     return cond2event
-
-
-def _comment_event(raw: dict) -> str | None:
-    core = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
-    parent = core.get("parentEntityID") if isinstance(core, dict) else None
-    return str(parent) if parent is not None else None
 
 
 def _scan(
@@ -122,7 +116,7 @@ def compute(run_dir: Path, registry_file: Path) -> dict:
     counts: dict[str, int] = {}
     by_event: dict[str, dict[str, int]] = {}
     last_ts: dict[str, str] = {}
-    book_last = _scan(
+    last_record_at = _scan(
         run_dir / "book.jsonl",
         "book",
         lambda raw: cond2event.get(str(raw.get("market"))),
@@ -130,10 +124,6 @@ def compute(run_dir: Path, registry_file: Path) -> dict:
         by_event,
         last_ts,
     )
-    comments_last = _scan(
-        run_dir / "comments.jsonl", "comments", _comment_event, counts, by_event, last_ts
-    )
-    last_record_at = max([t for t in (book_last, comments_last) if t], default=None)
     return {
         "counts": counts,
         "counts_by_event": by_event,
@@ -173,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         seed = compute(run_dir, Path(args.registry_file))
     print(
-        f"book={seed['counts'].get('book', 0)} comments={seed['counts'].get('comments', 0)} "
+        f"book={seed['counts'].get('book', 0)} "
         f"events={len(seed['counts_by_event'])} last_record_at={seed['last_record_at']}",
         file=sys.stderr,
     )

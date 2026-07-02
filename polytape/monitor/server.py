@@ -43,7 +43,6 @@ from urllib.parse import parse_qs, urlparse
 from polytape.gamma import GammaError, related_events
 from polytape.monitor.control import ControlError, RecorderManager
 from polytape.monitor.reader import CaptureMonitor
-from polytape.streams.discover import active_chat_events
 
 logger = logging.getLogger("polytape.monitor")
 
@@ -84,7 +83,6 @@ class _Handler(BaseHTTPRequestHandler):
         control_enabled: bool,
         host_allowlist: frozenset[str] | None,
         lock: threading.Lock,
-        active_chat_lock: threading.Lock,
         **kwargs: object,
     ) -> None:
         self._monitor = monitor
@@ -92,7 +90,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._control_enabled = control_enabled and manager is not None
         self._host_allowlist = host_allowlist
         self._lock = lock
-        self._active_chat_lock = active_chat_lock
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
     def _reject_foreign_host(self) -> bool:
@@ -189,8 +186,6 @@ class _Handler(BaseHTTPRequestHandler):
                 except GammaError as exc:
                     raise ControlError(str(exc)) from exc
                 self._send_json({"ok": True, **result})
-            elif path == "/api/active-chat":
-                self._send_json({"ok": True, **self._do_active_chat(body)})
             else:
                 self._send_json({"error": "not found", "path": path}, status=404)
         except ControlError as exc:
@@ -236,42 +231,10 @@ class _Handler(BaseHTTPRequestHandler):
             rate = body.get("rate")
             return self._manager.start_demo(event_id or "demo", rate=8.0 if rate is None else rate)
         if mode == "live":
-            if str(body.get("entity_type") or "Event") == "Series":
-                raise ControlError(
-                    "recording a bare series chat is not supported; every Event "
-                    "capture already includes its parent series chat"
-                )
-            # Legacy clients may still send `series_comments`; accept and ignore
-            # it — series chat is always recorded (the recorder's client-side
-            # comment filter includes parent series ids unconditionally).
-            return self._manager.start_recording(
-                event_id,
-                comments=bool(body.get("comments", True)),
-                book=bool(body.get("book", True)),
-                hash_usernames=bool(body.get("hash", True)),
-            )
+            # Legacy clients may still send stream/hash toggles; accept and
+            # ignore them — the recorder has a single (book) stream.
+            return self._manager.start_recording(event_id)
         raise ControlError(f"unknown start mode {mode!r}")
-
-    def _do_active_chat(self, body: dict[str, object]) -> dict[str, object]:
-        """Sample the live comments firehose and rank events by chat volume.
-
-        Read-only (same public firehose the recorder uses); held behind the
-        control gate because it briefly ties up a worker thread on an outbound
-        connection and naturally pairs with starting a recording. Serialized with
-        a non-blocking lock so repeated/concurrent clicks can't pile up parallel
-        firehose connections (the client disables its button, but the server must
-        not rely on that).
-        """
-        try:
-            seconds = float(body.get("seconds", 8.0))
-        except (TypeError, ValueError):
-            raise ControlError("seconds must be a number") from None
-        if not self._active_chat_lock.acquire(blocking=False):
-            raise ControlError("a chat scan is already in progress; try again in a moment")
-        try:
-            return active_chat_events(seconds)
-        finally:
-            self._active_chat_lock.release()
 
     def _safe_500(self) -> None:
         try:
@@ -303,7 +266,6 @@ def make_server(
         control_enabled=control_enabled,
         host_allowlist=host_allowlist,
         lock=lock,
-        active_chat_lock=threading.Lock(),
     )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True

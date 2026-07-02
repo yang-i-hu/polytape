@@ -74,8 +74,8 @@ PAGE = """<!doctype html>
 
   <h2 id="mtitle">matches</h2>
   <table>
-    <thead><tr><th class="dlcol" style="width:28px"></th><th style="width:34%">match</th><th>date</th><th>book</th><th>comments</th><th>last seen</th><th>status</th></tr></thead>
-    <tbody id="rows"><tr><td colspan="7" style="color:var(--dim)">loading…</td></tr></tbody>
+    <thead><tr><th class="dlcol" style="width:28px"></th><th style="width:34%">match</th><th>date</th><th>book</th><th>last seen</th><th>status</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="6" style="color:var(--dim)">loading…</td></tr></tbody>
   </table>
   <div class="footer" id="footer"></div>
 </div>
@@ -221,7 +221,7 @@ async function tick(){
     document.getElementById('run').textContent = (st.recorder? 'run-wc':'') ;
     const cov = st.coverage||{};
     const cards = [
-      ['records', n((st.records?.book||0)+(st.records?.comments||0))],
+      ['records', n(st.records?.book||0)],
       ['last record', '<span class="'+freshClass(st.last_record_age_s)+'">'+age(st.last_record_age_s)+'</span>'],
       ['coverage', (cov.seen||0)+'/'+(cov.total||0)],
       ['open matches', n(st.open_matches)],
@@ -252,11 +252,10 @@ async function tick(){
         '<td class="dlcol"><input type="checkbox" class="dlchk" data-eid="'+m.event_id+'"'+(dlSelected.has(m.event_id)?' checked':'')+dis+' title="'+(m.downloadable?'select to download':'no recorded data')+'"></td>'+
         '<td>'+m.title+'</td><td class="num">'+(m.date||'—')+'</td>'+
         '<td class="num">'+n(m.counts?.book||0)+'</td>'+
-        '<td class="num">'+n(m.counts?.comments||0)+'</td>'+
         lastSeen+
         '<td><span class="tag '+m.status+'">'+m.status+'</span></td></tr>';
     }).join('')
-      || '<tr><td colspan="7" style="color:var(--dim)">no matches in this run yet</td></tr>';
+      || '<tr><td colspan="6" style="color:var(--dim)">no matches in this run yet</td></tr>';
     // forget ticks for matches that are no longer downloadable, then refresh the bar
     var present=new Set(ms.filter(function(m){return m.downloadable;}).map(function(m){return m.event_id;}));
     Array.from(dlSelected).forEach(function(e){ if(!present.has(e)) dlSelected.delete(e); });

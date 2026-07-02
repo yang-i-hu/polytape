@@ -91,6 +91,16 @@ def test_has_complete_extract_requires_marker(tmp_path):
     assert not extractor.has_complete_extract(tmp_path, "X")
 
 
+def test_has_complete_extract_rejects_stale_schema(tmp_path):
+    # An extract cached by an older build (e.g. schema 1, which still shipped
+    # comments.jsonl) must be treated as absent so it gets rebuilt book-only.
+    extractor.archive_path(tmp_path, "X").write_bytes(b"x")
+    extractor.marker_path(tmp_path, "X").write_text(
+        json.dumps({"schema": 1, "event_id": "X", "built_at": "t", "size": 1}), encoding="utf-8"
+    )
+    assert not extractor.has_complete_extract(tmp_path, "X")
+
+
 def test_has_complete_extract_rejects_unsafe_id(tmp_path):
     # A traversal/separator id can never point outside extract_dir (defense in depth).
     assert not extractor.valid_event_id("../escape")
@@ -140,7 +150,14 @@ def test_enforce_cap_counts_and_evicts_corrupt_marker(tmp_path):
     # first — otherwise a bad marker would let the cache grow unbounded past the cap.
     extractor.archive_path(tmp_path, "GOOD").write_bytes(b"x" * 100)
     extractor.marker_path(tmp_path, "GOOD").write_text(
-        json.dumps({"event_id": "GOOD", "built_at": "2026-06-20T00:00:00Z", "size": 100}),
+        json.dumps(
+            {
+                "schema": extractor.EXTRACT_SCHEMA,
+                "event_id": "GOOD",
+                "built_at": "2026-06-20T00:00:00Z",
+                "size": 100,
+            }
+        ),
         encoding="utf-8",
     )
     extractor.archive_path(tmp_path, "BAD").write_bytes(b"x" * 100)
@@ -154,7 +171,15 @@ def test_enforce_cap_evicts_oldest(tmp_path):
     for eid, built in [("A", "2026-06-19T00:00:00Z"), ("B", "2026-06-20T00:00:00Z")]:
         extractor.archive_path(tmp_path, eid).write_bytes(b"x" * 100)
         extractor.marker_path(tmp_path, eid).write_text(
-            json.dumps({"event_id": eid, "built_at": built, "size": 100}), encoding="utf-8"
+            json.dumps(
+                {
+                    "schema": extractor.EXTRACT_SCHEMA,
+                    "event_id": eid,
+                    "built_at": built,
+                    "size": 100,
+                }
+            ),
+            encoding="utf-8",
         )
     extractor.enforce_cap(tmp_path, cap_bytes=150)  # must drop one to get under 150
     assert not extractor.has_complete_extract(tmp_path, "A")  # oldest evicted
@@ -180,7 +205,10 @@ def test_download_serves_prebuilt_extract(tmp_path):
     # A SENTINEL archive so we can prove it's served verbatim (not rebuilt by a scan).
     extractor.archive_path(ed, "0900").write_bytes(b"SENTINEL-TARGZ-BYTES")
     extractor.marker_path(ed, "0900").write_text(
-        json.dumps({"event_id": "0900", "built_at": "t", "size": 20}), encoding="utf-8"
+        json.dumps(
+            {"schema": extractor.EXTRACT_SCHEMA, "event_id": "0900", "built_at": "t", "size": 20}
+        ),
+        encoding="utf-8",
     )
     reg.write_registry_atomic(
         tmp_path / "registry.json",

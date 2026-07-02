@@ -66,19 +66,6 @@ def test_live_recording_rejects_unresolvable_ref(manager):
         manager.start_recording("no-such-event-slug")
 
 
-def test_live_recording_resolves_slug_before_spawn(manager):
-    # A known slug resolves to a numeric id; using no streams stops it right after
-    # resolution (before any process spawn), so the error is about streams — proving
-    # the slug was accepted and resolved, not rejected.
-    with pytest.raises(ControlError, match="at least one"):
-        manager.start_recording("fifwc-ksa-ury-2026-06-15", comments=False, book=False)
-
-
-def test_live_recording_requires_a_stream(manager):
-    with pytest.raises(ControlError, match="at least one"):
-        manager.start_recording("123", comments=False, book=False)
-
-
 def test_demo_rejects_unsafe_event_id(manager):
     with pytest.raises(ControlError):
         manager.start_demo("../escape")
@@ -136,14 +123,12 @@ def _capture_spawned_argv(monkeypatch) -> list[list[str]]:
     return seen
 
 
-def test_start_recording_argv_carries_flags(manager, monkeypatch):
-    """The dashboard options map to the right recorder CLI flags (no real spawn)."""
+def test_start_recording_resolves_slug_into_argv(manager, monkeypatch):
+    """A slug ref is resolved to its numeric event id before the spawn."""
     seen = _capture_spawned_argv(monkeypatch)
-    manager.start_recording("111", hash_usernames=False, book=False)
-    manager.start_recording("222")  # all defaults
-
-    assert "--no-hash" in seen[0] and "--no-book" in seen[0]
-    assert "--no-hash" not in seen[1] and "--no-book" not in seen[1]
+    manager.start_recording("fifwc-ksa-ury-2026-06-15")
+    assert "--event-id" in seen[0]
+    assert seen[0][seen[0].index("--event-id") + 1] == "351729"
 
 
 def test_start_recording_argv_parses_with_real_recorder_cli(manager, monkeypatch):
@@ -159,8 +144,7 @@ def test_start_recording_argv_parses_with_real_recorder_cli(manager, monkeypatch
 
     seen = _capture_spawned_argv(monkeypatch)
     manager.start_recording("111")  # all defaults
-    manager.start_recording("222", comments=False)
-    manager.start_recording("333", book=False, hash_usernames=False, log_level="DEBUG")
+    manager.start_recording("222", log_level="DEBUG")
 
     parser = build_parser()
     for argv in seen:
@@ -293,23 +277,9 @@ def test_unresolvable_event_ref_over_http_returns_400(control_server):
     assert "no-such-event-slug" in data["error"]
 
 
-def test_series_entity_type_over_http_returns_400(control_server):
-    """A bare Series chat cannot be recorded; the server must say so clearly."""
-    base, _ = control_server
-    status, data = _http(
-        base + "/api/recordings/start",
-        method="POST",
-        body={"mode": "live", "event_id": "11433", "entity_type": "Series"},
-        headers=_CTRL_HEADERS,
-    )
-    assert status == 400
-    assert "not supported" in data["error"]
-    assert "series chat" in data["error"].lower()
-
-
-def test_legacy_series_comments_key_is_accepted_and_ignored(control_server, monkeypatch):
-    """Old clients may still send ``series_comments``; series chat is always on,
-    so the key is silently ignored and never forwarded to the manager."""
+def test_legacy_stream_toggles_are_accepted_and_ignored(control_server, monkeypatch):
+    """Old clients may still send stream/hash toggles; the recorder has a single
+    (book) stream, so the keys are silently ignored and never forwarded."""
     base, manager = control_server
     seen: dict[str, object] = {}
 
@@ -322,13 +292,19 @@ def test_legacy_series_comments_key_is_accepted_and_ignored(control_server, monk
     status, data = _http(
         base + "/api/recordings/start",
         method="POST",
-        body={"mode": "live", "event_id": "123", "series_comments": True},
+        body={
+            "mode": "live",
+            "event_id": "123",
+            "series_comments": True,
+            "comments": False,
+            "book": True,
+            "hash": False,
+        },
         headers=_CTRL_HEADERS,
     )
     assert status == 200 and data["ok"] is True
     assert seen["event_id"] == "123"
-    assert "include_series_comments" not in seen["kwargs"]
-    assert "entity_type" not in seen["kwargs"]
+    assert seen["kwargs"] == {}
 
 
 def test_malformed_rate_returns_400_not_500(control_server):
@@ -378,40 +354,6 @@ def test_related_requires_ref(control_server):
     base, _ = control_server
     status, data = _http(base + "/api/related", method="POST", body={}, headers=_CTRL_HEADERS)
     assert status == 400
-
-
-def test_active_chat_over_http(control_server, monkeypatch):
-    base, _ = control_server
-    monkeypatch.setattr(
-        "polytape.monitor.server.active_chat_events",
-        lambda seconds: {
-            "sampled_seconds": seconds,
-            "total_events": 1,
-            "total_comments": 3,
-            "events": [
-                {
-                    "event_id": "11433",
-                    "parent_entity_type": "Event",
-                    "comments": 3,
-                    "reactions": 1,
-                    "sample": "lets go",
-                    "title": "Some Event",
-                }
-            ],
-        },
-    )
-    status, data = _http(
-        base + "/api/active-chat", method="POST", body={"seconds": 5}, headers=_CTRL_HEADERS
-    )
-    assert status == 200 and data["ok"] is True
-    assert data["total_comments"] == 3
-    assert data["events"][0]["event_id"] == "11433"
-
-
-def test_active_chat_requires_control_header(control_server):
-    base, _ = control_server
-    status, _ = _http(base + "/api/active-chat", method="POST", body={"seconds": 5})
-    assert status == 403  # no X-Polytape-Control header
 
 
 def test_control_rejects_foreign_host(control_server):

@@ -41,12 +41,6 @@ def test_parse_event_object_and_list_forms():
     assert _parse_event([EVENT_OBJ], "12345").event_id == "12345"  # ?id= array form
 
 
-def test_parse_event_series_ids():
-    obj = {**EVENT_OBJ, "series": [{"id": 11433, "slug": "soccer-fifwc"}, {"id": "999"}]}
-    assert _parse_event(obj, "12345").series_ids == ("11433", "999")
-    assert _parse_event(EVENT_OBJ, "12345").series_ids == ()  # no series -> empty
-
-
 def test_parse_token_ids_stringified():
     assert _parse_token_ids({"clobTokenIds": '["a","b"]'}) == ("a", "b")
     assert _parse_token_ids({}) == ()
@@ -169,7 +163,7 @@ def test_filter_markets_by_gamma_or_condition_id():
 def _client(handler) -> GammaClient:
     transport = httpx.MockTransport(handler)
     http = httpx.AsyncClient(transport=transport, base_url="https://gamma-api.polymarket.com")
-    return GammaClient(client=http, backoff_base=0.001, page_delay=0.0)
+    return GammaClient(client=http, backoff_base=0.001)
 
 
 async def test_resolve_event_and_filter():
@@ -203,65 +197,4 @@ async def test_get_retries_on_5xx():
     g = _client(handler)
     ev = await g.resolve_event("12345")
     assert ev.event_id == "12345" and state["n"] == 2
-    await g.aclose()
-
-
-async def test_fetch_comments_series_parent():
-    seen: dict[str, str] = {}
-
-    def handler(req):
-        seen.update(dict(req.url.params))
-        return httpx.Response(200, json=[{"id": "s1"}])
-
-    g = _client(handler)
-    out = await g.fetch_comments("11433", parent_entity_type="Series")
-    assert out == [{"id": "s1"}]
-    assert seen["parent_entity_type"] == "Series" and seen["parent_entity_id"] == "11433"
-    await g.aclose()
-
-
-async def test_fetch_comments_requests_holdings_by_default():
-    seen: dict[str, str] = {}
-
-    def handler(req):
-        seen.clear()
-        seen.update(dict(req.url.params))
-        return httpx.Response(200, json=[])
-
-    g = _client(handler)
-    await g.fetch_comments("11433", parent_entity_type="Series")
-    assert seen.get("get_positions") == "true"  # holdings requested by default
-    await g.fetch_comments("11433", parent_entity_type="Series", get_positions=False)
-    assert "get_positions" not in seen  # opt-out drops the param
-    await g.aclose()
-
-
-async def test_backfill_threads_get_positions():
-    seen: dict[str, str] = {}
-
-    def handler(req):
-        seen.update(dict(req.url.params))
-        return httpx.Response(200, json=[])
-
-    g = _client(handler)
-    await g.backfill_since("11433", parent_entity_type="Series", max_pages=1)
-    assert seen.get("get_positions") == "true"
-    await g.aclose()
-
-
-async def test_backfill_since_stops_at_last_seen():
-    newest_first = [{"id": f"c{i}", "createdAt": f"t{i}"} for i in (5, 4, 3, 2, 1)]
-
-    def handler(req):
-        q = req.url.params
-        assert q["parent_entity_type"] == "Event"
-        assert q["parent_entity_id"] == "12345"
-        off, lim = int(q["offset"]), int(q["limit"])
-        return httpx.Response(200, json=newest_first[off : off + lim])
-
-    g = _client(handler)
-    bf = await g.backfill_since("12345", last_seen_id="c2", page_size=2, max_pages=10)
-    assert [c["id"] for c in bf] == ["c3", "c4", "c5"]  # chronological, exclusive of c2
-    full = await g.backfill_since("12345", last_seen_id="missing", page_size=2, max_pages=10)
-    assert [c["id"] for c in full] == ["c1", "c2", "c3", "c4", "c5"]
     await g.aclose()

@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-# Canonical stream names — used for output file names, the envelope ``stream``
+# Canonical stream name — used for output file names, the envelope ``stream``
 # field, and ``meta.json``.
-STREAM_COMMENTS = "comments"
 STREAM_BOOK = "book"
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -33,9 +32,6 @@ class Config:
         run_name: Label for a multi-event run; output goes to ``out_dir/run-<name>``.
         out_dir: Output root. Single event -> ``out_dir/event-<id>``; multiple
             events (or an explicit ``run_name``) -> ``out_dir/run-<name>``.
-        comments: Whether to record the RTDS comment stream.
-        book: Whether to record the CLOB order-book stream.
-        hash_usernames: Whether to salt-and-hash identifier fields (privacy default).
         market_ids: Optional explicit market id(s) to record instead of every
             market in each event. Empty means "auto-resolve".
         per_match: Also write each event-tagged record to a per-match file under
@@ -51,9 +47,6 @@ class Config:
     event_ids: tuple[str, ...] = ()
     run_name: str | None = None
     out_dir: Path = Path("./data")
-    comments: bool = True
-    book: bool = True
-    hash_usernames: bool = True
     market_ids: tuple[str, ...] = ()
     per_match: bool = True
     dry_run: bool = False
@@ -69,10 +62,6 @@ class Config:
         # Frozen dataclass: settle the canonical fields via object.__setattr__.
         object.__setattr__(self, "event_ids", ids)
         object.__setattr__(self, "event_id", ids[0])
-        if not self.comments and not self.book:
-            raise ValueError(
-                "at least one stream must be enabled (do not combine --no-comments with --no-book)"
-            )
         if not self.dry_run:
             non_numeric = [i for i in ids if not i.isdigit()]
             if non_numeric:
@@ -102,9 +91,4 @@ class Config:
     @property
     def enabled_streams(self) -> tuple[str, ...]:
         """Names of the streams enabled for this run, in a stable order."""
-        streams: list[str] = []
-        if self.comments:
-            streams.append(STREAM_COMMENTS)
-        if self.book:
-            streams.append(STREAM_BOOK)
-        return tuple(streams)
+        return (STREAM_BOOK,)

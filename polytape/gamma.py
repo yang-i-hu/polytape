@@ -1,10 +1,7 @@
 """Async client for Polymarket's public Gamma REST API.
 
-Two jobs (see ``PROTOCOL.md`` §3):
-
-1. Resolve an Event ID to its markets and CLOB token ids (to seed the websocket
-   subscriptions), via ``GET /events/{id}``.
-2. Backfill comments missed during a disconnect, via paged ``GET /comments``.
+One job (see ``PROTOCOL.md`` §2): resolve an Event ID to its markets and CLOB
+token ids (to seed the websocket subscriptions), via ``GET /events/{id}``.
 
 All endpoints are public and unauthenticated. Network access is isolated in
 :class:`GammaClient`; the payload-shaping logic lives in module-level pure
@@ -55,7 +52,7 @@ class EventInfo:
     """Resolved event metadata used to drive the recorder.
 
     Attributes:
-        event_id: The numeric event id (also the RTDS ``parentEntityID``).
+        event_id: The numeric event id.
         title: Event title, if present.
         slug: Event slug, if present.
         markets: The markets to record (after any ``--market-id`` filtering).
@@ -67,7 +64,6 @@ class EventInfo:
     slug: str | None
     markets: tuple[Market, ...]
     raw: dict[str, Any]
-    series_ids: tuple[str, ...] = ()  # parent series (e.g. a sports league/tournament)
 
     @property
     def gamma_market_ids(self) -> tuple[str, ...]:
@@ -140,19 +136,12 @@ def _parse_event(payload: Any, event_id: str) -> EventInfo:
     if not isinstance(markets_raw, list):
         raise GammaError(f"event {event_id}: 'markets' is not a list")
     markets = tuple(_parse_market(m) for m in markets_raw)
-    series_raw = obj.get("series") or []
-    series_ids = (
-        tuple(str(s["id"]) for s in series_raw if isinstance(s, dict) and s.get("id"))
-        if isinstance(series_raw, list)
-        else ()
-    )
     return EventInfo(
         event_id=str(obj.get("id", event_id)),
         title=obj.get("title"),
         slug=obj.get("slug"),
         markets=markets,
         raw=obj,
-        series_ids=series_ids,
     )
 
 
@@ -365,12 +354,10 @@ class GammaClient:
         timeout: float = 15.0,
         max_retries: int = 4,
         backoff_base: float = 0.5,
-        page_delay: float = 0.25,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._max_retries = max_retries
         self._backoff_base = backoff_base
-        self._page_delay = page_delay
         if client is not None:
             self._client = client
             self._owns_client = False
@@ -487,108 +474,3 @@ class GammaClient:
             raise GammaError(f"no events could be resolved from {ids}")
         logger.info("resolved %d/%d event(s)", len(events), len(ids))
         return tuple(events)
-
-    async def fetch_comments(
-        self,
-        parent_entity_id: str,
-        *,
-        parent_entity_type: str = "Event",
-        limit: int = 100,
-        offset: int = 0,
-        ascending: bool = True,
-        get_positions: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Fetch a single page of comments for a parent entity.
-
-        Mirrors ``GET /comments?parent_entity_type=<type>&parent_entity_id=...``.
-        ``parent_entity_type`` is ``"Event"`` by default, or ``"Series"`` for the
-        parent league/tournament chat. With ``get_positions`` (the default), each
-        comment's ``profile`` carries the author's holdings
-        (``positions: [{tokenId, positionSize}]``) — the position the app shows
-        next to each user.
-        """
-        params = {
-            "parent_entity_type": parent_entity_type,
-            "parent_entity_id": str(parent_entity_id),
-            "order": "createdAt",
-            "ascending": "true" if ascending else "false",
-            "limit": str(limit),
-            "offset": str(offset),
-        }
-        if get_positions:
-            params["get_positions"] = "true"
-        data = await self._get("/comments", params=params)
-        if not isinstance(data, list):
-            raise GammaError(f"unexpected /comments response type: {type(data).__name__}")
-        return data
-
-    async def backfill_since(
-        self,
-        parent_entity_id: str,
-        last_seen_id: str | None = None,
-        *,
-        parent_entity_type: str = "Event",
-        page_size: int = 100,
-        max_pages: int = 50,
-        get_positions: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Fetch comments for a parent entity created since ``last_seen_id`` (exclusive).
-
-        The Gamma API has no ``since``/``after`` cursor, so this pages
-        **descending** (newest first) and stops as soon as ``last_seen_id`` is
-        reached — fetching only the missed tail rather than the whole history.
-
-        Args:
-            parent_entity_id: Numeric id of the parent (an event id, or a series id).
-            last_seen_id: Id of the last comment already recorded for this parent.
-                ``None`` pulls up to ``max_pages`` of the most recent comments.
-            parent_entity_type: ``"Event"`` (default) or ``"Series"``.
-            page_size: Comments per page.
-            max_pages: Safety bound on pages walked.
-            get_positions: Request author holdings inline (default on). **Note:**
-                backfilled holdings reflect *fetch* time, not the comment's original
-                post time — see the ``ts_recv`` snapshot note in ``README.md`` /
-                ``PROTOCOL.md`` (holdings change over a match).
-
-        Returns:
-            Missed comments in chronological (oldest-first) order. Downstream
-            de-duplication still guards against any overlap with the live stream.
-        """
-        collected: list[dict[str, Any]] = []
-        reached = False
-        for page in range(max_pages):
-            batch = await self.fetch_comments(
-                parent_entity_id,
-                parent_entity_type=parent_entity_type,
-                limit=page_size,
-                offset=page * page_size,
-                ascending=False,
-                get_positions=get_positions,
-            )
-            if not batch:
-                break
-            for comment in batch:
-                if last_seen_id is not None and str(comment.get("id")) == str(last_seen_id):
-                    reached = True
-                    break
-                collected.append(comment)
-            if reached or len(batch) < page_size:
-                break
-            await asyncio.sleep(self._page_delay)  # be polite between pages
-        collected.reverse()  # chronological order
-        if last_seen_id is not None and not reached:
-            logger.warning(
-                "backfill for %s %s did not reach last-seen id %s within %d page(s); "
-                "possible gap in recovered comments",
-                parent_entity_type,
-                parent_entity_id,
-                last_seen_id,
-                max_pages,
-            )
-        logger.info(
-            "backfilled %d comment(s) for %s %s",
-            len(collected),
-            parent_entity_type,
-            parent_entity_id,
-        )
-        return collected

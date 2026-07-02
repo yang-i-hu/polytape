@@ -15,7 +15,7 @@ Design notes baked in from the adversarial security review:
   (``Restart=always`` does not undo it) and ``restart`` covers the legitimate need.
 - The heartbeat URL is strictly allow-listed: it is later written into the recorder's
   systemd ``EnvironmentFile``, where a newline/quote/``$`` could inject a second key or
-  clobber ``POLYTAPE_SALT``.
+  clobber another variable.
 - The URL is staged in a fixed file, never passed on argv (avoids ``ps`` leakage), and
   the action is encoded only as an allow-listed filename (no command interpolation).
 

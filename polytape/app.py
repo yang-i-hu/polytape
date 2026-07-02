@@ -24,12 +24,10 @@ from typing import Any
 import httpx
 
 from polytape.config import Config
-from polytape.envelope import Hasher
 from polytape.gamma import EventInfo, GammaClient, GammaError, cond_to_event
 from polytape.streams.base import ConnectFactory
 from polytape.streams.clob import BookStream, shard_tokens
-from polytape.streams.rtds import CommentStream
-from polytape.supervisor import StreamSupervisor, make_comment_backfill
+from polytape.supervisor import StreamSupervisor
 from polytape.writer import CaptureWriter, FatalRecorderError
 
 logger = logging.getLogger("polytape.app")
@@ -84,53 +82,33 @@ def _build_supervisors(
     config: Config,
     events: tuple[EventInfo, ...],
     writer: CaptureWriter,
-    gamma: GammaClient,
     connect: ConnectFactory | None,
     on_activity: Callable[[], None] | None = None,
 ) -> list[StreamSupervisor]:
-    """Construct supervisors: one comment firehose + one or more sharded book sockets.
+    """Construct supervisors: one or more sharded book sockets.
 
-    Comments for all events ride a single global firehose, filtered client-side to
-    the set of event ids *and* parent series ids (some products, e.g. the World Cup,
-    attach the comment feed to the parent Series rather than each Event). The union
-    of every event's CLOB token ids is sharded into sockets of <=180 tokens (whole
-    event groups, never split); each book message is routed to its event by
-    top-level ``market`` (condition id).
+    The union of every event's CLOB token ids is sharded into sockets of <=180
+    tokens (whole event groups, never split); each book message is routed to its
+    event by top-level ``market`` (condition id).
     """
     supervisors: list[StreamSupervisor] = []
-    if config.comments:
-        comments = CommentStream(
-            event_ids={e.event_id for e in events},
-            series_ids={s for e in events for s in e.series_ids},
-            writer=writer,
-            connect=connect,
-            on_activity=on_activity,
-        )
-        supervisors.append(
-            StreamSupervisor(
-                comments,
+    routing = cond_to_event(events)
+    shards = shard_tokens([e.clob_token_ids for e in events])
+    if shards:
+        for shard in shards:
+            book = BookStream(
+                token_ids=shard,
                 writer=writer,
-                backfill=make_comment_backfill(comments, gamma, writer),
+                connect=connect,
+                on_activity=on_activity,
+                cond_to_event=routing,
             )
+            supervisors.append(StreamSupervisor(book, writer=writer))
+        logger.info(
+            "book: %d token id(s) across %d shard(s)", sum(len(s) for s in shards), len(shards)
         )
-    if config.book:
-        routing = cond_to_event(events)
-        shards = shard_tokens([e.clob_token_ids for e in events])
-        if shards:
-            for shard in shards:
-                book = BookStream(
-                    token_ids=shard,
-                    writer=writer,
-                    connect=connect,
-                    on_activity=on_activity,
-                    cond_to_event=routing,
-                )
-                supervisors.append(StreamSupervisor(book, writer=writer))
-            logger.info(
-                "book: %d token id(s) across %d shard(s)", sum(len(s) for s in shards), len(shards)
-            )
-        else:
-            logger.warning("book stream requested but events have no CLOB token ids; skipping book")
+    else:
+        logger.warning("events have no CLOB token ids; nothing to record")
     return supervisors
 
 
@@ -152,7 +130,6 @@ async def run(
     Returns:
         A process exit code.
     """
-    hasher = Hasher() if config.hash_usernames else None
     own_gamma = gamma is None
     if gamma is None:
         gamma = GammaClient()
@@ -173,14 +150,14 @@ async def run(
 
     try:
         events = await gamma.resolve_events(config.event_ids, config.market_ids)
-        writer = CaptureWriter(config, event_infos=events, hasher=hasher)
+        writer = CaptureWriter(config, event_infos=events)
         writer.open()
 
         supervisors = _build_supervisors(
-            config, events, writer, gamma, connect, on_activity=_mark_activity
+            config, events, writer, connect, on_activity=_mark_activity
         )
         if not supervisors:
-            logger.error("nothing to record (book requested but the event has no CLOB token ids)")
+            logger.error("nothing to record (the event has no CLOB token ids)")
             return 1
         tasks = [asyncio.create_task(s.run(), name=f"polytape.{s.name}") for s in supervisors]
         # Keep meta.json fresh so the admin dashboard reads per-match counts + freshness

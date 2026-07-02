@@ -28,7 +28,7 @@ def make_book_capture(tmp_path):
     """
 
     def _make(event_id: str = "20200") -> object:
-        cfg = Config(event_id=event_id, out_dir=tmp_path, comments=False, book=True, dry_run=True)
+        cfg = Config(event_id=event_id, out_dir=tmp_path, dry_run=True)
         event = EventInfo(
             event_id=event_id,
             title="Cap Event",
@@ -42,7 +42,7 @@ def make_book_capture(tmp_path):
             clock[0] += timedelta(seconds=1)
             return _iso(clock[0])
 
-        with CaptureWriter(cfg, event_info=event, hasher=None, now=now) as w:
+        with CaptureWriter(cfg, event_info=event, now=now) as w:
             w.write(
                 "book",
                 {

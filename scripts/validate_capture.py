@@ -26,8 +26,7 @@ def validate_event_dir(event_dir: Path) -> bool:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         print(
             f"  meta.json: event={meta.get('event_id')} streams={meta.get('streams')} "
-            f"counts={meta.get('counts')} gaps={len(meta.get('gaps', []))} "
-            f"hashing={meta.get('hashing', {}).get('enabled')}"
+            f"counts={meta.get('counts')} gaps={len(meta.get('gaps', []))}"
         )
     else:
         print("  WARNING: no meta.json")

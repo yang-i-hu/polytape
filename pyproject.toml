@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "polytape"
 version = "0.1.0"
-description = "Record Polymarket's public real-time comment and order-book feeds to timestamped JSONL."
+description = "Record Polymarket's public real-time order-book feed to timestamped JSONL."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

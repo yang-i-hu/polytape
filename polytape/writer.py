@@ -1,9 +1,9 @@
 """JSONL capture writer: per-stream append-only files, dedup, and ``meta.json``.
 
-The :class:`CaptureWriter` is the single sink for the whole pipeline. Streams,
-backfill, and the dry-run mock all hand it raw messages; it envelopes them,
-de-duplicates by id, appends one flushed JSON line per stream file, and keeps
-``meta.json`` current (start/stop times, counts, and a gap audit log).
+The :class:`CaptureWriter` is the single sink for the whole pipeline. Streams
+and the dry-run mock hand it raw messages; it envelopes them, de-duplicates by
+id, appends one flushed JSON line per stream file, and keeps ``meta.json``
+current (start/stop times, counts, and a gap audit log).
 
 The writer is synchronous (fast, append + flush per line) and intended to be
 called from the async stream tasks.
@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
 from polytape import __version__
-from polytape.config import STREAM_COMMENTS, Config
-from polytape.envelope import Hasher, build_envelope, iso_to_datetime, utc_now_iso
+from polytape.config import Config
+from polytape.envelope import build_envelope, iso_to_datetime, utc_now_iso
 
 if TYPE_CHECKING:
     from polytape.gamma import EventInfo
@@ -31,8 +31,8 @@ logger = logging.getLogger("polytape.writer")
 # Cap the per-stream in-memory dedup set so a long high-volume capture cannot grow
 # it without bound (a 12h busy book feed could otherwise reach multiple GB and OOM
 # a small VM). Real duplicates are recency-bounded — the CLOB resends the book
-# snapshot only on reconnect, and comment backfill overlaps just the last page — so
-# an oldest-first eviction at this size never drops an id that could still recur.
+# snapshot only on reconnect — so an oldest-first eviction at this size never
+# drops an id that could still recur.
 _SEEN_CAP = 500_000
 
 
@@ -59,8 +59,8 @@ class CaptureWriter:
 
     Use as a context manager::
 
-        with CaptureWriter(config, event_info=ev, hasher=hasher) as w:
-            w.write("comments", raw_msg)
+        with CaptureWriter(config, event_info=ev) as w:
+            w.write("book", raw_msg)
     """
 
     def __init__(
@@ -69,7 +69,6 @@ class CaptureWriter:
         *,
         event_info: EventInfo | None = None,
         event_infos: Sequence[EventInfo] | None = None,
-        hasher: Hasher | None = None,
         now: Any = utc_now_iso,
     ) -> None:
         self._config = config
@@ -81,7 +80,6 @@ class CaptureWriter:
             self._event_infos = ()
         # Primary event kept for back-compat single-event meta fields.
         self._event_info = self._event_infos[0] if self._event_infos else None
-        self._hasher = hasher
         self._now = now
         self._dir: Path = config.event_dir
         self._files: dict[str, TextIO] = {}
@@ -176,9 +174,9 @@ class CaptureWriter:
         ``event_id`` (keyword-only, optional) attributes the message to an event for
         per-event counts in ``meta.json``. It is **not** stored in the envelope — the
         record stays the documented 5-key shape; the event is recoverable from
-        ``raw`` (``parentEntityID`` for comments, ``market`` for book).
+        ``raw`` (``market`` for book).
         """
-        envelope = build_envelope(stream, raw, hasher=self._hasher, ts_recv=self._now())
+        envelope = build_envelope(stream, raw, ts_recv=self._now())
         wrote = self.write_envelope(envelope, event_id=event_id)
         if wrote:
             ts = envelope["ts_recv"]
@@ -256,7 +254,6 @@ class CaptureWriter:
         disconnected_at: str,
         reconnected_at: str,
         *,
-        backfilled: int = 0,
         note: str = "",
     ) -> dict[str, Any]:
         """Append a disconnect/recovery entry to the gap log and persist meta."""
@@ -265,17 +262,11 @@ class CaptureWriter:
             "disconnected_at": disconnected_at,
             "reconnected_at": reconnected_at,
             "downtime_seconds": _downtime_seconds(disconnected_at, reconnected_at),
-            "backfilled": backfilled,
             "note": note,
         }
         self._gaps.append(gap)
         self._write_meta()
-        logger.info(
-            "recorded gap on %s: down %ss, backfilled %d",
-            stream,
-            gap["downtime_seconds"],
-            backfilled,
-        )
+        logger.info("recorded gap on %s: down %ss", stream, gap["downtime_seconds"])
         return gap
 
     # -- introspection ------------------------------------------------------ #
@@ -365,14 +356,7 @@ class CaptureWriter:
             "market_ids": [c for e in self._event_infos for c in e.condition_ids],
             "clob_token_ids": [t for e in self._event_infos for t in e.clob_token_ids],
             "streams": list(self._config.enabled_streams),
-            # Comments are fetched with get_positions=true, so each comment carries
-            # the author's holdings (profile.positions) as a snapshot at ts_recv.
-            "holdings_captured": STREAM_COMMENTS in self._config.enabled_streams,
             "out_dir": self._dir.as_posix(),
-            "hashing": {
-                "enabled": self._hasher is not None,
-                "salt_fingerprint": self._hasher.fingerprint if self._hasher else None,
-            },
             "started_at": self._started_at,
             "stopped_at": self._stopped_at,
             "counts": dict(self._counts),
@@ -412,11 +396,6 @@ class CaptureWriter:
             "event_id": event_id,
             "run_name": self._config.run_name,
             "streams": list(self._config.enabled_streams),
-            "holdings_captured": STREAM_COMMENTS in self._config.enabled_streams,
-            "hashing": {
-                "enabled": self._hasher is not None,
-                "salt_fingerprint": self._hasher.fingerprint if self._hasher else None,
-            },
             "started_at": self._started_at,
             "stopped_at": self._stopped_at,
             "counts": dict(self._counts_by_event.get(event_id, {})),

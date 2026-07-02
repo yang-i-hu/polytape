@@ -2,7 +2,7 @@
 
 A finished match (rolled out of ``meta.events``) is immutable — the recorder never
 appends to it again — so its filtered slice can be extracted from the combined
-``book.jsonl`` / ``comments.jsonl`` ONCE and cached as ``event-<id>.tar.gz``. The
+``book.jsonl`` ONCE and cached as ``event-<id>.tar.gz``. The
 download route then serves that file directly instead of re-scanning the ~17 GB run
 on every request.
 
@@ -32,7 +32,9 @@ from polytape.envelope import utc_now_iso
 
 logger = logging.getLogger("polytape.admin.extractor")
 
-EXTRACT_SCHEMA = 1
+# v2 (2026-07): archives ship meta.json + book.jsonl only (comment recording removed).
+# has_complete_extract gates on this, so caches built by an older build are rebuilt.
+EXTRACT_SCHEMA = 2
 DEFAULT_CAP_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB of cached extracts
 
 # Real ids are Gamma numeric strings; this is defense-in-depth so a malformed id can
@@ -54,12 +56,22 @@ def marker_path(extract_dir: str | Path, event_id: str) -> Path:
 
 
 def has_complete_extract(extract_dir: str | Path, event_id: str) -> bool:
-    """True iff a finished, fully-published extract exists (marker AND tarball)."""
+    """True iff a finished, fully-published, CURRENT-schema extract exists.
+
+    Requires the marker AND the tarball, and the marker's ``schema`` to match
+    :data:`EXTRACT_SCHEMA` — an archive cached by an older build (different
+    contents) is treated as absent and rebuilt on demand.
+    """
     if not valid_event_id(event_id):
         return False
-    return (
-        marker_path(extract_dir, event_id).exists() and archive_path(extract_dir, event_id).exists()
-    )
+    mp = marker_path(extract_dir, event_id)
+    if not (mp.exists() and archive_path(extract_dir, event_id).exists()):
+        return False
+    try:
+        marker = json.loads(mp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(marker, dict) and marker.get("schema") == EXTRACT_SCHEMA
 
 
 def _write_marker(extract_dir: Path, event_id: str, *, exported_at: str) -> None:
