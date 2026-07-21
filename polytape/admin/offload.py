@@ -14,6 +14,12 @@ untouched. A small marker (``matches/event-<id>.offloaded.json``) records the
 object so (a) the admin download path can serve the match with a signed URL, and
 (b) a re-run skips already-offloaded matches (idempotent).
 
+**Completeness.** A match that straddled the per-match dual-write deploy has a
+PARTIAL native ``book.jsonl`` (only the post-deploy tail). Selection runs the same
+:func:`polytape.admin.download.have_native_matches` gate as the admin download
+path, so a partial native is never archived as the match's canonical copy — it is
+skipped (with a warning) until rebuilt from the monolith.
+
 **Graceful degradation.** Even without the admin's signed-URL fast path, a
 download of an offloaded match still works: with the native dir gone,
 ``download.have_native_matches`` returns False and the route falls back to the
@@ -96,12 +102,18 @@ def native_event_dirs(run_dir: str | Path) -> list[str]:
 def offloadable_event_ids(run_dir: str | Path, meta: dict[str, Any]) -> list[str]:
     """Finished matches whose native dir can be offloaded now.
 
-    A match qualifies iff it has a native ``matches/event-<id>/book.jsonl``, is NOT
-    in the current open set (i.e. finished/immutable), and is not already offloaded.
-    The monolith is the backstop, so this is deliberately simple — it never touches
-    a still-recording match.
+    A match qualifies iff it has a COMPLETE native ``matches/event-<id>/book.jsonl``
+    (same :func:`~polytape.admin.download.have_native_matches` gate as the admin
+    download path — a partial native from a match that straddled the per-match
+    deploy must never become the archived canonical copy), is NOT in the current
+    open set (i.e. finished/immutable), and is not already offloaded. The monolith
+    is the backstop, so this is deliberately simple — it never touches a
+    still-recording match.
     """
-    matches_dir = Path(run_dir) / "matches"
+    from polytape.admin.download import have_native_matches
+
+    run_dir = Path(run_dir)
+    matches_dir = run_dir / "matches"
     open_ids = open_event_ids(meta)
     out: list[str] = []
     for eid in native_event_dirs(run_dir):
@@ -109,6 +121,14 @@ def offloadable_event_ids(run_dir: str | Path, meta: dict[str, Any]) -> list[str
             continue  # still recording — never touch
         if is_offloaded(matches_dir, eid):
             continue  # already archived
+        if not have_native_matches(run_dir, [eid], meta):
+            logger.warning(
+                "offload: event %s native book.jsonl is PARTIAL (fewer lines than the "
+                "monolith count in meta.counts_by_event); skipping — rebuild it from "
+                "the monolith before offloading",
+                eid,
+            )
+            continue
         out.append(eid)
     return out
 
