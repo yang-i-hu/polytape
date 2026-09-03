@@ -81,8 +81,10 @@ def test_load_matches_open_only(tmp_path):
     from polytape.cli import load_matches
 
     p = _write_matches(tmp_path)
-    assert load_matches(str(p), open_only=True) == ("1001", "1003")  # closed skipped, deduped
-    assert load_matches(str(p), open_only=False) == ("1001", "1002", "1003")
+    sel = load_matches(str(p), open_only=True)
+    assert sel.event_ids == ("1001", "1003")  # closed skipped, deduped
+    assert sel.event_markets == {}  # no record_markets -> every market (back-compat)
+    assert load_matches(str(p), open_only=False).event_ids == ("1001", "1002", "1003")
 
 
 def test_cli_matches_file_is_multi(tmp_path):
