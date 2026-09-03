@@ -1,48 +1,45 @@
-# polytape finished-match offloader — moves FINISHED matches' per-match native files
-# (matches/event-<id>/) to a Coldline GCS bucket and removes them from local disk,
-# reclaiming ~half the run's SSD footprint (the per-match duplicates of the monolith).
+# polytape offloader — moves what the recorder has FINISHED with to a Coldline GCS
+# bucket and removes it from local disk: finished matches' per-match native dirs
+# (matches/event-<id>/) and sealed monolith segments. On an open-ended campaign this
+# is what keeps /data bounded — without it the run only ever grows.
 #
-# Oneshot, triggered hourly by polytape-offload.timer. Runs as root so it can remove
-# the root-owned matches/ dirs and read the SA key. SAFE: a native dir is deleted ONLY
-# after its tar.gz is uploaded AND verified in GCS; the monolith book.jsonl is never
-# touched and remains the on-disk backstop. See polytape/admin/offload.py.
+# Oneshot, triggered hourly by polytape-offload.timer. Runs as the recorder user
+# `polytape` (it only touches polytape-owned files under /data; nothing here needs
+# root). SAFE: a local file is deleted ONLY after its archive is uploaded AND verified
+# in GCS; a still-recording match / the live segment is never touched. See
+# polytape/admin/offload.py.
 #
-# Setup (once, on the VM):
-#   # scoped SA key (object access on ONLY the archive bucket):
-#   install -m 0600 -o root -g root offload-sa.json /etc/polytape/offload-sa.json
-#   # env file with the bucket + key + scratch (0644 ok; no secrets, just paths):
-#   cat >/etc/polytape/offload.env <<'ENV'
-#   POLYTAPE_RUN_DIR=/data/run-wc
-#   POLYTAPE_GCS_BUCKET=polytape-prod-194347-archive
-#   POLYTAPE_GCS_KEY=/etc/polytape/offload-sa.json
-#   POLYTAPE_GCS_STORAGE_CLASS=COLDLINE
-#   POLYTAPE_SCRATCH_DIR=/data/tmp/polytape-admin
-#   ENV
-#   cp deploy/polytape-offload.{service,timer} /etc/systemd/system/
-#   systemctl daemon-reload && systemctl enable --now polytape-offload.timer
+# Auth: Application Default Credentials from the VM's ATTACHED service account
+# (polytape-offload@polytape-prod-194347.iam.gserviceaccount.com, objectAdmin on the
+# archive bucket only, instance scope storage-rw). There is NO key file on this VM —
+# do not set POLYTAPE_GCS_KEY / GOOGLE_APPLICATION_CREDENTIALS in offload.env.
 #
-# The uploader uses /opt/polytape/venv (needs the [admin] extra -> google-cloud-storage).
+# Config: /etc/polytape/offload.env (see deploy/offload.env.example; bootstrap.sh
+# writes it). The uploader uses /opt/polytape/venv with the [admin] extra installed
+# (google-cloud-storage); the admin dashboard itself is NOT deployed.
 
 [Unit]
-Description=polytape finished-match offloader (per-match natives -> GCS, reclaim SSD)
+Description=polytape offloader (finished matches + sealed segments -> GCS Coldline)
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/data
 
 [Service]
 Type=oneshot
-User=root
-Group=root
+User=polytape
+Group=polytape
 EnvironmentFile=/etc/polytape/offload.env
 # Be gentle on the shared disk so the live recorder never starves for I/O.
 IOSchedulingClass=idle
 Nice=10
 ExecStart=/opt/polytape/venv/bin/python -m polytape.admin.offload --log-level INFO
-# The offloader writes ONLY under /data (tar scratch + deletes matches/ dirs); everything
-# else read-only. It never touches the recorder's monolith book.jsonl.
+# The offloader writes ONLY under /data (tar scratch, markers, deletes of archived
+# files); everything else read-only. It never touches the live monolith segment.
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/data
 ProtectHome=true
+PrivateTmp=true
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=polytape-offload
