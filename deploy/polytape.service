@@ -1,30 +1,34 @@
-# polytape recorder — systemd unit (Phase 0 deploy).
+# polytape recorder — systemd unit (maker campaign: open-ended, multi-family).
 #
-# Install on the recorder VM:
+# Records every event listed in /etc/polytape/campaign_events.json in ONE process
+# into /data/run-maker. That file is written by scripts/list_campaign_events.py from
+# the campaign spec /etc/polytape/campaign.json (sports main lines for several
+# leagues inside a lookahead window + the live/next hourly crypto strike ladders).
+# polytape-refresh.timer re-discovers the set every 10 min and restarts this unit
+# ONLY when the (event, recorded-market) set actually changed.
+#
+# Install: deploy/bootstrap.sh does all of this. By hand:
 #   sudo cp deploy/polytape.service /etc/systemd/system/polytape.service
 #   sudo systemctl daemon-reload && sudo systemctl enable --now polytape
 #   sudo journalctl -u polytape -f
 #
-# Secrets live in /etc/polytape/polytape.env (mode 0600, owner polytape), e.g.:
-#   POLYTAPE_EVENT_ID=<numeric id; legacy single-event ExecStart only>
-# The heartbeat URL is kept SEPARATELY in /etc/polytape/heartbeat.env (0640
-# root:polytape) so the admin sidecar can read its armed state (via group polytape)
-# and the control plane can rewrite it without touching the main env file:
-#   POLYTAPE_HEARTBEAT_URL=https://hc-ping.com/<uuid>   (optional; arms the watchdog)
+# Env files (unchanged from the WC deployment):
+#   /etc/polytape/polytape.env    0600 polytape:polytape — REQUIRED (may be empty:
+#                                 a public-feed capture needs no secrets)
+#   /etc/polytape/heartbeat.env   0640 root:polytape — optional
+#     POLYTAPE_HEARTBEAT_URL=https://hc-ping.com/<uuid>   (arms the dead-man's switch)
 #
-# This is the PRODUCTION multi-event unit: it records ALL open World Cup match
-# moneylines in one process via the discovery file into /data/run-wc. Keep this
-# file in sync with the live unit (`systemctl cat polytape`).
-#
-# Restart=always recovers crashes and the post-migration reconnect; on a
-# *persistent* fatal (e.g. disk full -> exit 2) the process keeps dying, no data is
-# written, and the external heartbeat stays dead -> healthchecks.io alerts. systemd
-# alone would loop forever silently, which is why the heartbeat is the real backstop.
+# Restart=always recovers crashes and the refresh roll-over; on a *persistent* fatal
+# (e.g. disk full -> exit 2) the process keeps dying, nothing is written, and the
+# external heartbeat (if armed) goes quiet -> alert. systemd alone would loop silently.
+# RequiresMountsFor=/data: never start — and never write into the small root fs — if
+# the data disk (a separate pd-balanced volume mounted with `nofail`) is not mounted.
 
 [Unit]
-Description=polytape Polymarket recorder
+Description=polytape Polymarket recorder (maker campaign)
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/data
 
 [Service]
 Type=simple
@@ -33,7 +37,7 @@ Group=polytape
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/polytape/polytape.env
 EnvironmentFile=-/etc/polytape/heartbeat.env
-ExecStart=/opt/polytape/venv/bin/polytape --matches-file /etc/polytape/wc_matches.json --open-only --run-name wc --out /data --log-level INFO
+ExecStart=/opt/polytape/venv/bin/polytape --matches-file /etc/polytape/campaign_events.json --open-only --run-name maker --out /data --log-level INFO
 # Legacy single-event mode (writes /data/event-<id>); swap the ExecStart above for:
 #   ExecStart=/opt/polytape/venv/bin/polytape --event-id ${POLYTAPE_EVENT_ID} --out /data --log-level INFO
 Restart=always

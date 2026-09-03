@@ -1,11 +1,20 @@
-# Oneshot: re-discover the open World Cup match set and restart polytape if it
-# changed (rolls resolved matches out, new fixtures in). Driven by the timer.
-# Runs as root (needs to write /etc/polytape and restart the service).
+# Oneshot: re-discover the campaign's OPEN event set and restart polytape ONLY if
+# the (event, recorded-market) set changed — finished games / expired strike ladders
+# roll out, new fixtures / the next hour's ladder roll in. Driven by the timer.
+# Runs as root (writes /etc/polytape/campaign_events.json and restarts the unit).
 [Unit]
-Description=polytape match-set refresh (roll out resolved, roll in new)
+Description=polytape campaign event-set refresh (roll out finished, roll in new)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/opt/polytape/polytape-refresh.sh
+# Hardening: root is needed for /etc/polytape + systemctl; the write surface is just
+# the config dir and the lock dir. Discovery scratch lands in a private /tmp.
+ProtectSystem=strict
+ReadWritePaths=/etc/polytape /run/lock
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
