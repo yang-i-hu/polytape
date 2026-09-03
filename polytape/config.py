@@ -2,14 +2,45 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 
 # Canonical stream name — used for output file names, the envelope ``stream``
 # field, and ``meta.json``.
 STREAM_BOOK = "book"
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+def _normalize_event_markets(raw: Mapping[str, object]) -> Mapping[str, tuple[str, ...]]:
+    """Validate + freeze an ``event_id -> market ids`` allow-list mapping.
+
+    Keys and every listed id must be strings (a bare int would silently match
+    nothing at resolve time, so it is rejected here instead). Ids are stripped and
+    de-duplicated order-preservingly; an event whose list is empty is dropped from
+    the mapping, since "no allow-list" means "record every market".
+    """
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"event_markets must be a mapping, got {type(raw).__name__}")
+    out: dict[str, tuple[str, ...]] = {}
+    for key, ids in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"event_markets keys must be non-empty event id strings, got {key!r}")
+        if isinstance(ids, str) or not hasattr(ids, "__iter__"):
+            raise ValueError(
+                f"event_markets[{key!r}] must be a list/tuple of market ids, got {ids!r}"
+            )
+        cleaned: dict[str, None] = {}
+        for mid in ids:
+            if not isinstance(mid, str):
+                raise ValueError(f"event_markets[{key!r}]: market ids must be strings, got {mid!r}")
+            if mid.strip():
+                cleaned[mid.strip()] = None
+        if cleaned:
+            out[key.strip()] = tuple(cleaned)
+    return MappingProxyType(out)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +64,14 @@ class Config:
         out_dir: Output root. Single event -> ``out_dir/event-<id>``; multiple
             events (or an explicit ``run_name``) -> ``out_dir/run-<name>``.
         market_ids: Optional explicit market id(s) to record instead of every
-            market in each event. Empty means "auto-resolve".
+            market in each event (the global ``--market-id`` override). Empty
+            means "auto-resolve". Applies to *every* event and composes with
+            ``event_markets`` as an intersection.
+        event_markets: Optional per-event allow-list: ``event_id -> market ids``
+            (Gamma market ids and/or ``conditionId``s), read from a matches file's
+            ``record_markets`` entries. An event absent from the mapping records
+            every market it has (the pre-campaign behaviour). Frozen and validated:
+            every id must be a string; empty lists are dropped.
         per_match: Also write each event-tagged record to a per-match file under
             ``event_dir/matches/event-<id>/<stream>.jsonl`` (the PRIMARY, ready-to-use
             per-match output), in addition to the monolithic ``<stream>.jsonl`` (kept
@@ -48,6 +86,7 @@ class Config:
     run_name: str | None = None
     out_dir: Path = Path("./data")
     market_ids: tuple[str, ...] = ()
+    event_markets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     per_match: bool = True
     dry_run: bool = False
     log_level: str = "INFO"
@@ -62,6 +101,7 @@ class Config:
         # Frozen dataclass: settle the canonical fields via object.__setattr__.
         object.__setattr__(self, "event_ids", ids)
         object.__setattr__(self, "event_id", ids[0])
+        object.__setattr__(self, "event_markets", _normalize_event_markets(self.event_markets))
         if not self.dry_run:
             non_numeric = [i for i in ids if not i.isdigit()]
             if non_numeric:

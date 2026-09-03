@@ -149,7 +149,9 @@ async def run(
         last_activity[0] = loop.time()
 
     try:
-        events = await gamma.resolve_events(config.event_ids, config.market_ids)
+        events = await gamma.resolve_events(
+            config.event_ids, config.market_ids, event_markets=config.event_markets
+        )
         writer = CaptureWriter(config, event_infos=events)
         writer.open()
 
