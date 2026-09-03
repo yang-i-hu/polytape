@@ -222,8 +222,8 @@ def test_segment_paths_and_names(tmp_path):
         run / "segments" / "book.2026-09-02.offloaded.json"
     )
     assert (
-        ofl.segment_object_name("matches", run, "book.2026-09-02.jsonl")
-        == "matches/run-camp/segments/book.2026-09-02.jsonl.zst"
+        ofl.segment_object_name("run-camp", "book.2026-09-02.jsonl")
+        == "run-camp/segments/book.2026-09-02.jsonl.zst"
     )
     assert ofl.open_segments({"segments": {"book": {"current": "book.2026-09-03.jsonl"}}}) == {
         "book.2026-09-03.jsonl"
@@ -251,10 +251,10 @@ def test_offload_segments_archives_closed_segments_only(tmp_path):
     )
     assert done == ["book.2026-09-01.jsonl", "book.2026-09-02.jsonl"]
 
-    # objects: <prefix>/<run-dir-name>/segments/<segment>.zst holding the compressor's bytes
-    obj = "matches/run-camp/segments/book.2026-09-01.jsonl.zst"
+    # objects: <prefix>/segments/<segment>.zst holding the compressor's bytes
+    obj = "matches/segments/book.2026-09-01.jsonl.zst"
     assert be.objects[obj] == b"ZSTD" + b"s1a\ns1b\n"
-    assert "matches/run-camp/segments/book.2026-09-02.jsonl.zst" in be.objects
+    assert "matches/segments/book.2026-09-02.jsonl.zst" in be.objects
 
     # local segments gone; today's segment, the legacy monolith and the native untouched
     assert not (run / "book.2026-09-01.jsonl").exists()
@@ -329,7 +329,7 @@ def test_offload_segment_keeps_local_on_compress_or_upload_failure(tmp_path):
         ofl.offload_segment(run, "book.2026-09-01.jsonl", be, now_iso="t", compressor=broken)
     assert (run / "book.2026-09-01.jsonl").exists() and be.objects == {}
 
-    be.fail_upload_for.add("matches/run-camp/segments/book.2026-09-01.jsonl.zst")
+    be.fail_upload_for.add("matches/segments/book.2026-09-01.jsonl.zst")
     with pytest.raises(OSError, match="upload failure"):
         ofl.offload_segment(run, "book.2026-09-01.jsonl", be, now_iso="t", compressor=fake_compress)
     assert (run / "book.2026-09-01.jsonl").exists()
@@ -350,7 +350,7 @@ def test_offload_segment_refuses_non_segment_names(tmp_path):
 def test_offload_segments_batch_survives_one_failure(tmp_path):
     run = _make_run(tmp_path)
     be = FakeBackend()
-    be.fail_upload_for.add("matches/run-camp/segments/book.2026-09-01.jsonl.zst")
+    be.fail_upload_for.add("matches/segments/book.2026-09-01.jsonl.zst")
     done = ofl.offload_segments(run, be, today=TODAY, compressor=fake_compress)
     assert done == ["book.2026-09-02.jsonl"]
     assert (run / "book.2026-09-01.jsonl").exists()  # kept for the next run
@@ -456,8 +456,8 @@ def test_cli_default_runs_matches_then_segments(tmp_path, cli_env, capsys):
     assert (run / "book.2020-01-03.jsonl").exists()  # open per meta -> untouched
     assert sorted(cli_env.objects) == [
         "matches/event-0900.tar.gz",
-        "matches/run-cli/segments/book.2020-01-01.jsonl.zst",
-        "matches/run-cli/segments/book.2020-01-02.jsonl.zst",
+        "matches/segments/book.2020-01-01.jsonl.zst",
+        "matches/segments/book.2020-01-02.jsonl.zst",
     ]
 
 

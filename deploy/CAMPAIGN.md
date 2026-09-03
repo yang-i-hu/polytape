@@ -256,7 +256,7 @@ Counts in `meta.json` continue cumulatively across restarts.
 
 **Pull data for research**: from GCS (`gcloud storage cp -r gs://$BUCKET/run-maker/ ...`
 — Coldline retrieval + egress are billed, see §8); the archive holds finished matches
-(`run-maker/matches/event-<id>.tar.gz`, byte-exact `book.jsonl` + `meta.json`) and
+(`run-maker/event-<id>.tar.gz`, byte-exact `book.jsonl` + `meta.json`; closed daily segments go to `run-maker/segments/book.<day>.jsonl.zst`) and
 the sealed monolith segments. Only the live segment and the still-open matches are on
 the VM.
 

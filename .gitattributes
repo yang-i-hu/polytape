@@ -1,0 +1,6 @@
+# Shell scripts and deploy assets must stay LF: they are copied onto a Linux VM verbatim.
+*.sh text eol=lf
+deploy/** text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+*.path text eol=lf

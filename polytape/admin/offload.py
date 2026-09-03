@@ -27,7 +27,7 @@ day is before today, nothing has written to it for ``min_age_s`` (15 min by defa
 comfortably past the roll-over) and the recorder's ``meta.json#segments`` does not
 name it as open. A closed segment is compressed with the ``zstd`` CLI
 (``zstd -T0 -6 -q -o <scratch>.zst <segment>``; injectable for tests), uploaded to
-``<prefix>/<run-dir-name>/segments/book.<day>.jsonl.zst``, verified byte-exact in
+``<prefix>/segments/book.<day>.jsonl.zst``, verified byte-exact in
 GCS, recorded in the marker ``segments/book.<day>.offloaded.json`` and only then
 deleted locally, along with the scratch ``.zst``. The segment sweep never touches
 today's segment, the legacy ``book.jsonl`` or any per-match native; a failure at any
@@ -132,10 +132,12 @@ def is_segment_offloaded(run_dir: str | Path, segment: str) -> bool:
     return bool(marker and marker.get("gs_uri"))
 
 
-def segment_object_name(prefix: str, run_dir: str | Path, segment: str) -> str:
-    """GCS object name for a segment: ``<prefix>/<run-dir-name>/segments/<segment>.zst``
-    (e.g. ``matches/run-camp/segments/book.2026-09-02.jsonl.zst``)."""
-    return f"{prefix.rstrip('/')}/{Path(run_dir).name}/{SEGMENTS_DIRNAME}/{segment}.zst"
+def segment_object_name(prefix: str, segment: str) -> str:
+    """GCS object name for a segment: ``<prefix>/segments/<segment>.zst``
+    (e.g. ``run-maker/segments/book.2026-09-02.jsonl.zst``). The prefix is the
+    campaign's namespace in the bucket (finished matches sit beside it as
+    ``<prefix>/event-<id>.tar.gz``), so one prefix per run keeps runs apart."""
+    return f"{prefix.rstrip('/')}/{SEGMENTS_DIRNAME}/{segment}.zst"
 
 
 # --------------------------------------------------------------------------- #
@@ -508,7 +510,7 @@ def offload_segment(
     Steps, in order (the delete is LAST and only after a verified upload):
       1. (optionally) count the segment's lines for the marker,
       2. compress into a scratch ``<segment>.zst`` with ``compressor``,
-      3. upload to ``<prefix>/<run-dir-name>/segments/<segment>.zst``,
+      3. upload to ``<prefix>/segments/<segment>.zst``,
       4. verify the object exists in GCS with the exact local ``.zst`` size (and that
          the segment did not grow meanwhile),
       5. write the marker ``segments/book.<day>.offloaded.json`` (atomically),
@@ -533,7 +535,7 @@ def offload_segment(
     if not src.is_file():
         raise FileNotFoundError(f"no local segment {segment}")
 
-    name = segment_object_name(prefix, run_dir, segment)
+    name = segment_object_name(prefix, segment)
     scratch_root = Path(scratch_dir) if scratch_dir else None
     if scratch_root:
         scratch_root.mkdir(parents=True, exist_ok=True)

@@ -682,7 +682,7 @@ def test_main_end_to_end_writes_contract_and_summary(tmp_path, monkeypatch, caps
             } <= set(m)
             assert m["clobTokenIds"]
     # The recorder's existing matches-file loader reads it as-is.
-    assert load_matches(str(out)) == ("960280", "960301", "945719", "945983", "930715")
+    assert load_matches(str(out)).event_ids == ("960280", "960301", "945719", "945983", "930715")
     # Ladder slugs were looked up for now-1..now+2 for both assets; the closed one was dropped.
     looked_up = [c["slug"] for c in fake.calls if "slug" in c]
     assert len(looked_up) == 8 and "bitcoin-above-on-september-3-2026-3pm-et" in looked_up
@@ -713,8 +713,10 @@ def test_main_no_open_only_keeps_closed_ladder(tmp_path, monkeypatch, capsys, no
     assert lce.main([*args, "--no-open-only"]) == 0
     data = json.loads(out.read_text(encoding="utf-8"))
     assert [e["event_id"] for e in data] == ["960279"] and data[0]["closed"] is True
-    assert load_matches(str(out)) == ()  # the recorder's default --open-only still skips it
-    assert load_matches(str(out), open_only=False) == ("960279",)
+    assert (
+        load_matches(str(out)).event_ids == ()
+    )  # the recorder's default --open-only still skips it
+    assert load_matches(str(out), open_only=False).event_ids == ("960279",)
 
 
 def test_main_reports_gamma_failure_and_bad_spec(tmp_path, monkeypatch, capsys, no_delay):
