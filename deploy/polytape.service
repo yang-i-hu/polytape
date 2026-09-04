@@ -37,7 +37,7 @@ Group=polytape
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/polytape/polytape.env
 EnvironmentFile=-/etc/polytape/heartbeat.env
-ExecStart=/opt/polytape/venv/bin/polytape --matches-file /etc/polytape/campaign_events.json --open-only --run-name maker --out /data --log-level INFO
+ExecStart=/opt/polytape/venv/bin/polytape --matches-file /etc/polytape/campaign_events.json --open-only --run-name maker --no-per-match --out /data --log-level INFO
 # Legacy single-event mode (writes /data/event-<id>); swap the ExecStart above for:
 #   ExecStart=/opt/polytape/venv/bin/polytape --event-id ${POLYTAPE_EVENT_ID} --out /data --log-level INFO
 Restart=always

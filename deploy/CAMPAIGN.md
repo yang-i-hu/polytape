@@ -19,7 +19,7 @@ teardown. The mechanics live in `deploy/` (units, scripts) and are installed by
 | Data disk | `polytape-data2` — 200 GB pd-balanced, attached as device-name `polytape-data2` (`/dev/disk/by-id/google-polytape-data2`), mounted at `/data` |
 | Service account (attached) | `polytape-offload@polytape-prod-194347.iam.gserviceaccount.com` — objectAdmin on the archive bucket ONLY; instance scope `storage-rw` |
 | Archive bucket | `gs://polytape-prod-194347-archive` (exists; Coldline objects under `run-maker/` — `event-<id>.tar.gz` and `segments/`; the World Cup run's `matches/` and `run-wc/` sit beside it) |
-| Run dir | `/data/run-maker` (`polytape --run-name maker --out /data`) |
+| Run dir | `/data/run-maker` (`polytape --run-name maker --no-per-match --out /data`; monolith segments only — measured ~45 MB/min in game hours, so no per-match dual write) |
 
 ---
 
@@ -27,7 +27,7 @@ teardown. The mechanics live in `deploy/` (units, scripts) and are installed by
 
 ```
 polytape.service            recorder: --matches-file /etc/polytape/campaign_events.json
-                            --open-only --run-name maker --out /data      (user polytape)
+                            --open-only --run-name maker --no-per-match --out /data   (user polytape)
 polytape-refresh.timer      every 10 min: list_campaign_events.py --spec campaign.json,
                             compare the (event, recorded-market) set, install + restart
                             the recorder ONLY on a genuine change              (root)
