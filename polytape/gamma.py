@@ -493,7 +493,9 @@ class GammaClient:
                 "event %s has no CLOB token ids; the book stream has nothing to subscribe to",
                 event_id,
             )
-        logger.info(
+        # DEBUG, not INFO: a campaign restart resolves hundreds of events at once, and
+        # one line each would bury the journal (the resolve_events summary stays INFO).
+        logger.debug(
             "resolved event %s: %d market(s), %d CLOB token id(s)",
             event_id,
             len(info.markets),

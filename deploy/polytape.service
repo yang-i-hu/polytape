@@ -44,6 +44,9 @@ Restart=always
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# One per-match handle per open event (hundreds on a CFB Saturday) + shards + meta
+# temp files: leave real headroom over the 1024 default.
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=polytape

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import time
@@ -68,6 +69,12 @@ def _write_lines(path: Path, lines) -> None:
 def _age(path: Path, seconds: float) -> None:
     t = time.time() - seconds
     os.utime(path, (t, t))
+
+
+@pytest.fixture(autouse=True)
+def _no_headroom(monkeypatch):
+    """tmp_path sits on whatever disk CI has; the headroom rule is tested explicitly."""
+    monkeypatch.setattr(ofl, "DEFAULT_HEADROOM_BYTES", 0)
 
 
 def _run_meta(open_segment: str | None = "book.2026-09-03.jsonl") -> dict:
@@ -366,6 +373,32 @@ def test_offload_segments_without_meta_still_guards_by_day_and_age(tmp_path):
     assert (run / "book.2026-09-03.jsonl").exists()
 
 
+def test_offload_segment_refuses_to_stage_without_headroom(tmp_path, monkeypatch):
+    # The .zst is staged on the run volume: never push the recorder into ENOSPC for it.
+    run = _make_run(tmp_path)
+    be = FakeBackend()
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(ofl.shutil, "disk_usage", lambda p: usage(100, 99, 1))
+    with pytest.raises(OSError, match="not enough free space"):
+        ofl.offload_segment(
+            run,
+            "book.2026-09-01.jsonl",
+            be,
+            now_iso="t",
+            compressor=fake_compress,
+            headroom_bytes=1000,
+        )
+    assert be.objects == {} and (run / "book.2026-09-01.jsonl").exists()
+    monkeypatch.setattr(ofl.shutil, "disk_usage", lambda p: usage(10**12, 0, 10**12))
+    assert ofl.offload_segments(run, be, today=TODAY, compressor=fake_compress) == [
+        "book.2026-09-01.jsonl",
+        "book.2026-09-02.jsonl",
+    ]  # the module default is 0 here (fixture); the CLI's default is 5 GiB
+    assert ofl.DEFAULT_HEADROOM_BYTES == 0 and ofl._headroom(None) == 0
+    monkeypatch.setattr(ofl, "DEFAULT_HEADROOM_BYTES", 7)
+    assert ofl._headroom(None) == 7 and ofl._headroom(3) == 3
+
+
 # --------------------------------------------------------------------------- #
 # zstd CLI wrapper (subprocess is faked; never spawns the real binary)
 # --------------------------------------------------------------------------- #
@@ -433,6 +466,7 @@ def _cli_run(tmp_path: Path) -> Path:
     native = run / "matches" / "event-0900"
     native.mkdir(parents=True)
     _write_lines(native / "book.jsonl", ["n"])
+    _age(native / "book.jsonl", 3600)  # quiet for an hour: finished
     (native / "meta.json").write_text("{}", encoding="utf-8")
     return run
 
@@ -486,3 +520,14 @@ def test_cli_list_shows_both_sweeps_and_min_age(tmp_path, cli_env, capsys):
     # a huge --min-age makes every segment "too young"
     assert ofl.main(["--run-dir", str(run), "--bucket", "b", "--list", "--min-age", "1e9"]) == 0
     assert "offloadable segments (0): (none)" in capsys.readouterr().out
+    # likewise --match-min-age for matches; and an --events-file naming the match protects it
+    base = ["--run-dir", str(run), "--bucket", "b", "--list"]
+    assert ofl.main([*base, "--match-min-age", "1e9"]) == 0
+    assert "offloadable matches (0): (none)" in capsys.readouterr().out
+    events = tmp_path / "campaign_events.json"
+    events.write_text(json.dumps([{"event_id": "0900", "closed": False}]), encoding="utf-8")
+    assert ofl.main([*base, "--events-file", str(events)]) == 0
+    assert "offloadable matches (0): (none)" in capsys.readouterr().out
+    assert ofl.main(["--run-dir", str(run), "--bucket", "b", "--events-file", str(events)]) == 0
+    assert "offloaded 0 match(es)" in capsys.readouterr().out
+    assert (run / "matches" / "event-0900").exists()

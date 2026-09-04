@@ -8,14 +8,19 @@
 #      /data via fstab (by UUID, `nofail`), own it to polytape. REFUSES to continue if
 #      /data would land on the 20 GB root fs (override: ALLOW_ROOT_DATA=1, dev only).
 #   4. /opt/polytape/{src,venv,scripts}: unpack the source tarball, pip install
-#      "src[admin]" (google-cloud-storage for the offloader — the admin dashboard itself
-#      is NOT installed as a service), copy the discovery script + helper scripts
+#      "src[admin]" under deploy/constraints.txt (the recorder deps pinned to uv.lock;
+#      google-cloud-storage for the offloader — the admin dashboard itself is NOT
+#      installed as a service; no --upgrade), copy the discovery script + helper scripts
 #   5. /etc/polytape: campaign.json (from deploy/, never overwritten once installed),
 #      polytape.env, offload.env (ADC — no key file, no secrets)
-#   6. systemd units: polytape, polytape-refresh.{service,timer},
+#   6. systemd units: polytape (its --run-name follows RUN_NAME), polytape-refresh.{service,timer},
 #      polytape-offload.{service,timer}, polytape-scratch-janitor.{service,timer}
-#   7. one discovery pass -> /etc/polytape/campaign_events.json
-#   8. enable + start everything (an already-running recorder is RESTARTED = upgrade)
+#   7. one discovery pass -> /etc/polytape/campaign_events.json, ONLY when none is
+#      installed yet (a re-run leaves the live set to polytape-refresh.timer, which has
+#      the empty-set guard and sticky main-line picks) and only if it found events
+#   8. enable everything, (re)start the recorder, THEN start the timers (an
+#      already-running recorder is RESTARTED = upgrade; the refresh timer would
+#      otherwise fire its own restart right behind this one)
 #
 # NOT installed, on purpose: polytape-admin (dashboard), polytape-control (privileged
 # intent bridge), polytape-autogrow (needs compute-rw on the SA), the admin tmpfiles.
@@ -26,14 +31,16 @@
 #
 # Inputs (env, all optional):
 #   SRC_TARBALL=/tmp/polytape-src.tar.gz            git-archive tarball of the repo (CAMPAIGN.md)
-#   DATA_DISK=/dev/disk/by-id/google-polytape-data  the attached data disk (GCE device-name)
+#   DATA_DISK=/dev/disk/by-id/google-polytape-data2 the attached data disk (GCE device-name
+#                                                   polytape-data2 on polytape-rec2)
 #   BUCKET=polytape-prod-194347-archive             Coldline archive bucket
-#   RUN_NAME=maker                                  -> /data/run-<RUN_NAME>
+#   RUN_NAME=maker                                  -> /data/run-<RUN_NAME>, polytape --run-name,
+#                                                   GCS prefix run-<RUN_NAME>
 #   SKIP_APT=0 / SKIP_DISCOVERY=0                   1 = skip that step
 set -euo pipefail
 
 SRC_TARBALL=${SRC_TARBALL:-/tmp/polytape-src.tar.gz}
-DATA_DISK=${DATA_DISK:-/dev/disk/by-id/google-polytape-data}
+DATA_DISK=${DATA_DISK:-/dev/disk/by-id/google-polytape-data2}
 DATA_MOUNT=/data
 BUCKET=${BUCKET:-polytape-prod-194347-archive}
 RUN_NAME=${RUN_NAME:-maker}
@@ -77,8 +84,14 @@ if mountpoint -q "$DATA_MOUNT"; then
     log "$DATA_MOUNT already mounted ($(findmnt -no SOURCE "$DATA_MOUNT"))"
 elif [ -b "$DATA_DISK" ]; then
     fstype=$(blkid -o value -s TYPE "$DATA_DISK" || true)
-    if [ -z "$fstype" ]; then
-        log "formatting $DATA_DISK (ext4, 0% reserved, discard)"
+    pttype=$(blkid -o value -s PTTYPE "$DATA_DISK" || true)
+    if [ -z "$fstype" ] && [ -n "$pttype" ]; then
+        # No filesystem on the whole device but a partition table: somebody's disk.
+        lsblk -f "$DATA_DISK" >&2 || true
+        die "$DATA_DISK carries a $pttype partition table; refusing to format it"
+    elif [ -z "$fstype" ]; then
+        log "formatting $DATA_DISK (ext4, 0% reserved, discard); before:"
+        lsblk -f "$DATA_DISK" || true
         mkfs.ext4 -q -m 0 -F -E lazy_itable_init=0,lazy_journal_init=0,discard "$DATA_DISK"
     elif [ "$fstype" != ext4 ]; then
         die "$DATA_DISK carries a $fstype filesystem; refusing to touch it"
@@ -97,7 +110,7 @@ elif [ -b "$DATA_DISK" ]; then
 elif [ "$ALLOW_ROOT_DATA" = 1 ]; then
     log "WARNING: no data disk; $DATA_MOUNT is on the root fs (ALLOW_ROOT_DATA=1 — dev only)"
 else
-    die "no block device at $DATA_DISK and $DATA_MOUNT is not a mount point — the recorder must not write to the root fs. Attach the disk (device-name polytape-data) or set DATA_DISK=; see CAMPAIGN.md"
+    die "no block device at $DATA_DISK and $DATA_MOUNT is not a mount point — the recorder must not write to the root fs. Attach the disk (device-name polytape-data2) or set DATA_DISK=/dev/disk/by-id/google-<device-name>; see CAMPAIGN.md"
 fi
 install -d -o polytape -g polytape -m 0755 "$DATA_MOUNT"
 install -d -o polytape -g polytape -m 0755 "$DATA_MOUNT/tmp"
@@ -122,7 +135,7 @@ find "$SRC.new/deploy" "$SRC.new/scripts" -type f \
     \( -name '*.sh' -o -name '*.py' -o -name '*.service' -o -name '*.timer' -o -name '*.path' \
        -o -name '*.conf' -o -name '*.example' -o -name '*.json' -o -name '*.md' \) \
     -exec sed -i 's/\r$//' {} +
-for f in scripts/list_campaign_events.py deploy/campaign.json "${UNITS[@]/#/deploy/}" "${HELPERS[@]/#/deploy/}"; do
+for f in scripts/list_campaign_events.py deploy/campaign.json deploy/constraints.txt "${UNITS[@]/#/deploy/}" "${HELPERS[@]/#/deploy/}"; do
     [ -f "$SRC.new/$f" ] || die "tarball is missing $f (build it from a branch that has the campaign work)"
 done
 rm -rf "$SRC.old"
@@ -135,7 +148,12 @@ if [ ! -x "$VENV/bin/python" ]; then
     python3 -m venv "$VENV"
 fi
 log "pip install polytape[admin] (google-cloud-storage for the offloader)"
-"$VENV/bin/pip" install --quiet --upgrade "$SRC[admin]"
+# -c deploy/constraints.txt pins the recorder dependencies (websockets, httpx, ...) to
+# the versions uv.lock holds — the set CI tests — so two bootstraps a week apart run
+# the same code; google-cloud-storage is not locked and floats within its floor. No
+# --upgrade: a re-run reinstalls the project from the new tree but never silently
+# moves an already-satisfied dependency.
+"$VENV/bin/pip" install --quiet -c "$SRC/deploy/constraints.txt" "$SRC[admin]"
 "$VENV/bin/python" -c 'import polytape, google.cloud.storage' \
     || die "venv import check failed (polytape / google-cloud-storage)"
 
@@ -168,9 +186,10 @@ if [ ! -f "$ETC/offload.env" ]; then
 # account. Do NOT add POLYTAPE_GCS_KEY / GOOGLE_APPLICATION_CREDENTIALS.
 POLYTAPE_RUN_DIR=$DATA_MOUNT/run-$RUN_NAME
 POLYTAPE_GCS_BUCKET=$BUCKET
-POLYTAPE_GCS_PREFIX=run-$RUN_NAME/matches
+POLYTAPE_GCS_PREFIX=run-$RUN_NAME
 POLYTAPE_GCS_STORAGE_CLASS=COLDLINE
 POLYTAPE_SCRATCH_DIR=$DATA_MOUNT/tmp/polytape-offload
+POLYTAPE_EVENTS_FILE=$ETC/campaign_events.json
 EOF
     chmod 0644 "$ETC/offload.env"
     log "wrote $ETC/offload.env"
@@ -178,29 +197,48 @@ fi
 
 # ---- 6. units -------------------------------------------------------------- #
 for u in "${UNITS[@]}"; do
-    install -m 0644 "$SRC/deploy/$u" "/etc/systemd/system/$u"
+    if [ "$u" = polytape.service ]; then
+        # The unit hard-codes the run name; keep it in lock-step with RUN_NAME (offload.env
+        # and the GCS prefix above), or the offloader would watch a run dir nobody writes.
+        sed "s|--run-name maker|--run-name $RUN_NAME|" "$SRC/deploy/$u" > "/etc/systemd/system/$u.tmp"
+        install -m 0644 "/etc/systemd/system/$u.tmp" "/etc/systemd/system/$u"
+        rm -f "/etc/systemd/system/$u.tmp"
+    else
+        install -m 0644 "$SRC/deploy/$u" "/etc/systemd/system/$u"
+    fi
 done
 systemctl daemon-reload
 # Deliberately NOT installed here: polytape-admin.service, polytape-admin.tmpfiles.conf,
 # polytape-control.{service,path}, polytape-autogrow.{service,timer} (see the header).
 
-# ---- 7. discovery once ----------------------------------------------------- #
-if [ "$SKIP_DISCOVERY" != 1 ]; then
+# ---- 7. discovery once (first install only) -------------------------------- #
+# On a re-run the live set is left to polytape-refresh.timer: it re-discovers with
+# --previous (sticky main-line picks), refuses an empty result and restarts only on a
+# genuine change. Installing a raw discovery here would bypass all of that.
+if [ "$SKIP_DISCOVERY" != 1 ] && [ ! -s "$ETC/campaign_events.json" ]; then
     tmp=$(mktemp)
     if "$VENV/bin/python" "$PREFIX/scripts/list_campaign_events.py" \
             --spec "$ETC/campaign.json" --out "$tmp" --open-only; then
-        install -o polytape -g polytape -m 0644 "$tmp" "$ETC/campaign_events.json"
-        log "discovery: $("$VENV/bin/python" "$PREFIX/polytape-event-set.py" --open-only --summary "$ETC/campaign_events.json")"
+        summary=$("$VENV/bin/python" "$PREFIX/polytape-event-set.py" --open-only --summary "$tmp" || echo "events=0")
+        case "$summary" in
+            events=0*)
+                log "WARNING: discovery found no open events ($summary); not installing it —" \
+                    "check the spec; polytape-refresh.timer retries every 10 min" ;;
+            *)
+                install -o polytape -g polytape -m 0644 "$tmp" "$ETC/campaign_events.json"
+                log "discovery: $summary" ;;
+        esac
     else
         log "WARNING: discovery failed; polytape-refresh.timer retries every 10 min" \
             "(the recorder cannot start until $ETC/campaign_events.json exists)"
     fi
     rm -f "$tmp"
+elif [ -s "$ETC/campaign_events.json" ]; then
+    log "keeping the installed $ETC/campaign_events.json (the refresh timer maintains it)"
 fi
 
-# ---- 8. enable + start ----------------------------------------------------- #
-systemctl enable --now polytape-refresh.timer polytape-offload.timer polytape-scratch-janitor.timer
-systemctl enable polytape
+# ---- 8. enable, (re)start the recorder, then the timers -------------------- #
+systemctl enable polytape polytape-refresh.timer polytape-offload.timer polytape-scratch-janitor.timer
 if [ -s "$ETC/campaign_events.json" ]; then
     if systemctl is-active --quiet polytape; then
         log "restarting polytape (upgrade; this is one capture gap)"
@@ -211,5 +249,8 @@ if [ -s "$ETC/campaign_events.json" ]; then
 else
     log "polytape enabled but NOT started: no $ETC/campaign_events.json yet (refresh timer will create it)"
 fi
+# Timers last: on a long-booted VM their OnBootSec is already past, so `--now` would
+# fire the refresh (and possibly a second restart) right behind the one above.
+systemctl start polytape-refresh.timer polytape-offload.timer polytape-scratch-janitor.timer
 
 log "done. Next: journalctl -u polytape -f   |   $PREFIX/healthcheck.sh   |   $PREFIX/polytape-refresh.sh --check"

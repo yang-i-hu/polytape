@@ -11,15 +11,28 @@ Two independent sweeps over one run directory (layout in :mod:`polytape.writer`)
         ├── event-<id>/{book.jsonl,meta.json}   per-match natives — the MATCH sweep
         └── event-<id>.offloaded.json           match marker (written by this module)
 
-**Matches.** A finished match (rolled out of ``meta.events``) is immutable — the
-recorder never appends to it again. Its per-match native dir
-(``matches/event-<id>/{book.jsonl,meta.json}``) duplicates data already held in
-the monolith, so it can be packaged, uploaded to a (Coldline) GCS bucket as
+**Matches.** A finished match is one that is NOT in the recorder's current open set
+(``meta.events``), NOT named as open by the installed campaign events file (the set
+the recorder was TOLD to record — ``--events-file``; a process that failed to resolve
+an event once still has it in that file) AND whose native ``book.jsonl`` has been
+quiet for ``match_min_age_s`` (30 min by default). Absence from ``meta.events`` alone
+is not enough on a campaign whose set is re-discovered every 10 minutes: a postponed
+game leaves the lookahead window and comes back days later, and a transient per-event
+resolve failure drops a live event from one process's set — the quiet time keeps a
+native that is still being written out of the sweep, and both open sets are re-read
+right before each match is touched (a pass can run for a long time). Its per-match
+native dir (``matches/event-<id>/{book.jsonl,meta.json}``) duplicates data already
+held in the monolith, so it can be packaged, uploaded to a (Coldline) GCS bucket as
 ``<prefix>/event-<id>.tar.gz``, and removed from local disk — freeing SSD that
 would otherwise grow forever (~½ the run's footprint is these per-match duplicates).
 A marker (``matches/event-<id>.offloaded.json``) records the object so (a) the admin
 download path can serve the match with a signed URL, and (b) a re-run skips
-already-offloaded matches (idempotent).
+already-offloaded matches (idempotent). A match whose native dir REAPPEARS after it
+was archived (it re-entered the open set) is archived again as the next **part**
+(``<prefix>/event-<id>.part2.tar.gz``, ...); the marker's ``parts`` list names every
+part, so the archive is never silently partial. Before the local delete the native
+is re-checked against the size + mtime it had when it was packaged — a native that
+changed during the upload is left alone for the next run.
 
 **Segments.** An open-ended run's monolith is split into daily segments
 ``book.<YYYY-MM-DD>.jsonl`` (UTC day of ``ts_recv``). A segment is CLOSED once its
@@ -35,8 +48,14 @@ step leaves the local file intact for the next run, and the markers make re-runs
 idempotent.
 
 **Safety (both sweeps).** A local file is deleted ONLY after its object is uploaded
-AND verified present in GCS with a byte-exact size match, and the marker is durable
-on disk. Never delete a marker without also removing its GCS object.
+AND verified present in GCS with a byte-exact size match and a matching crc32c (the
+local checksum is computed here and sent with the upload, so a corrupted transfer is
+rejected by GCS and a wrong stored checksum is caught by the verify step), and the
+marker is fsync'd to disk (file and directory) before the delete. Neither sweep
+stages a tar / ``.zst`` when the scratch volume would be left with less than
+``headroom_bytes`` free (5 GiB by default) — the scratch sits on the same volume the
+recorder writes, and pushing it into ENOSPC would cost a capture gap. Never delete a
+marker without also removing its GCS object.
 
 **Graceful degradation.** Even without the admin's signed-URL fast path, a
 download of an offloaded match still works: with the native dir gone,
@@ -51,6 +70,7 @@ import is lazy so tests never need it, and no test spawns ``zstd``.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -59,7 +79,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -67,7 +87,10 @@ from polytape.writer import parse_segment_name
 
 logger = logging.getLogger("polytape.admin.offload")
 
-OFFLOAD_MARKER_SCHEMA = 1
+#: Match markers: schema 2 adds ``parts`` (one entry per archived part of a match that
+#: re-entered the open set); ``object``/``gs_uri`` keep naming the FIRST part, so a
+#: schema-1 reader still finds the archive it knows about.
+OFFLOAD_MARKER_SCHEMA = 2
 SEGMENT_MARKER_SCHEMA = 1
 DEFAULT_OBJECT_PREFIX = "matches"
 DEFAULT_STORAGE_CLASS = "COLDLINE"
@@ -76,6 +99,16 @@ SEGMENTS_DIRNAME = "segments"
 #: A closed segment must have been quiet this long before it is offloaded. The writer
 #: rolls at the first write after midnight UTC, so 15 min is far past any roll-over.
 DEFAULT_SEGMENT_MIN_AGE_S = 900
+#: A finished match's native ``book.jsonl`` must have been quiet this long before it is
+#: offloaded. "Absent from meta.events" is not "finished" on a set that is re-discovered
+#: every 10 min (postponements, transient resolve failures); a fresh native is never a
+#: candidate, whatever the open set says.
+DEFAULT_MATCH_MIN_AGE_S = 1800
+#: Free space to leave on the scratch volume (the run volume) before staging an archive.
+DEFAULT_HEADROOM_BYTES = 5 * 1024**3
+#: Worst-case size of a staged archive relative to its source (gzip/zstd on JSONL is
+#: ~6-10x; 4x is a safe bound for the headroom check).
+_STAGING_RATIO = 4
 #: zstd CLI options: all cores, level 6 (fast, ~5-8x on JSONL), quiet.
 ZSTD_ARGS = ("-T0", "-6", "-q")
 _READ_CHUNK = 8 * 1024 * 1024
@@ -106,9 +139,27 @@ def is_offloaded(matches_dir: str | Path, event_id: str) -> bool:
     return bool(marker and marker.get("gs_uri"))
 
 
-def object_name(prefix: str, event_id: str) -> str:
-    """GCS object name for a match archive: ``<prefix>/event-<id>.tar.gz``."""
-    return f"{prefix.rstrip('/')}/event-{event_id}.tar.gz"
+def marker_parts(marker: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The archived parts a match marker records, oldest first.
+
+    A schema-2 marker lists them under ``parts``; a schema-1 marker (one archive) is
+    read as a single implicit part. Empty for a missing/incomplete marker.
+    """
+    if not marker or not marker.get("gs_uri"):
+        return []
+    parts = marker.get("parts")
+    if isinstance(parts, list) and parts:
+        return [p for p in parts if isinstance(p, dict)]
+    keys = ("object", "gs_uri", "size", "crc32c", "offloaded_at")
+    return [{"part": 1, **{k: marker.get(k) for k in keys}}]
+
+
+def object_name(prefix: str, event_id: str, part: int = 1) -> str:
+    """GCS object name for a match archive: ``<prefix>/event-<id>.tar.gz`` for the first
+    part, ``<prefix>/event-<id>.part<N>.tar.gz`` for a later part (a match whose native
+    dir reappeared after its first archive — it re-entered the open set)."""
+    suffix = "" if part <= 1 else f".part{part}"
+    return f"{prefix.rstrip('/')}/event-{event_id}{suffix}.tar.gz"
 
 
 def segment_marker_path(run_dir: str | Path, segment: str) -> Path:
@@ -150,6 +201,31 @@ def open_event_ids(meta: dict[str, Any]) -> set[str]:
     return {str(e.get("id")) for e in (meta.get("events") or []) if e.get("id") is not None}
 
 
+def events_file_ids(path: str | Path | None) -> set[str]:
+    """Event ids the installed campaign events file (``--events-file``) names as OPEN —
+    the set the recorder was told to record, whether or not the running process managed
+    to resolve every one of them. ``None``/missing/unreadable -> empty set (with a
+    warning when a path was given), so this guard only ever ADDS protection."""
+    if not path:
+        return set()
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        logger.warning("offload: events file %s unreadable (%s); that guard is off", path, exc)
+        return set()
+    if not isinstance(data, list):
+        logger.warning("offload: events file %s is not a JSON list; that guard is off", path)
+        return set()
+    out: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("closed"):
+            continue
+        raw = entry.get("event_id", entry.get("id"))
+        if raw not in (None, "") and str(raw).strip():
+            out.add(str(raw).strip())
+    return out
+
+
 def native_event_dirs(run_dir: str | Path) -> list[str]:
     """Event ids that have a per-match native ``book.jsonl`` under ``matches/``."""
     base = Path(run_dir) / "matches"
@@ -162,22 +238,61 @@ def native_event_dirs(run_dir: str | Path) -> list[str]:
     return out
 
 
-def offloadable_event_ids(run_dir: str | Path, meta: dict[str, Any]) -> list[str]:
+def _native_signature(native_dir: Path) -> tuple[int, int]:
+    """``(size, mtime_ns)`` of a native ``book.jsonl`` — what "unchanged" means here."""
+    st = (native_dir / "book.jsonl").stat()
+    return (st.st_size, st.st_mtime_ns)
+
+
+def offloadable_event_ids(
+    run_dir: str | Path,
+    meta: dict[str, Any],
+    *,
+    min_age_s: float = DEFAULT_MATCH_MIN_AGE_S,
+    now_s: float | None = None,
+    protected_ids: Iterable[str] = (),
+) -> list[str]:
     """Finished matches whose native dir can be offloaded now.
 
-    A match qualifies iff it has a native ``matches/event-<id>/book.jsonl``, is NOT
-    in the current open set (i.e. finished/immutable), and is not already offloaded.
-    The monolith is the backstop, so this is deliberately simple — it never touches
-    a still-recording match.
+    A match qualifies iff ALL hold: it has a native ``matches/event-<id>/book.jsonl``;
+    it is NOT in the current open set (``meta.events``) nor in ``protected_ids`` (the
+    installed events file's open events, see :func:`events_file_ids`); and its
+    ``book.jsonl`` has not been written for ``min_age_s`` (the quiet time — the open
+    set alone is not a finished signal on a set that changes every 10 min, see the
+    module docstring).
+
+    A native that REAPPEARED after the match was archived (its marker exists) is a
+    candidate again and will be archived as the next part. The one exception is a
+    native whose ``book.jsonl`` still has exactly the size + mtime its last archived
+    part recorded — that is the leftover of a delete that failed after the marker was
+    published; like the segment sweep, it is left alone with a warning for a human.
+    The monolith is the backstop, so a still-recording match is never touched.
     """
+    now_s = time.time() if now_s is None else now_s
     matches_dir = Path(run_dir) / "matches"
-    open_ids = open_event_ids(meta)
+    open_ids = open_event_ids(meta) | set(protected_ids)
     out: list[str] = []
     for eid in native_event_dirs(run_dir):
         if eid in open_ids:
-            continue  # still recording — never touch
-        if is_offloaded(matches_dir, eid):
-            continue  # already archived
+            continue  # still recording (or meant to be) — never touch
+        native_dir = matches_dir / f"event-{eid}"
+        try:
+            size, mtime_ns = _native_signature(native_dir)
+        except OSError:
+            continue
+        if now_s - mtime_ns / 1e9 < min_age_s:
+            continue  # written recently — not quiet, not finished
+        parts = marker_parts(read_marker(matches_dir, eid))
+        if parts:
+            last = parts[-1]
+            if last.get("native_size") == size and last.get("native_mtime_ns") == mtime_ns:
+                logger.warning(
+                    "event %s: native dir is still on disk although its archive (part %d) "
+                    "was verified and marked; leaving it alone",
+                    eid,
+                    len(parts),
+                )
+                continue
         out.append(eid)
     return out
 
@@ -284,17 +399,29 @@ class GcsBackend:
         self._storage_class = storage_class
 
     def upload(self, local_path: Path, name: str) -> dict[str, Any]:
+        """Upload ``local_path`` as ``name``; returns ``{gs_uri, size, crc32c, storage_class}``
+        where ``crc32c`` is the LOCAL checksum (so a later :func:`_verify_uploaded`
+        compares local bytes against what GCS stored, not the server against itself).
+
+        ``checksum="crc32c"`` is passed explicitly: the library then sends the checksum
+        with the upload and GCS rejects a transfer whose bytes differ, regardless of the
+        installed version's default. The stored checksum is compared with the local one
+        as a second, independent check.
+        """
         blob = self._bucket.blob(name)
         if self._storage_class:
             blob.storage_class = self._storage_class
-        # upload_from_filename computes+checks crc32c end-to-end, so a corrupted
-        # transfer raises rather than silently storing bad bytes.
-        blob.upload_from_filename(str(local_path))
+        local_crc = local_crc32c(local_path)
+        blob.upload_from_filename(str(local_path), checksum="crc32c")
         blob.reload()
+        if local_crc and blob.crc32c and blob.crc32c != local_crc:
+            raise OSError(
+                f"upload of {name}: GCS stored crc32c {blob.crc32c}, local is {local_crc}"
+            )
         return {
             "gs_uri": f"gs://{self._bucket.name}/{name}",
             "size": blob.size,
-            "crc32c": blob.crc32c,
+            "crc32c": local_crc or blob.crc32c,
             "storage_class": blob.storage_class,
         }
 
@@ -352,6 +479,50 @@ def _count_lines(path: Path, chunk: int = _READ_CHUNK) -> int:
             n += block.count(b"\n")
 
 
+def local_crc32c(path: Path, chunk: int = _READ_CHUNK) -> str | None:
+    """The file's crc32c as GCS reports it (base64 of the 4-byte big-endian digest,
+    ``blob.crc32c``), streamed in constant memory. ``None`` (with a warning) if
+    ``google-crc32c`` — a dependency of ``google-cloud-storage`` — is not importable,
+    in which case verification falls back to the size check alone."""
+    try:
+        import google_crc32c  # transitive dep of google-cloud-storage; lazy like the client
+    except ImportError:
+        logger.warning("google-crc32c not importable; upload verification is size-only")
+        return None
+    checksum = google_crc32c.Checksum()
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                break
+            checksum.update(block)
+    return base64.b64encode(checksum.digest()).decode("ascii")
+
+
+def _headroom(headroom_bytes: int | None) -> int:
+    """``headroom_bytes`` or the module default — resolved at CALL time so a test (or a
+    caller) can lower :data:`DEFAULT_HEADROOM_BYTES` without threading it everywhere."""
+    return DEFAULT_HEADROOM_BYTES if headroom_bytes is None else headroom_bytes
+
+
+def _require_headroom(volume: Path, source_bytes: int, headroom_bytes: int, what: str) -> None:
+    """Refuse to stage an archive for ``what`` unless the volume holding ``volume`` keeps
+    at least ``headroom_bytes`` free after a worst-case (``source_bytes / 4``) staging
+    file. The scratch sits on the run volume: staging into ENOSPC would take the
+    recorder down for a capture gap before anything is freed."""
+    try:
+        free = shutil.disk_usage(volume).free
+    except OSError:
+        return  # cannot tell — do not block the sweep on a stat failure
+    staging = source_bytes // _STAGING_RATIO
+    need = staging + headroom_bytes
+    if free < need:
+        raise OSError(
+            f"not enough free space to stage {what}: {free} bytes free on {volume}, "
+            f"need >= {need} (~{staging} staging + {headroom_bytes} headroom)"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Offload one match (tar native -> upload -> verify -> marker -> delete)
 # --------------------------------------------------------------------------- #
@@ -368,20 +539,50 @@ def _tar_native_dir(native_dir: Path, event_id: str, dest: Path) -> None:
                 tar.add(path, arcname=f"event-{event_id}/{name}", recursive=False)
 
 
+def _fsync_dir(path: Path) -> None:
+    """fsync a directory so a rename into it is durable. A no-op where directories
+    cannot be opened for fsync (Windows) — durability only matters on the Linux VM."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _publish_marker(path: Path, marker: dict[str, Any]) -> None:
-    """Write a marker atomically (``.partial`` + ``os.replace``): once it exists, the
-    object it names has been verified in GCS."""
+    """Write a marker atomically AND durably (``.partial`` + fsync + ``os.replace`` +
+    directory fsync): once it exists, the object it names has been verified in GCS,
+    and a hard reset right after the local delete cannot leave an empty marker
+    (a brand-new file's data would otherwise sit in the page cache for up to
+    ``dirty_expire`` while the unlink is journaled at the next commit)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".partial")
-    tmp.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(marker) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
 
 
-def _verify_uploaded(name: str, backend: Backend, local_size: int, what: str) -> dict[str, Any]:
-    """Stat ``name`` in the store and require a byte-exact size match; returns the stat."""
+def _verify_uploaded(
+    name: str, backend: Backend, local_size: int, what: str, *, crc32c: str | None = None
+) -> dict[str, Any]:
+    """Stat ``name`` in the store and require a byte-exact size match — and, when both
+    the local ``crc32c`` and the stored one are known, a checksum match; returns the stat."""
     remote = backend.stat(name)
     if remote is None or int(remote.get("size", -1)) != local_size:
         raise OSError(f"offload verify failed for {what}: local={local_size} remote={remote}")
+    remote_crc = remote.get("crc32c")
+    if crc32c and remote_crc and crc32c != remote_crc:
+        raise OSError(
+            f"offload verify failed for {what}: crc32c mismatch local={crc32c} remote={remote_crc}"
+        )
     return remote
 
 
@@ -393,15 +594,22 @@ def offload_one(
     prefix: str = DEFAULT_OBJECT_PREFIX,
     scratch_dir: str | Path | None = None,
     now_iso: str,
+    headroom_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Offload ONE finished match's native dir to GCS and remove it locally.
 
     Steps, in order (the delete is LAST and only after a verified upload):
-      1. tar ``matches/event-<id>/`` into a scratch ``event-<id>.tar.gz``,
-      2. upload to ``<prefix>/event-<id>.tar.gz``,
-      3. verify the object exists in GCS with the exact local tar size,
-      4. write the marker ``matches/event-<id>.offloaded.json`` (atomically),
-      5. delete the local native dir and the scratch tar.
+      1. note the native ``book.jsonl``'s size + mtime and check the scratch headroom,
+      2. tar ``matches/event-<id>/`` into a scratch ``event-<id>.tar.gz``,
+      3. upload to ``<prefix>/event-<id>.tar.gz`` (``.part<N>.tar.gz`` when the marker
+         already records N-1 parts — the match re-entered the open set and its native
+         dir was re-created after the earlier archive),
+      4. verify the object exists in GCS with the exact local tar size (and crc32c),
+      5. re-check the native: if ``book.jsonl`` changed since step 1 (the recorder came
+         back for this match), stop here — no marker, no delete, retry next run,
+      6. write the marker ``matches/event-<id>.offloaded.json`` (atomically, fsync'd),
+         with every part under ``parts`` and ``object``/``gs_uri`` naming part 1,
+      7. delete the local native dir and the scratch tar.
 
     Returns the marker dict. Raises on any failure BEFORE the marker is written,
     leaving the native dir intact (safe to retry).
@@ -412,10 +620,17 @@ def offload_one(
     if not (native_dir / "book.jsonl").exists():
         raise FileNotFoundError(f"no native book.jsonl for event {event_id}")
 
-    name = object_name(prefix, event_id)
+    existing = read_marker(matches_dir, event_id)
+    prior_parts = marker_parts(existing)
+    part = len(prior_parts) + 1
+    name = object_name(prefix, event_id, part)
     scratch_root = Path(scratch_dir) if scratch_dir else None
     if scratch_root:
         scratch_root.mkdir(parents=True, exist_ok=True)
+    before = _native_signature(native_dir)
+    _require_headroom(
+        scratch_root or run_dir, before[0], _headroom(headroom_bytes), f"event {event_id}"
+    )
     tmp = Path(tempfile.mkdtemp(prefix="polytape-offload-", dir=scratch_root))
     try:
         tar_path = tmp / f"event-{event_id}.tar.gz"
@@ -423,18 +638,54 @@ def offload_one(
         local_size = tar_path.stat().st_size
 
         uploaded = backend.upload(tar_path, name)
-        _verify_uploaded(name, backend, local_size, f"event {event_id}")
+        remote = _verify_uploaded(
+            name, backend, local_size, f"event {event_id}", crc32c=uploaded.get("crc32c")
+        )
+        crc = uploaded.get("crc32c") or remote.get("crc32c")
+        if _native_signature(native_dir) != before:
+            raise OSError(
+                f"event {event_id}: native book.jsonl changed during the offload (the recorder "
+                "is writing it again?); leaving it for the next run"
+            )
 
-        marker = {
-            "schema": OFFLOAD_MARKER_SCHEMA,
-            "event_id": event_id,
-            "gs_uri": uploaded["gs_uri"],
+        part_record = {
+            "part": part,
             "object": name,
+            "gs_uri": uploaded["gs_uri"],
             "size": local_size,
-            "crc32c": uploaded.get("crc32c"),
+            "crc32c": crc,
             "offloaded_at": now_iso,
+            "native_size": before[0],
+            "native_mtime_ns": before[1],
         }
-        # marker published atomically — implies a verified object
+        if part == 1:
+            marker = {
+                "schema": OFFLOAD_MARKER_SCHEMA,
+                "event_id": event_id,
+                "gs_uri": uploaded["gs_uri"],
+                "object": name,
+                "size": local_size,
+                "crc32c": crc,
+                "offloaded_at": now_iso,
+                "parts": [part_record],
+            }
+        else:
+            marker = {
+                **(existing or {}),
+                "schema": OFFLOAD_MARKER_SCHEMA,
+                "event_id": event_id,
+                "parts": [*prior_parts, part_record],
+            }
+            logger.warning(
+                "event %s re-entered the open set after part %d was archived; its new native "
+                "is archived as part %d -> %s (the match's archive now has %d parts)",
+                event_id,
+                part - 1,
+                part,
+                uploaded["gs_uri"],
+                part,
+            )
+        # marker published atomically + durably — implies a verified object
         _publish_marker(marker_path(matches_dir, event_id), marker)
 
         # Only now, with the object verified and the marker durable, reclaim the disk.
@@ -458,11 +709,19 @@ def run_offload(
     scratch_dir: str | Path | None = None,
     limit: int | None = None,
     now_iso_fn: Any = None,
+    min_age_s: float = DEFAULT_MATCH_MIN_AGE_S,
+    now_s: float | None = None,
+    headroom_bytes: int | None = None,
+    events_file: str | Path | None = None,
 ) -> list[str]:
     """Offload all currently-offloadable finished matches (up to ``limit``).
 
-    Reloads ``meta.json`` once for the open set. Per-match failures are logged and
-    skipped (the native dir stays intact for a later retry). Returns offloaded ids.
+    Reads ``meta.json`` (and the installed ``events_file``, if given) for the candidate
+    list, then AGAIN right before each match is touched: a pass runs one upload per
+    match and the recorder may have restarted — or the refresh installed a new set —
+    with a candidate back in it meanwhile (a match that is open again is skipped).
+    Per-match failures are logged and skipped (the native dir stays intact for a later
+    retry). Returns offloaded ids.
     """
     from polytape.envelope import utc_now_iso
 
@@ -472,14 +731,36 @@ def run_offload(
     if meta is None:
         logger.warning("offload: run meta.json unreadable; nothing to do")
         return []
-    candidates = offloadable_event_ids(run_dir, meta)
+    candidates = offloadable_event_ids(
+        run_dir,
+        meta,
+        min_age_s=min_age_s,
+        now_s=now_s,
+        protected_ids=events_file_ids(events_file),
+    )
     if limit is not None:
         candidates = candidates[:limit]
     done: list[str] = []
     for eid in candidates:
+        current = _load_meta(run_dir)
+        if current is None:
+            logger.warning("offload: run meta.json became unreadable mid-pass; stopping")
+            break
+        if eid in open_event_ids(current):
+            logger.info("event %s is open again (recorder restarted); skipping", eid)
+            continue
+        if eid in events_file_ids(events_file):
+            logger.info("event %s is back in the installed event set; skipping", eid)
+            continue
         try:
             offload_one(
-                run_dir, eid, backend, prefix=prefix, scratch_dir=scratch_dir, now_iso=now_iso_fn()
+                run_dir,
+                eid,
+                backend,
+                prefix=prefix,
+                scratch_dir=scratch_dir,
+                now_iso=now_iso_fn(),
+                headroom_bytes=headroom_bytes,
             )
             done.append(eid)
         except Exception:  # noqa: BLE001 - never let one match abort the batch
@@ -504,16 +785,17 @@ def offload_segment(
     now_iso: str,
     compressor: Compressor = zstd_compress,
     count_lines: bool = True,
+    headroom_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Offload ONE closed daily segment (file name ``segment``) to GCS and delete it locally.
 
     Steps, in order (the delete is LAST and only after a verified upload):
-      1. (optionally) count the segment's lines for the marker,
+      1. check the scratch headroom, (optionally) count the segment's lines,
       2. compress into a scratch ``<segment>.zst`` with ``compressor``,
       3. upload to ``<prefix>/segments/<segment>.zst``,
-      4. verify the object exists in GCS with the exact local ``.zst`` size (and that
-         the segment did not grow meanwhile),
-      5. write the marker ``segments/book.<day>.offloaded.json`` (atomically),
+      4. verify the object exists in GCS with the exact local ``.zst`` size and crc32c
+         (and that the segment did not grow meanwhile),
+      5. write the marker ``segments/book.<day>.offloaded.json`` (atomically, fsync'd),
       6. delete the local segment and the scratch ``.zst``.
 
     Caller is responsible for selection (:func:`offloadable_segments`); this function
@@ -539,9 +821,12 @@ def offload_segment(
     scratch_root = Path(scratch_dir) if scratch_dir else None
     if scratch_root:
         scratch_root.mkdir(parents=True, exist_ok=True)
+    raw_bytes = src.stat().st_size
+    _require_headroom(
+        scratch_root or run_dir, raw_bytes, _headroom(headroom_bytes), f"segment {segment}"
+    )
     tmp = Path(tempfile.mkdtemp(prefix="polytape-offload-", dir=scratch_root))
     try:
-        raw_bytes = src.stat().st_size
         lines = _count_lines(src) if count_lines else None
         zst = tmp / f"{segment}.zst"
         compressor(src, zst)
@@ -550,11 +835,10 @@ def offload_segment(
             raise OSError(f"segment {segment} grew during compression; leaving it for next run")
 
         uploaded = backend.upload(zst, name)
-        remote = _verify_uploaded(name, backend, zst_bytes, f"segment {segment}")
-        up_crc, rm_crc = uploaded.get("crc32c"), remote.get("crc32c")
-        if up_crc and rm_crc and up_crc != rm_crc:
-            raise OSError(f"offload verify failed for segment {segment}: crc32c mismatch")
-        crc = up_crc or rm_crc
+        remote = _verify_uploaded(
+            name, backend, zst_bytes, f"segment {segment}", crc32c=uploaded.get("crc32c")
+        )
+        crc = uploaded.get("crc32c") or remote.get("crc32c")
 
         marker = {
             "schema": SEGMENT_MARKER_SCHEMA,
@@ -600,6 +884,7 @@ def offload_segments(
     now_s: float | None = None,
     now_iso_fn: Any = None,
     count_lines: bool = True,
+    headroom_bytes: int | None = None,
 ) -> list[str]:
     """Offload every closed daily segment (see :func:`offloadable_segments`), up to ``limit``.
 
@@ -632,6 +917,7 @@ def offload_segments(
                 now_iso=now_iso_fn(),
                 compressor=compressor,
                 count_lines=count_lines,
+                headroom_bytes=headroom_bytes,
             )
             done.append(segment)
         except Exception:  # noqa: BLE001 - never let one segment abort the batch
@@ -726,6 +1012,29 @@ def main(argv: list[str] | None = None) -> int:
         help="Seconds a closed segment must have been quiet before it is offloaded.",
     )
     ap.add_argument(
+        "--match-min-age",
+        type=float,
+        default=float(os.environ.get("POLYTAPE_MATCH_MIN_AGE_S", DEFAULT_MATCH_MIN_AGE_S)),
+        help="Seconds a finished match's native book.jsonl must have been quiet before "
+        "it is offloaded (absence from the open set alone is not 'finished').",
+    )
+    ap.add_argument(
+        "--events-file",
+        default=os.environ.get("POLYTAPE_EVENTS_FILE"),
+        help="The installed campaign events file (the set the recorder was told to "
+        "record): a match it names as open is never offloaded, even if the running "
+        "process failed to resolve it. Optional but recommended.",
+    )
+    ap.add_argument(
+        "--headroom-gb",
+        type=float,
+        default=float(
+            os.environ.get("POLYTAPE_OFFLOAD_HEADROOM_GB", DEFAULT_HEADROOM_BYTES / 1024**3)
+        ),
+        help="Free GiB to keep on the scratch volume; an archive whose staging would "
+        "leave less is skipped (the recorder writes the same volume).",
+    )
+    ap.add_argument(
         "--zstd",
         default=os.environ.get("POLYTAPE_ZSTD", "zstd"),
         help="zstd binary used to compress segments (must be installed on the host).",
@@ -749,13 +1058,19 @@ def main(argv: list[str] | None = None) -> int:
     do_matches = not args.segments_only
     do_segments = not args.matches_only
     today = utc_now_iso()[:10]
+    headroom_bytes = int(args.headroom_gb * 1024**3)
 
     if args.list:
         meta = _load_meta(Path(args.run_dir))
         if do_matches:
             if meta is None:
                 ap.error(f"cannot read run meta: {Path(args.run_dir) / 'meta.json'}")
-            ids = offloadable_event_ids(args.run_dir, meta)
+            ids = offloadable_event_ids(
+                args.run_dir,
+                meta,
+                min_age_s=args.match_min_age,
+                protected_ids=events_file_ids(args.events_file),
+            )
             print(f"offloadable matches ({len(ids)}): {' '.join(ids) or '(none)'}")
         if do_segments:
             segs = offloadable_segments(
@@ -772,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
             prefix=args.prefix,
             scratch_dir=args.scratch_dir,
             limit=args.limit,
+            min_age_s=args.match_min_age,
+            headroom_bytes=headroom_bytes,
+            events_file=args.events_file,
         )
         print(f"offloaded {len(done)} match(es): {' '.join(done) or '(none)'}")
     if do_segments:
@@ -785,6 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
             scratch_dir=args.scratch_dir,
             limit=args.limit,
             count_lines=not args.no_count_lines,
+            headroom_bytes=headroom_bytes,
         )
         print(f"offloaded {len(done_segments)} segment(s): {' '.join(done_segments) or '(none)'}")
     return 0

@@ -1,17 +1,21 @@
 #!/bin/bash
 # polytape maker-campaign health check — read-only; run by hand over SSH (or from cron).
 #
-# Prints: recorder unit state, freshness from meta.json (age of last_record_at,
-# cumulative counts, open events/tokens, gaps), segment and per-match file sizes,
-# the polytape-* timers, and disk usage. Exit status: 0 healthy; 1 STALE (no record
-# for more than --stale-after seconds, default 300) or meta.json missing/unreadable.
+# Prints: recorder unit state, freshness from meta.json (age of last_record_at and of
+# started_at — a just-restarted recorder is not a stalled one —, cumulative counts,
+# open events/tokens, gaps), segment and per-match file sizes (incl. matches whose
+# native dir re-appeared after being archived and await their next part), the
+# polytape-* timers, and disk usage. Exit status: 0 healthy; 1 STALE (no record for
+# more than --stale-after seconds, default 900: last_record_at only advances on a
+# written record, and a pre-game European-morning window with no ladder can be quiet
+# for minutes) or meta.json missing/unreadable.
 #
-#   healthcheck.sh [--run-dir /data/run-maker] [--stale-after 300]
+#   healthcheck.sh [--run-dir /data/run-maker] [--stale-after 900]
 # Env: POLYTAPE_RUN_DIR, POLYTAPE_STALE_AFTER, POLYTAPE_UNIT, POLYTAPE_PY.
 set -uo pipefail
 
 RUN_DIR=${POLYTAPE_RUN_DIR:-/data/run-maker}
-STALE_AFTER=${POLYTAPE_STALE_AFTER:-300}
+STALE_AFTER=${POLYTAPE_STALE_AFTER:-900}
 UNIT=${POLYTAPE_UNIT:-polytape}
 PY=${POLYTAPE_PY:-}
 
@@ -67,11 +71,17 @@ now = datetime.now(timezone.utc)
 last = meta.get("last_record_at")
 last_dt = parse(last) if last else None
 age = (now - last_dt).total_seconds() if last_dt else None
+started = meta.get("started_at")
+started_dt = parse(started) if started else None
+up = (now - started_dt).total_seconds() if started_dt else None
 counts = meta.get("counts") or {}
 events = meta.get("events") or []
 tokens = meta.get("clob_token_ids") or []
 gaps = meta.get("gaps") or []
-print(f"  started_at:     {meta.get('started_at')}   stopped_at: {meta.get('stopped_at')}")
+print(
+    f"  started_at:     {started}   process age: "
+    f"{'%.0fs' % up if up is not None else 'n/a'}   stopped_at: {meta.get('stopped_at')}"
+)
 print(f"  last_record_at: {last}   age: {'%.0fs' % age if age is not None else 'n/a'}")
 print(f"  counts:         {counts}   open events: {len(events)}   tokens: {len(tokens)}")
 if gaps:
@@ -111,7 +121,15 @@ if [ -d "$RUN_DIR" ]; then
     fi
     n_native=$(find "$RUN_DIR/matches" -mindepth 1 -maxdepth 1 -type d -name 'event-*' 2>/dev/null | wc -l)
     n_offloaded=$(find "$RUN_DIR/matches" -mindepth 1 -maxdepth 1 -name 'event-*.offloaded.json' 2>/dev/null | wc -l)
-    echo "  per-match: $n_native native dir(s), $n_offloaded offloaded marker(s)"
+    # A native dir NEXT TO its marker = the match re-entered the open set after being
+    # archived (postponement / transient resolve failure); the offloader archives it
+    # as the next part once it is quiet. Steady growth here means the offloader is not.
+    n_reentered=0
+    for d in "$RUN_DIR"/matches/event-*/; do
+        [ -d "$d" ] || continue
+        [ -f "${d%/}.offloaded.json" ] && n_reentered=$((n_reentered + 1))
+    done
+    echo "  per-match: $n_native native dir(s), $n_offloaded offloaded marker(s), $n_reentered re-entered (native + marker, next part pending)"
     echo "  run total: $(du -sh "$RUN_DIR" 2>/dev/null | cut -f1)"
 else
     echo "  (run dir missing)"

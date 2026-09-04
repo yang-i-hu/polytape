@@ -10,6 +10,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/opt/polytape/polytape-refresh.sh
+# A oneshot has no start timeout by default; discovery is bounded (40 s per request,
+# paging capped) but a wedged run would otherwise block the timer for hours.
+TimeoutStartSec=10min
+SyslogIdentifier=polytape-refresh
 # Hardening: root is needed for /etc/polytape + systemctl; the write surface is just
 # the config dir and the lock dir. Discovery scratch lands in a private /tmp.
 ProtectSystem=strict

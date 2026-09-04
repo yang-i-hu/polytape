@@ -15,8 +15,16 @@
 #
 # Safety: a discovery failure (Gamma hiccup), an unreadable/empty result, or an
 # unchanged set is a NO-OP — the live set is never wiped on a fluke and the recorder
-# is never restarted for nothing. The restart is serialized under a flock, and a
-# restart that fails leaves a marker so the next run retries it.
+# is never restarted for nothing. A discovery failure exits 1 (the unit shows as
+# failed; the timer still re-fires) with the discovery's last stderr lines in the
+# journal. The restart is serialized under a flock, and a restart that fails leaves
+# a marker so the next run retries it.
+#
+# Restart economy: the installed file is passed back to the discovery (--previous) so
+# main-line picks are sticky, and a change that only REMOVES events (finished games,
+# expired ladders) is deferred — a finished market yields nothing, so leaving it
+# subscribed costs nothing — until the next addition or until DEFER_MIN minutes have
+# passed since the last install. Additions and changed market sets restart at once.
 #
 #   polytape-refresh.sh            # act (timer mode)
 #   polytape-refresh.sh --check    # report what would happen; change nothing
@@ -31,41 +39,50 @@ CUR=${POLYTAPE_EVENTS_FILE:-/etc/polytape/campaign_events.json}
 UNIT=${POLYTAPE_UNIT:-polytape}
 LOCK=${POLYTAPE_LOCK:-/run/lock/polytape-refresh.lock}
 OWNER=${POLYTAPE_OWNER:-polytape}
+DEFER_MIN=${POLYTAPE_DEFER_REMOVALS_MIN:-60}   # pure roll-outs wait this long since the last install
 PENDING="$CUR.restart-pending"   # exists iff a set was installed but the restart failed
 
 CHECK=0
 case "${1:-}" in
     "") ;;
     --check|--dry-run) CHECK=1 ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "polytape-refresh: unknown argument: $1" >&2; exit 2 ;;
 esac
 
 log() {
-    command -v logger >/dev/null 2>&1 && logger -t polytape-refresh -- "$*"
+    # Under systemd ($INVOCATION_ID set) stdout already lands in the journal under
+    # SyslogIdentifier=polytape-refresh; logging via logger too would double every line.
+    if [ -z "${INVOCATION_ID:-}" ] && command -v logger >/dev/null 2>&1; then
+        logger -t polytape-refresh -- "$*"
+    fi
     echo "polytape-refresh: $*"
 }
 
 NEW=$(mktemp "${TMPDIR:-/tmp}/campaign_events.XXXXXX") || { log "mktemp failed"; exit 1; }
-trap 'rm -f "$NEW"' EXIT
+ERR=$(mktemp "${TMPDIR:-/tmp}/campaign_discovery.XXXXXX") || { log "mktemp failed"; exit 1; }
+trap 'rm -f "$NEW" "$ERR"' EXIT
 
-if ! "$PY" "$SCRIPT" --spec "$SPEC" --out "$NEW" --open-only >/dev/null 2>&1; then
-    log "discovery failed (Gamma error? bad spec?); leaving recorder unchanged"
-    exit 0
+PREVIOUS=()
+[ -s "$CUR" ] && PREVIOUS=(--previous "$CUR")   # sticky main-line picks
+if ! "$PY" "$SCRIPT" --spec "$SPEC" --out "$NEW" --open-only "${PREVIOUS[@]}" >/dev/null 2>"$ERR"; then
+    log "discovery failed (Gamma error? bad spec?); leaving recorder unchanged: $(tail -n 3 "$ERR" | tr '\n' ' ')"
+    exit 1
 fi
+tags=$(grep -m1 '^tags:' "$ERR" || true)   # per-tag open events / pages / truncation
 
 NEW_KEY=$("$PY" "$KEYER" --open-only "$NEW" 2>/dev/null) || NEW_KEY=""
 CUR_KEY=$("$PY" "$KEYER" --open-only "$CUR" 2>/dev/null) || CUR_KEY=""
 
 # Refuse to act on an empty/garbage discovery (would blank the recorder).
 if [ -z "$NEW_KEY" ]; then
-    log "discovery returned no open events; leaving recorder unchanged"
+    log "discovery returned no open events; leaving recorder unchanged${tags:+ ($tags)}"
     exit 0
 fi
 
 new_summary=$("$PY" "$KEYER" --open-only --summary "$NEW" 2>/dev/null)
 if [ "$NEW_KEY" = "$CUR_KEY" ] && [ ! -e "$PENDING" ]; then
-    log "no change ($new_summary)"
+    log "no change ($new_summary)${tags:+ $tags}"
     exit 0
 fi
 
@@ -80,12 +97,30 @@ n_changed=$(( n_common_ids - n_common_lines ))
 cur_summary=$("$PY" "$KEYER" --open-only --summary "$CUR" 2>/dev/null || echo "none installed")
 delta="+$n_added -$n_removed ~$n_changed ($new_summary; was $cur_summary)"
 
+# A pure roll-out (only removals, nothing added or changed, no restart pending): a
+# finished market yields nothing, so leaving it subscribed costs nothing, whereas the
+# restart costs a gap on EVERY market. Defer it until the next addition or until the
+# installed file is DEFER_MIN minutes old (its mtime is the last install).
+defer=0
+if [ "$n_added" -eq 0 ] && [ "$n_changed" -eq 0 ] && [ "$n_removed" -gt 0 ] && [ ! -e "$PENDING" ]; then
+    if [ -n "$(find "$CUR" -maxdepth 0 -mmin -"$DEFER_MIN" 2>/dev/null)" ]; then
+        defer=1
+    fi
+fi
+
 if [ "$CHECK" = 1 ]; then
     if [ "$NEW_KEY" = "$CUR_KEY" ]; then
         log "CHECK: set unchanged but a restart is pending from a failed one -> would restart $UNIT"
+    elif [ "$defer" = 1 ]; then
+        log "CHECK: only removals $delta -> would defer (last install <${DEFER_MIN}m ago)"
     else
         log "CHECK: event set changed $delta -> would install $CUR + restart $UNIT"
     fi
+    exit 0
+fi
+
+if [ "$defer" = 1 ]; then
+    log "deferring pure roll-out $delta: nothing to add; last install <${DEFER_MIN}m ago${tags:+ $tags}"
     exit 0
 fi
 
@@ -112,4 +147,4 @@ if [ "$rc" -ne 0 ]; then
     exit 1
 fi
 rm -f "$PENDING"
-log "event set changed $delta -> installed + restarted $UNIT"
+log "event set changed $delta -> installed + restarted $UNIT${tags:+ $tags}"

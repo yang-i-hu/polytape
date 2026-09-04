@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -10,6 +11,7 @@ from polytape.writer import (
     CaptureWriter,
     FatalRecorderError,
     _downtime_seconds,
+    _repair_tail,
     parse_segment_name,
     segment_name,
 )
@@ -424,3 +426,102 @@ def test_write_envelope_with_unparseable_ts_stays_in_open_segment(make_config):
             assert w.write_envelope(env) is True
     assert _ids(_read(_seg(cfg, "2026-09-03"))) == ["x", "y", "z"]
     assert sorted(cfg.event_dir.glob("book.*.jsonl")) == [_seg(cfg, "2026-09-03")]
+
+
+def test_clock_step_back_across_midnight_never_rolls_backwards(make_config):
+    # The roll is forward-only: a ts_recv from the previous day (an NTP step back right
+    # after midnight) stays in the open segment instead of re-creating yesterday's file —
+    # which may already be offloaded and would then sit beside its marker forever.
+    cfg = make_config(run_name="camp")
+    cfg.event_dir.mkdir(parents=True)
+    (cfg.event_dir / "segments").mkdir()
+    (cfg.event_dir / "segments" / "book.2026-09-02.offloaded.json").write_text(
+        '{"gs_uri": "gs://x/y"}', encoding="utf-8"
+    )
+    clock = _Clock(
+        "2026-09-03T00:00:05.000000Z",  # open(): today's segment
+        "2026-09-02T23:59:59.000000Z",  # a: the clock stepped back 6 s, across midnight
+        "2026-09-03T00:00:07.000000Z",  # b
+        "2026-09-03T00:00:08.000000Z",  # close()
+    )
+    with CaptureWriter(cfg, now=clock) as w:
+        w.write("book", _book("a"), event_id="7")
+        w.write("book", _book("b"), event_id="7")
+        assert w.segments["book"]["seen"] == ["book.2026-09-03.jsonl"]
+    assert not _seg(cfg, "2026-09-02").exists()
+    assert _ids(_read(_seg(cfg, "2026-09-03"))) == ["a", "b"]
+
+
+# -- crash safety of the append-open: a torn trailing line ------------------ #
+
+
+def _parsed_ids(path):
+    out = []
+    for raw in path.read_bytes().split(b"\n"):
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw)["id"])
+        except (ValueError, KeyError):
+            out.append("<torn>")
+    return out
+
+
+def test_restart_after_a_torn_trailing_line_does_not_glue_the_next_record(make_config, caplog):
+    # ENOSPC / SIGKILL mid-write leaves a partial last line in BOTH the segment and the
+    # per-match file. The restart's append-open must terminate it, or the first new
+    # record is glued onto it and readers lose two records (while counts say otherwise).
+    cfg = make_config(run_name="camp")
+    with CaptureWriter(cfg, now=_Clock("2026-09-03T10:00:00.000000Z")) as w:
+        w.write("book", _book("a"), event_id="7")
+    torn = b'{"stream": "book", "id": "torn", "ts_recv": "2026-09-03T10:00:01.0'
+    for path in (_seg(cfg, "2026-09-03"), _pm(cfg, "7")):
+        with open(path, "ab") as fh:
+            fh.write(torn)
+    with caplog.at_level(logging.WARNING, logger="polytape.writer"):
+        with CaptureWriter(cfg, now=_Clock("2026-09-03T10:05:00.000000Z")) as w:
+            w.write("book", _book("b"), event_id="7")
+            assert w.counts["book"] == 2
+    assert _parsed_ids(_seg(cfg, "2026-09-03")) == ["a", "<torn>", "b"]
+    assert _parsed_ids(_pm(cfg, "7")) == ["a", "<torn>", "b"]
+    assert caplog.text.count("torn line") == 2  # once per repaired file
+
+
+def test_repair_tail_helper(tmp_path):
+    missing = tmp_path / "missing.jsonl"
+    assert _repair_tail(missing) is False and not missing.exists()
+    empty = tmp_path / "empty.jsonl"
+    empty.write_bytes(b"")
+    assert _repair_tail(empty) is False and empty.read_bytes() == b""
+    clean = tmp_path / "clean.jsonl"
+    clean.write_bytes(b'{"id": 1}\n{"id": 2}\n')
+    assert _repair_tail(clean) is False and clean.read_bytes() == b'{"id": 1}\n{"id": 2}\n'
+    torn = tmp_path / "torn.jsonl"
+    torn.write_bytes(b'{"id": 1}\n{"id": 2')
+    assert _repair_tail(torn) is True and torn.read_bytes() == b'{"id": 1}\n{"id": 2\n'
+    assert _repair_tail(torn) is False  # idempotent
+
+
+# -- per-match meta flush economy ------------------------------------------- #
+
+
+def test_per_match_meta_is_rewritten_only_for_events_with_new_records(make_config):
+    # Hundreds of open events x a flush every 5 s must not rewrite hundreds of files
+    # for no new information: only events with records since their last write.
+    cfg = make_config(run_name="camp")
+    meta7 = _pm(cfg, "7").with_name("meta.json")
+    meta8 = _pm(cfg, "8").with_name("meta.json")
+    with CaptureWriter(cfg) as w:
+        w.write("book", _book("a"), event_id="7")
+        assert w.flush_meta() is True
+        assert meta7.exists()
+        meta7.unlink()  # a needless rewrite on the next flush would bring it back
+        w.write("book", _book("b"), event_id="8")
+        assert w.flush_meta() is True
+        assert not meta7.exists() and meta8.exists()
+        w.write("book", _book("c"), event_id="7")
+        assert w.flush_meta() is True
+        assert json.loads(meta7.read_text(encoding="utf-8"))["counts"] == {"book": 2}
+    # close() stamps stopped_at into EVERY open match's meta, dirty or not
+    stopped = json.loads(meta8.read_text(encoding="utf-8"))
+    assert stopped["stopped_at"] and stopped["counts"] == {"book": 1}

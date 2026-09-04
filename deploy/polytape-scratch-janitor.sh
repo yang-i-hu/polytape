@@ -9,10 +9,13 @@
 # /data and crash-loop the recorder with ENOSPC (exactly what took the WC recorder
 # down on 2026-06-27: 8 orphaned dirs = 41 GB).
 #
-# This sweeps scratch dirs older than AGE_MIN minutes. A real in-flight build is far
-# younger than that, so the age floor means we never race an active offload/download.
-# Safe by construction: it only ever touches POLYTAPE_SCRATCH_DIR's own transient
-# build dirs — never the run dir or any recorded data.
+# This sweeps scratch dirs older than AGE_MIN minutes — measured on the NEWEST file
+# inside the dir, not the dir itself (a dir's mtime is set when its tar/.zst entry is
+# created and never advances while it is being written or read) — and never while
+# polytape-offload.service is running, so a legitimately long segment compress +
+# upload is never pulled out from under the offloader. Safe by construction: it only
+# ever touches POLYTAPE_SCRATCH_DIR's own transient build dirs — never the run dir or
+# any recorded data.
 set -uo pipefail
 
 # Config: the autogrow env (WC layout) then the offloader's env (this campaign; wins).
@@ -27,17 +30,28 @@ fi
 
 SCRATCH=${POLYTAPE_SCRATCH_DIR:-/data/tmp/polytape-offload}
 AGE_MIN=${JANITOR_AGE_MIN:-180}
+OFFLOAD_UNIT=${JANITOR_OFFLOAD_UNIT:-polytape-offload.service}
 
 log() { logger -t polytape-scratch-janitor "$*"; echo "polytape-scratch-janitor: $*"; }
 
 [ -d "$SCRATCH" ] || { log "scratch dir $SCRATCH absent; nothing to do"; exit 0; }
 
+# Never sweep under a running offloader: its scratch is in use however old it looks.
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$OFFLOAD_UNIT" 2>/dev/null; then
+    log "skip: $OFFLOAD_UNIT is running; its scratch is in use"
+    exit 0
+fi
+
 # find runs as root (this unit is root), so it can traverse a group-only scratch dir
-# that a non-root glob can't. -mmin +AGE_MIN = modified more than AGE_MIN minutes ago.
+# that a non-root glob can't. A dir is stale when NOTHING inside it (nor the dir) was
+# modified in the last AGE_MIN minutes (-mmin -N = modified within N minutes).
 mapfile -t stale < <(
     find "$SCRATCH" -mindepth 1 -maxdepth 1 -type d \
         \( -name 'polytape-offload-*' -o -name 'polytape-extract-*' -o -name 'polytape-dl-*' \) \
-        -mmin +"$AGE_MIN"
+        -mmin +"$AGE_MIN" \
+        | while IFS= read -r d; do
+            [ -z "$(find "$d" -mmin -"$AGE_MIN" -print -quit 2>/dev/null)" ] && printf '%s\n' "$d"
+        done
 )
 
 if [ "${#stale[@]}" -eq 0 ]; then

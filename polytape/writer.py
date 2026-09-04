@@ -31,8 +31,13 @@ for a multi-event run) holds::
 open-ended campaign recorder), so single-event captures keep the documented
 ``event-<id>/book.jsonl`` that the monitor and viewer tail. The roll-over is a
 plain string compare of the envelope's ``ts_recv`` day (``YYYY-MM-DD``) against the
-open segment's day — no extra clock reads on the hot path. Segments are opened in
-append mode, so the 10-minute refresh restart simply continues the day's file.
+open segment's day — no extra clock reads on the hot path, and the roll only ever
+goes FORWARD (a ``ts_recv`` earlier than the open segment's day — a clock step back
+across midnight — stays in the open segment rather than re-creating, and possibly
+resurrecting an already offloaded, earlier segment). Segments are opened in append
+mode, so the 10-minute refresh restart simply continues the day's file; before any
+append-open (segment or per-match file) a torn trailing line left by a crash
+mid-write is terminated with a newline, so the next record is never glued onto it.
 ``meta.json#segments`` names the open segment and every segment this process has
 opened; the cumulative ``counts`` are unaffected by rotation.
 """
@@ -91,6 +96,33 @@ def _day_of(ts: Any) -> str | None:
     if isinstance(ts, str) and len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
         return ts[:10]
     return None
+
+
+def _repair_tail(path: Path) -> bool:
+    """Terminate a torn trailing line in ``path`` before it is opened for append.
+
+    A crash mid-write (ENOSPC, SIGKILL, a hard reset) can leave a partial last line
+    on disk; appending the next record straight after it would glue the two into one
+    unparseable line, costing every reader TWO records. A lone ``\\n`` turns the torn
+    fragment into one unparseable line that readers already skip. Returns True if a
+    repair was made. A missing file is fine (nothing to repair); other ``OSError``s
+    propagate to the caller exactly like the open that follows would.
+    """
+    try:
+        with open(path, "rb+") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) == b"\n":
+                return False
+            fh.write(b"\n")
+    except FileNotFoundError:
+        return False
+    logger.warning(
+        "%s ended in a torn line (crash mid-write?); terminated it before appending", path
+    )
+    return True
 
 
 class FatalRecorderError(Exception):
@@ -153,6 +185,10 @@ class CaptureWriter:
         # write_envelope for the lossless dual-write.
         self._per_match: bool = bool(getattr(config, "per_match", True))
         self._event_files: dict[tuple[str, str], TextIO] = {}
+        # Events whose per-match meta.json is behind their counts: the periodic flush
+        # rewrites only these (hundreds of open events x every 5 s would otherwise be a
+        # steady stream of small synchronous writes on the hot loop).
+        self._event_meta_dirty: set[str] = set()
         self._event_snapshots: dict[str, dict[str, Any]] = {
             e.event_id: self._snapshot(e) for e in self._event_infos
         }
@@ -226,7 +262,7 @@ class CaptureWriter:
         # Best-effort on shutdown: if the disk is full we cannot finalize meta.json,
         # but that must not mask the original cause or crash the cleanup path.
         try:
-            self._write_meta()
+            self._write_meta(all_events=True)  # every open match gets its stopped_at
         except FatalRecorderError:
             logger.exception("could not finalize meta.json on close")
         logger.info("capture stopped; counts: %s", dict(self._counts))
@@ -247,6 +283,7 @@ class CaptureWriter:
         roll-over path turns it into a :class:`FatalRecorderError`).
         """
         path = self._stream_path(stream, day)
+        _repair_tail(path)  # a torn last line from a crash must not swallow the next record
         handle = open(path, "a", encoding="utf-8", newline="\n")
         if self._rotate and day is not None:
             self._segment_day[stream] = day
@@ -338,9 +375,12 @@ class CaptureWriter:
             seen.popitem(last=False)  # evict oldest; the dedup window stays recency-bounded
         if self._rotate:
             # Day boundary in ts_recv -> roll the monolith to that day's segment. A cheap
-            # string compare per record; a malformed ts stays in the open segment.
+            # string compare per record; a malformed ts stays in the open segment. Only
+            # a LATER day rolls: an earlier ts_recv (clock stepped back across midnight)
+            # stays in the open segment instead of re-creating yesterday's file, which
+            # may already be offloaded.
             day = _day_of(envelope.get("ts_recv"))
-            if day is not None and day != self._segment_day.get(stream):
+            if day is not None and day > (self._segment_day.get(stream) or ""):
                 handle = self._roll_segment(stream, day)
         line = json.dumps(envelope, ensure_ascii=False) + "\n"
         try:
@@ -350,6 +390,7 @@ class CaptureWriter:
                 per = self._event_handle(stream, str(event_id))  # per-match PRIMARY
                 per.write(line)
                 per.flush()
+                self._event_meta_dirty.add(str(event_id))
         except OSError as exc:
             raise FatalRecorderError(f"write to {stream!r} failed: {exc}") from exc
         self._counts[stream] += 1
@@ -367,7 +408,9 @@ class CaptureWriter:
         if handle is None:
             event_dir = self._dir / "matches" / f"event-{event_id}"
             event_dir.mkdir(parents=True, exist_ok=True)
-            handle = open(event_dir / f"{stream}.jsonl", "a", encoding="utf-8", newline="\n")
+            path = event_dir / f"{stream}.jsonl"
+            _repair_tail(path)  # same torn-line guard as the monolith segment
+            handle = open(path, "a", encoding="utf-8", newline="\n")
             self._event_files[key] = handle
         return handle
 
@@ -514,8 +557,10 @@ class CaptureWriter:
             "gaps": list(self._gaps),
         }
 
-    def _write_meta(self) -> None:
-        """Atomically (temp file + replace) write ``meta.json``.
+    def _write_meta(self, *, all_events: bool = False) -> None:
+        """Atomically (temp file + replace) write ``meta.json``, then the per-match metas
+        of events with new records since their last write (every open event's when
+        ``all_events`` — the close path, which stamps ``stopped_at``).
 
         Raises :class:`FatalRecorderError` on an I/O error (e.g. disk full) so a
         failure while recording a gap stops the process rather than being swallowed
@@ -532,7 +577,7 @@ class CaptureWriter:
             os.replace(tmp, path)
         except OSError as exc:
             raise FatalRecorderError(f"writing meta.json failed: {exc}") from exc
-        self._write_event_metas()
+        self._write_event_metas(all_open=all_events)
 
     def _event_meta(self, event_id: str) -> dict[str, Any]:
         """A self-contained per-match meta dict (event snapshot + that event's counts)."""
@@ -548,7 +593,7 @@ class CaptureWriter:
             "event": self._event_snapshots.get(event_id),
         }
 
-    def _write_event_metas(self) -> None:
+    def _write_event_metas(self, *, all_open: bool = False) -> None:
         """Persist a small ``meta.json`` next to each per-match file's directory.
 
         Makes ``matches/event-<id>/`` a ready-to-use archive (data + meta), mirroring the
@@ -556,11 +601,16 @@ class CaptureWriter:
         NEVER escalates to fatal — the ``book.jsonl`` data is what matters and the meta is
         derivable from it (the monolith stays the source of truth). Only events that have
         an open per-match handle are written (so finished, rolled-out matches keep their
-        last-written meta).
+        last-written meta), and — unless ``all_open`` — only those with new records since
+        their meta was last written: with hundreds of open events, rewriting every one
+        on each 5-second flush would be a steady synchronous I/O load on the hot loop
+        for no new information. A failed write stays dirty and is retried next flush.
         """
         if not self._per_match:
             return
-        for event_id in {eid for (_stream, eid) in self._event_files}:
+        open_ids = {eid for (_stream, eid) in self._event_files}
+        targets = open_ids if all_open else (self._event_meta_dirty & open_ids)
+        for event_id in targets:
             event_dir = self._dir / "matches" / f"event-{event_id}"
             try:
                 tmp = event_dir / "meta.json.tmp"
@@ -572,3 +622,5 @@ class CaptureWriter:
                 logger.warning(
                     "could not write per-match meta for event %s", event_id, exc_info=True
                 )
+            else:
+                self._event_meta_dirty.discard(event_id)

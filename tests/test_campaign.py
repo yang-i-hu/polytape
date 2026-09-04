@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import random
+import re
 import urllib.error
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -231,15 +232,31 @@ def test_parse_gamma_time_garbage_is_none():
     assert cp.iso_utc(datetime(2026, 9, 5, 1, 40, tzinfo=timezone.utc)) == "2026-09-05T01:40:00Z"
 
 
-def test_market_start_falls_back_market_then_event_then_start_date():
+def test_market_start_is_the_kickoff_never_the_listing_date():
     ev = event(1, "x", [], start="2026-09-01T00:00:00Z")
     assert cp.market_start(ev, {"gameStartTime": GAME_START}) == cp.parse_gamma_time(GAME_START)
     ev["gameStartTime"] = "2026-09-02 12:00:00+00"
     assert cp.market_start(ev, {}) == datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    # No kick-off anywhere -> unknown. NOT the event's startDate: for Gamma sports
+    # events that is the LISTING time, not a game time.
     ev["gameStartTime"] = None
-    assert cp.market_start(ev, {"gameStartTime": "garbage"}) == datetime(
-        2026, 9, 1, tzinfo=timezone.utc
+    assert cp.market_start(ev, {"gameStartTime": "garbage"}) is None
+    assert cp.market_start(ev, {}) is None
+
+
+def test_sports_market_without_a_kickoff_is_never_recorded_as_a_game():
+    # "Pro Football: X vs. Y Season Series Winner": sportsMarketType=moneyline, no
+    # gameStartTime, listed (startDate) an hour ago — inside lookback_h by LISTING time.
+    fresh = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev = event(
+        48,
+        "pro-football-cardinals-vs-rams-season-series-winner",
+        [mkt(1, "moneyline", start=None), mkt(2, "moneyline", start=None)],
+        start=fresh,
     )
+    nfl = cp.SportsSpec("nfl", ("moneyline", "spreads", "totals"), "main")
+    assert cp.select_sports_markets(ev, nfl, **WINDOW) == []
+    assert cp.sports_entry(ev, nfl, **WINDOW) is None
 
 
 def test_in_window_is_inclusive_and_rejects_unknown():
@@ -270,6 +287,192 @@ def test_pick_main_line_closest_to_half_then_lowest_id():
     assert cp.pick_main_line([]) is None
     assert cp.price_distance({"outcomePrices": '["0.4", "0.6"]'}) == pytest.approx(0.1)
     assert cp.price_distance({}) == float("inf")
+
+
+def qmkt(mid, mtype, prices, *, line, bid, ask, spread, liq, **kw):
+    """A market carrying Gamma's quote fields (bestBid / bestAsk / spread / liquidityNum)."""
+    m = mkt(mid, mtype, prices, line=line, **kw)
+    m.update({"bestBid": bid, "bestAsk": ask, "spread": spread, "liquidityNum": liq})
+    return m
+
+
+def cmu_unm_spreads():
+    """Central Michigan vs. New Mexico spreads as seen live (2026-09-03T20:36Z): every
+    alternate is pre-generated, and the ones with no book at all sit at exactly
+    0.50/0.50 — Gamma's outcomePrices is the bid/ask midpoint of a 0.01/0.99 rail book."""
+    return [
+        qmkt(
+            3988845,
+            "spreads",
+            ("0.465", "0.535"),
+            line=-11.5,
+            bid=0.46,
+            ask=0.47,
+            spread=0.01,
+            liq=3545.0,
+        ),  # noqa: E501
+        qmkt(
+            3988846,
+            "spreads",
+            ("0.505", "0.495"),
+            line=-10.5,
+            bid=0.49,
+            ask=0.52,
+            spread=0.03,
+            liq=3701.7,
+        ),  # noqa: E501
+        qmkt(
+            4101342,
+            "spreads",
+            ("0.625", "0.375"),
+            line=-0.5,
+            bid=0.44,
+            ask=0.81,
+            spread=0.37,
+            liq=415.0,
+        ),  # noqa: E501
+        qmkt(
+            4101343, "spreads", ("0.5", "0.5"), line=-1.5, bid=0.01, ask=0.99, spread=0.98, liq=0.32
+        ),  # noqa: E501
+        qmkt(
+            4101344, "spreads", ("0.5", "0.5"), line=-2.5, bid=0.01, ask=0.99, spread=0.98, liq=0.32
+        ),  # noqa: E501
+        qmkt(
+            4101350,
+            "spreads",
+            ("0.545", "0.455"),
+            line=-8.5,
+            bid=0.53,
+            ask=0.56,
+            spread=0.03,
+            liq=3231.0,
+        ),  # noqa: E501
+    ]
+
+
+def test_is_quoted_needs_a_real_two_sided_book():
+    assert cp.is_quoted({"bestBid": 0.49, "bestAsk": 0.52, "spread": 0.03})
+    assert cp.is_quoted({"bestBid": "0.49", "bestAsk": "0.52", "spread": "0.03"})  # number-strings
+    assert not cp.is_quoted({"bestBid": 0.01, "bestAsk": 0.99, "spread": 0.98})  # the rails
+    assert not cp.is_quoted({"bestBid": 0.44, "bestAsk": 0.81, "spread": 0.37})  # too wide
+    assert not cp.is_quoted({"bestBid": 0.05, "bestAsk": 0.25, "spread": 0.20})  # bid on the rail
+    assert not cp.is_quoted({"bestBid": 0.75, "bestAsk": 0.95, "spread": 0.20})  # ask on the rail
+    assert not cp.is_quoted({"bestBid": None, "bestAsk": 0.5, "spread": 0.01})  # null (128/5k live)
+    assert not cp.is_quoted({"bestBid": 0.49, "bestAsk": 0.52})  # missing spread
+    assert not cp.is_quoted({"bestBid": True, "bestAsk": 0.52, "spread": 0.03})
+    assert cp.liquidity({"liquidityNum": "12.5"}) == 12.5
+    assert cp.liquidity({}) == 0.0 and cp.liquidity({"liquidityNum": "nan"}) == 0.0
+
+
+def test_pick_main_line_prefers_a_quoted_book_over_the_placeholder_midpoint():
+    pick = cp.pick_main_line(cmu_unm_spreads())
+    assert (pick["id"], pick["line"]) == ("3988846", -10.5)  # 0.505/0.495, $3.7k, 3c wide
+    # Among quoted lines: closest to 0.50 first, then the most liquid, then the lowest id.
+    a = qmkt(10, "totals", ("0.51", "0.49"), line=52.5, bid=0.50, ask=0.52, spread=0.02, liq=100.0)
+    b = qmkt(11, "totals", ("0.51", "0.49"), line=53.5, bid=0.50, ask=0.52, spread=0.02, liq=900.0)
+    c = qmkt(12, "totals", ("0.51", "0.49"), line=54.5, bid=0.50, ask=0.52, spread=0.02, liq=900.0)
+    assert cp.pick_main_line([a, b, c]) is b and cp.pick_main_line([c, b]) is b
+    d = qmkt(13, "totals", ("0.5", "0.5"), line=55.5, bid=0.49, ask=0.51, spread=0.02, liq=1.0)
+    assert cp.pick_main_line([a, b, c, d]) is d  # closest wins over liquidity
+    # Nothing quoted at all: the most liquid, then closest to 0.50, then lowest id.
+    dead = [
+        qmkt(20, "totals", ("0.5", "0.5"), line=33.5, bid=0.01, ask=0.99, spread=0.98, liq=0.34),
+        qmkt(22, "totals", ("0.5", "0.5"), line=54.5, bid=0.01, ask=0.99, spread=0.98, liq=8113.0),
+        qmkt(21, "totals", ("0.5", "0.5"), line=53.5, bid=0.01, ask=0.99, spread=0.98, liq=8113.0),
+    ]
+    assert cp.pick_main_line(dead)["id"] == "21"
+
+
+def test_pick_main_line_is_sticky_while_the_previous_pick_stays_a_main_line():
+    lines = cmu_unm_spreads()
+    by_id = {m["id"]: m for m in lines}
+    assert cp.pick_main_line(lines, previous_id="3988846") is by_id["3988846"]
+    # The odds moved: -11.5 is now closest to 0.50, but -10.5 is still a quoted main
+    # line -> kept (a fresh pick would flip, and every flip restarts the recorder).
+    by_id["3988845"]["outcomePrices"] = '["0.5", "0.5"]'
+    by_id["3988846"]["outcomePrices"] = '["0.55", "0.45"]'
+    assert cp.pick_main_line(lines) is by_id["3988845"]
+    assert cp.pick_main_line(lines, previous_id="3988846") is by_id["3988846"]
+    assert cp.pick_main_line(lines, previous_id=3988846) is by_id["3988846"]  # int id is fine
+    # Released when the previous pick lost its quote (back on the rails)...
+    by_id["3988846"].update({"bestBid": 0.01, "bestAsk": 0.99, "spread": 0.98})
+    assert cp.pick_main_line(lines, previous_id="3988846") is by_id["3988845"]
+    by_id["3988846"].update({"bestBid": 0.53, "bestAsk": 0.56, "spread": 0.03})
+    # ...or drifted out of the main-line band (further than STICKY_MAX_DISTANCE from 0.50)...
+    by_id["3988846"]["outcomePrices"] = '["0.72", "0.28"]'
+    assert cp.pick_main_line(lines, previous_id="3988846") is by_id["3988845"]
+    by_id["3988846"]["outcomePrices"] = '["0.7", "0.3"]'  # exactly on the edge: still main
+    assert cp.pick_main_line(lines, previous_id="3988846") is by_id["3988846"]
+    # ...or is simply no longer a candidate (closed / delisted / unknown id).
+    assert cp.pick_main_line(lines, previous_id="999") is by_id["3988845"]
+    without = [m for m in lines if m["id"] != "3988846"]
+    assert cp.pick_main_line(without, previous_id="3988846") is by_id["3988845"]
+    # An unquoted previous pick (chosen when nothing was quoted) gives way to a real book.
+    dead = [qmkt(20, "totals", ("0.5", "0.5"), line=33.5, bid=0.01, ask=0.99, spread=0.98, liq=0.3)]
+    assert cp.pick_main_line(dead, previous_id="20") is dead[0]
+    live = qmkt(21, "totals", ("0.5", "0.5"), line=53.5, bid=0.49, ask=0.51, spread=0.02, liq=100.0)
+    assert cp.pick_main_line([*dead, live], previous_id="20") is live
+
+
+def test_previous_picks_collects_non_moneyline_picks_per_event():
+    entries = [
+        {
+            "event_id": "1",
+            "record_markets": [
+                {"id": "10", "sportsMarketType": "moneyline"},
+                {"id": "11", "sportsMarketType": "spreads"},
+                {"id": "12", "sportsMarketType": "totals"},
+            ],
+        },
+        {
+            "event_id": "2",
+            "record_markets": [
+                {"id": 20, "sportsMarketType": "totals"},
+                {"id": "", "sportsMarketType": "spreads"},
+                {"id": "22", "sportsMarketType": None},
+            ],
+        },
+        {"event_id": "", "record_markets": [{"id": "30", "sportsMarketType": "totals"}]},
+        {"event_id": "3", "record_markets": "junk"},
+        "junk",
+        None,
+    ]
+    assert cp.previous_picks(entries) == {
+        "1": {"spreads": "11", "totals": "12"},
+        "2": {"totals": "20"},
+    }
+    assert cp.previous_picks([]) == {}
+
+
+def test_select_main_mode_keeps_the_previous_line_while_it_is_quoted():
+    ev = event(
+        77, "cfb-cmich-unm-2026-09-04", [mkt(1, "moneyline", ("0.6", "0.4")), *cmu_unm_spreads()]
+    )
+    cfb = cp.SportsSpec("cfb", ("moneyline", "spreads", "totals"), "main")
+    fresh = cp.select_sports_markets(ev, cfb, **WINDOW)
+    assert [(m["sportsMarketType"], m["id"]) for m in fresh] == [
+        ("moneyline", "1"),
+        ("spreads", "3988846"),
+    ]
+    sticky = cp.select_sports_markets(ev, cfb, previous={"spreads": "3988845"}, **WINDOW)
+    assert [m["id"] for m in sticky] == ["1", "3988845"]
+    # a previous pick for a type the spec does not record is ignored; a stale id re-picks
+    stale = cp.select_sports_markets(ev, cfb, previous={"totals": "9", "spreads": "9"}, **WINDOW)
+    assert [m["id"] for m in stale] == ["1", "3988846"]
+    # ...and it threads through sports_entries via previous_picks(<installed file>),
+    # with the quote the pick was made on written into the record for auditing.
+    spec = cp.load_spec(SPEC_OBJ)
+    installed = cp.sports_entries({"cfb": [ev]}, spec, NOW, previous={"77": {"spreads": "3988845"}})
+    assert [m["id"] for m in installed[0]["record_markets"]] == ["1", "3988845"]
+    again = cp.sports_entries({"cfb": [ev]}, spec, NOW, previous=cp.previous_picks(installed))
+    assert [m["id"] for m in again[0]["record_markets"]] == ["1", "3988845"]
+    spread = again[0]["record_markets"][1]
+    assert (spread["bestBid"], spread["bestAsk"], spread["spread"], spread["liquidityNum"]) == (
+        0.46,
+        0.47,
+        0.01,
+        3545.0,
+    )
 
 
 def test_select_main_mode_keeps_all_moneylines_and_one_line_per_type():
@@ -362,6 +565,11 @@ def test_sports_entry_contract():
         "outcomePrices": ["0.545", "0.455"],
         "groupItemTitle": None,
         "closed": False,
+        # the quote the main-line pick is made on (None when Gamma sends none)
+        "bestBid": None,
+        "bestAsk": None,
+        "spread": None,
+        "liquidityNum": None,
     }
     assert len(entry["record_markets"]) == 8 and len(cp.entry_tokens(entry)) == 16
     # An event with nothing selectable yields no entry.
@@ -485,6 +693,44 @@ def test_ladder_entry_records_all_strikes_and_honours_open_only():
     for m in bare["markets"]:
         m["clobTokenIds"] = None
     assert cp.ladder_entry(bare, "bitcoin") is None
+
+
+def test_ladder_entry_drops_a_resolved_ladder_gamma_has_not_closed_yet():
+    # Live: 33 min after the 4PM ET ladder resolved, Gamma still said closed=false with
+    # one strike open -> a 1-market entry, and one more restart when it finally flips.
+    lad = ladder()  # endDate 2026-09-03T20:00:00Z, closed=false, 20 open strikes
+    assert cp.ladder_entry(lad, "bitcoin", now=NOW) is not None  # at the resolution instant
+    assert cp.ladder_entry(lad, "bitcoin", now=NOW + cp.LADDER_GRACE) is not None  # in grace
+    late = NOW + cp.LADDER_GRACE + timedelta(seconds=1)
+    assert cp.ladder_entry(lad, "bitcoin", now=late) is None
+    assert cp.ladder_finished(lad, late) and not cp.ladder_finished(lad, None)
+    assert cp.ladder_entry(lad, "bitcoin", now=late, open_only=False) is not None  # --no-open-only
+    lad["endDate"] = None
+    assert cp.ladder_entry(lad, "bitcoin", now=late) is not None  # unknown end: the flag decides
+
+
+def test_summarize_lists_every_spec_family_even_when_empty():
+    # An off-season league, a typo'd tag and a truncated listing must not all look the
+    # same (a family silently missing from the summary): every spec family gets a row.
+    spec = cp.load_spec(SPEC_OBJ)
+    assert cp.spec_families(spec) == [
+        "sports:mlb",
+        "sports:cfb",
+        "sports:epl",
+        "ladder:bitcoin",
+        "ladder:ethereum",
+    ]
+    entries = cp.sports_entries({"mlb": [mlb_game()]}, spec, NOW)
+    rows = cp.summarize(entries, families=cp.spec_families(spec))
+    assert [(r["family"], r["events"]) for r in rows] == [
+        ("ladder:bitcoin", 0),
+        ("ladder:ethereum", 0),
+        ("sports:cfb", 0),
+        ("sports:epl", 0),
+        ("sports:mlb", 1),
+        ("TOTAL", 1),
+    ]
+    assert "sports:cfb" in cp.format_summary(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -620,6 +866,40 @@ def test_fetch_tag_events_handles_gamma_offset_cap(no_delay, monkeypatch):
         lce.fetch_tag_events("cfb")
 
 
+def test_fetch_tag_events_reports_pages_and_truncation(no_delay, monkeypatch):
+    full = [event(i, "cfb-a-b-2026-09-05", []) for i in range(100)]
+    fake = FakeGamma({"cfb": [full, full, [event(1000, "x", [])]], "mlb": [[]]})
+    monkeypatch.setattr(lce, "_get", fake)
+    stats: dict[str, object] = {}
+    assert len(lce.fetch_tag_events("cfb", stats=stats)) == 201
+    assert stats == {"events": 201, "pages": 3, "truncated": None}
+    stats = {}
+    assert lce.fetch_tag_events("mlb", stats=stats) == []
+    assert stats == {"events": 0, "pages": 1, "truncated": None}  # a typo'd tag looks like this
+    fake = FakeGamma({"cfb": [full] * 40})
+    fake.fail_422_at["cfb"] = 300
+    monkeypatch.setattr(lce, "_get", fake)
+    stats = {}
+    assert len(lce.fetch_tag_events("cfb", stats=stats)) == 300
+    assert stats["truncated"] == "Gamma 422 at offset 300" and stats["pages"] == 3
+    fake.fail_422_at.clear()
+    stats = {}
+    assert len(lce.fetch_tag_events("cfb", stats=stats)) == lce.MAX_OFFSET
+    assert stats["truncated"] == f"local cap at offset {lce.MAX_OFFSET}"
+    line = lce.format_tag_stats(
+        {
+            "mlb": {"events": 343, "pages": 4, "truncated": None},
+            "cfb": stats,
+            "nope": {"events": 0, "pages": 1, "truncated": None},
+        }
+    )
+    assert line == (
+        f"tags: mlb=343/4p cfb={lce.MAX_OFFSET}/{lce.MAX_OFFSET // lce.PAGE}p nope=0/1p"
+        f"  TRUNCATED: cfb (local cap at offset {lce.MAX_OFFSET})"
+    )
+    assert lce.format_tag_stats({}) == "tags: (none)"
+
+
 def test_fetch_event_by_slug(monkeypatch):
     fake = FakeGamma({}, {"bitcoin-above-on-september-3-2026-4pm-et": ladder()})
     monkeypatch.setattr(lce, "_get", fake)
@@ -686,12 +966,56 @@ def test_main_end_to_end_writes_contract_and_summary(tmp_path, monkeypatch, caps
     # Ladder slugs were looked up for now-1..now+2 for both assets; the closed one was dropped.
     looked_up = [c["slug"] for c in fake.calls if "slug" in c]
     assert len(looked_up) == 8 and "bitcoin-above-on-september-3-2026-3pm-et" in looked_up
-    # Summary table on stdout.
-    text = capsys.readouterr().out
+    # Summary table on stdout; the per-tag diagnostics on stderr (for the journal).
+    captured = capsys.readouterr()
+    text = captured.out
     assert "campaign 'maker' @ 2026-09-03T20:00:00Z: 5 event(s)" in text
     assert "shards@180" in text and "TOTAL" in text
     assert "sports:mlb" in text and "ladder:ethereum" in text
     assert "New York Yankees vs. San Diego Padres" in text
+    assert re.search(r"^sports:cfb\s+0\s+0\s+0\s+0$", text, re.M)  # a 0 row, not a missing one
+    assert "tags: mlb=1/1p cfb=0/1p epl=2/1p" in captured.err and "TRUNCATED" not in captured.err
+
+
+def test_main_previous_keeps_the_pick_and_tolerates_a_bad_previous_file(
+    tmp_path, monkeypatch, capsys, no_delay
+):
+    spec = {"sports": [{"tag": "cfb", "types": ["moneyline", "spreads"], "lines": "main"}]}
+    lines = cmu_unm_spreads()
+    game = event(77, "cfb-cmich-unm-2026-09-04", [mkt(1, "moneyline", ("0.6", "0.4")), *lines])
+    monkeypatch.setattr(lce, "_get", FakeGamma({"cfb": [[game]]}))
+    out = tmp_path / "events.json"
+    args = [
+        "--spec",
+        str(_write_spec(tmp_path, spec)),
+        "--out",
+        str(out),
+        "--now",
+        "2026-09-03T20:00:00Z",
+    ]
+
+    def picked():
+        return [m["id"] for m in json.loads(out.read_text(encoding="utf-8"))[0]["record_markets"]]
+
+    assert lce.main(args) == 0 and picked() == ["1", "3988846"]
+    assert "tags: cfb=1/1p" in capsys.readouterr().err
+    installed = tmp_path / "installed.json"
+    installed.write_bytes(out.read_bytes())
+    # The odds moved: a fresh pick flips to -11.5; with --previous the installed pick stays.
+    by_id = {m["id"]: m for m in lines}
+    by_id["3988845"]["outcomePrices"] = '["0.5", "0.5"]'
+    by_id["3988846"]["outcomePrices"] = '["0.55", "0.45"]'
+    assert lce.main(args) == 0 and picked() == ["1", "3988845"]
+    assert lce.main([*args, "--previous", str(installed)]) == 0 and picked() == ["1", "3988846"]
+    # A missing / malformed previous file is reported and simply means no stickiness.
+    assert lce.main([*args, "--previous", str(tmp_path / "missing.json")]) == 0
+    assert picked() == ["1", "3988845"]
+    assert "previous events file unusable" in capsys.readouterr().err
+    (tmp_path / "obj.json").write_text("{}", encoding="utf-8")
+    assert lce.main([*args, "--previous", str(tmp_path / "obj.json")]) == 0
+    assert picked() == ["1", "3988845"]
+    assert "not a JSON list" in capsys.readouterr().err
+    assert lce.load_previous(None) == {} and lce.load_previous("") == {}
 
 
 def test_main_no_open_only_keeps_closed_ladder(tmp_path, monkeypatch, capsys, no_delay):
