@@ -2,15 +2,22 @@
 selected matches — for the admin dashboard's (login-gated) download endpoint.
 
 A "match" is **not** a directory. The multi-event recorder writes one combined
-``book.jsonl`` / ``meta.json`` for the whole run, and every record is attributed
+monolith / ``meta.json`` for the whole run, and every record is attributed
 to an event: book records by ``raw.market`` (a condition id, mapped to its event
 via ``meta.events[].markets[].conditionId``). So a per-match export is a
 *filtered slice* of the combined files, re-emitted under the familiar
 ``event-<id>/`` layout; the whole-run export is the combined files verbatim.
 
+The monolith is one or more files (see :mod:`polytape.writer` for the layout): the
+legacy ``book.jsonl`` (older runs) and/or the daily segments ``book.<YYYY-MM-DD>.jsonl``
+of a rotating run. Every scan here goes through :func:`monolith_files`, which lists
+them in chronological order — legacy first, then segments by day — so a slice reads
+the same whether a run rotated or not. A segment already offloaded to GCS is simply
+absent locally (its records are still in the offloaded object, not in a download).
+
 Everything here is read-only — it never opens the recorder's files for writing.
 Filtering streams line-by-line into a scratch dir (flat memory even on a multi-GB
-``book.jsonl``, and byte-exact: the original line bytes are re-emitted, only a
+monolith, and byte-exact: the original line bytes are re-emitted, only a
 decoded copy is parsed for attribution). The archive is then streamed as a gzip
 tar straight to the client through an OS pipe, so nothing is buffered whole.
 """
@@ -30,11 +37,32 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from polytape.admin import registry as _reg
+from polytape.writer import parse_segment_name
 
 logger = logging.getLogger("polytape.admin.download")
 
 _STREAMS = ("book",)
 _READ_CHUNK = 8 * 1024 * 1024  # 8 MiB scan chunks; flat memory on a multi-GB file.
+
+
+def monolith_files(run_dir: Path, stream: str = "book") -> list[Path]:
+    """The local monolith files of ``stream`` in scan (chronological) order.
+
+    The legacy ``<stream>.jsonl`` first (a run recorded before daily rotation, or the
+    pre-rotation head of one that was upgraded in place), then the daily segments
+    ``<stream>.<YYYY-MM-DD>.jsonl`` sorted by day. Anything else (``comments.jsonl``,
+    markers, scratch ``.zst``) is ignored. Only files that exist are returned, so a
+    run with none yields ``[]``.
+    """
+    run_dir = Path(run_dir)
+    legacy = run_dir / f"{stream}.jsonl"
+    files = [legacy] if legacy.is_file() else []
+    segments = []
+    for path in run_dir.glob(f"{stream}.*.jsonl"):
+        parsed = parse_segment_name(path.name)
+        if parsed and parsed[0] == stream and path.is_file():
+            segments.append(path)
+    return files + sorted(segments)
 
 
 # --------------------------------------------------------------------------- #
@@ -311,8 +339,10 @@ def filter_run(
 ) -> list[tuple[str, Path]]:
     """Filter the combined run files into ``dest_dir/event-<id>/`` and list archive entries.
 
-    Scans each combined file once, routing every attributed line to its event's
-    writer — so selecting several matches stays a single pass per stream. When a
+    Scans each combined file once (every monolith file of the stream, legacy then daily
+    segments, in chronological order — see :func:`monolith_files`), routing every
+    attributed line to its event's writer — so selecting several matches stays a
+    single pass per stream. When a
     ``registry`` is given (all matches incl. finished), book records attribute via its
     conditionId map, so FINISHED matches' records (gone from ``meta.events``) still
     route. Always writes a per-event ``meta.json`` slice (even for a match with no
@@ -343,16 +373,14 @@ def filter_run(
 
     try:
         for stream in _STREAMS:
-            src = run_dir / f"{stream}.jsonl"
-            if not src.exists():
-                continue
             attribute: Callable[[dict[str, Any]], str | None] = partial(
                 _book_event, cond2event=cond2event
             )
-            for key, n in _scan_and_route(
-                src, stream, wanted, attribute, writer_for, chunk_bytes
-            ).items():
-                tally[key] = tally.get(key, 0) + n
+            for src in monolith_files(run_dir, stream):
+                for key, n in _scan_and_route(
+                    src, stream, wanted, attribute, writer_for, chunk_bytes
+                ).items():
+                    tally[key] = tally.get(key, 0) + n
     finally:
         for handle in writers.values():
             handle.close()
@@ -463,13 +491,16 @@ def native_match_entries(
 
 
 def whole_run_entries(run_dir: Path, meta: dict[str, Any] | None = None) -> list[tuple[str, Path]]:
-    """Archive entries for the whole run verbatim — the combined files."""
+    """Archive entries for the whole run verbatim — ``meta.json`` plus every local
+    monolith file (legacy and/or daily segments, see :func:`monolith_files`)."""
     root = run_dir.name or "run"
     entries: list[tuple[str, Path]] = []
-    for name in ("meta.json", "book.jsonl"):
-        path = run_dir / name
-        if path.exists():
-            entries.append((f"{root}/{name}", path))
+    meta_path = run_dir / "meta.json"
+    if meta_path.exists():
+        entries.append((f"{root}/meta.json", meta_path))
+    for stream in _STREAMS:
+        for path in monolith_files(run_dir, stream):
+            entries.append((f"{root}/{path.name}", path))
     return entries
 
 

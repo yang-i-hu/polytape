@@ -1,12 +1,20 @@
-"""Tests for the JSONL writer: dedup, JSONL output, meta.json, gap log."""
+"""Tests for the JSONL writer: dedup, JSONL output, meta.json, gap log, daily segments."""
 
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
-from polytape.writer import CaptureWriter, FatalRecorderError, _downtime_seconds
+from polytape.writer import (
+    CaptureWriter,
+    FatalRecorderError,
+    _downtime_seconds,
+    _repair_tail,
+    parse_segment_name,
+    segment_name,
+)
 
 
 def _read(path):
@@ -270,3 +278,250 @@ def test_per_match_write_full_disk_is_fatal_but_backup_kept(make_config):
         with pytest.raises(FatalRecorderError):
             w.write("book", _book("h2"), event_id="1001")
     assert len(_read(cfg.event_dir / "book.jsonl")) == 2  # backup kept both records
+
+
+# -- daily monolith segments (multi-event runs rotate; single-event does not) -- #
+
+
+class _Clock:
+    """An injectable ``now`` that replays the given stamps in order, then repeats the last.
+
+    The writer reads it once in ``open()`` (started_at), once per ``write()`` (ts_recv)
+    and once in ``close()`` (stopped_at) — nowhere else.
+    """
+
+    def __init__(self, *stamps: str) -> None:
+        self._stamps = list(stamps)
+
+    def __call__(self) -> str:
+        if len(self._stamps) > 1:
+            return self._stamps.pop(0)
+        return self._stamps[0]
+
+
+def _seg(cfg, day):
+    return cfg.event_dir / segment_name("book", day)
+
+
+def _ids(lines):
+    return [json.loads(line)["id"] for line in lines]
+
+
+def test_segment_name_helpers():
+    assert segment_name("book", "2026-09-03") == "book.2026-09-03.jsonl"
+    assert parse_segment_name("book.2026-09-03.jsonl") == ("book", "2026-09-03")
+    assert parse_segment_name("book.jsonl") is None  # the legacy monolith
+    assert parse_segment_name("comments.jsonl") is None
+    assert parse_segment_name("book.2026-09-03.jsonl.zst") is None  # offload scratch
+    assert parse_segment_name("book.2026-09-03.offloaded.json") is None  # marker
+    assert parse_segment_name("book.notaday.jsonl") is None
+
+
+def test_multi_event_run_rotates_monolith_at_utc_day_boundary(make_config):
+    # An open-ended run's monolith is one segment per UTC day of ts_recv: the first
+    # record of a new day rolls the file; counts stay cumulative; per-match natives
+    # are untouched by rotation; meta lists the open + seen segments.
+    cfg = make_config(run_name="camp")  # run_name -> multi-event layout -> rotation
+    clock = _Clock(
+        "2026-09-02T23:59:58.000000Z",  # open(): started_at
+        "2026-09-02T23:59:59.500000Z",  # a -> still 09-02
+        "2026-09-03T00:00:00.100000Z",  # b -> rolls to 09-03
+        "2026-09-03T00:00:01.000000Z",  # c -> 09-03
+        "2026-09-03T00:00:02.000000Z",  # close(): stopped_at
+    )
+    with CaptureWriter(cfg, now=clock) as w:
+        assert w.write("book", _book("a"), event_id="7") is True
+        assert w.segments == {
+            "book": {"current": "book.2026-09-02.jsonl", "seen": ["book.2026-09-02.jsonl"]}
+        }
+        assert w.write("book", _book("b"), event_id="7") is True
+        assert w.segments["book"]["current"] == "book.2026-09-03.jsonl"
+        # the roll-over itself refreshes meta.json so #segments is current at once
+        assert _meta(cfg)["segments"]["book"]["current"] == "book.2026-09-03.jsonl"
+        assert w.write("book", _book("c"), event_id="8") is True
+        assert w.counts == {"book": 3}
+
+    assert _ids(_read(_seg(cfg, "2026-09-02"))) == ["a"]
+    assert _ids(_read(_seg(cfg, "2026-09-03"))) == ["b", "c"]
+    assert not (cfg.event_dir / "book.jsonl").exists()  # never a legacy monolith
+    # per-match PRIMARY files are unaffected by the monolith's rotation
+    assert _ids(_read(_pm(cfg, "7"))) == ["a", "b"]
+    assert _ids(_read(_pm(cfg, "8"))) == ["c"]
+    all_segment_lines = _read(_seg(cfg, "2026-09-02")) + _read(_seg(cfg, "2026-09-03"))
+    assert set(all_segment_lines) == set(_read(_pm(cfg, "7")) + _read(_pm(cfg, "8")))
+    m = _meta(cfg)
+    assert m["counts"] == {"book": 3}  # cumulative across segments
+    assert m["counts_by_event"] == {"7": {"book": 2}, "8": {"book": 1}}
+    assert m["segments"] == {
+        "book": {
+            "current": "book.2026-09-03.jsonl",
+            "seen": ["book.2026-09-02.jsonl", "book.2026-09-03.jsonl"],
+        }
+    }
+
+
+def test_restart_appends_to_the_days_segment_and_counts_stay_cumulative(make_config):
+    # The refresh timer restarts the recorder routinely: the new process opens the
+    # same day's segment in append mode and continues the tally seeded from meta.
+    cfg = make_config(run_name="camp")
+    with CaptureWriter(cfg, now=_Clock("2026-09-03T10:00:00.000000Z")) as w:
+        w.write("book", _book("a"), event_id="7")
+    with CaptureWriter(cfg, now=_Clock("2026-09-03T10:10:00.000000Z")) as w:
+        assert w.counts["book"] == 1  # seeded, not reset
+        w.write("book", _book("b"), event_id="7")
+    assert _ids(_read(_seg(cfg, "2026-09-03"))) == ["a", "b"]
+    m = _meta(cfg)
+    assert m["counts"] == {"book": 2}
+    # "seen" is per PROCESS (this one only opened today's segment)
+    assert m["segments"]["book"]["seen"] == ["book.2026-09-03.jsonl"]
+
+
+def test_legacy_monolith_is_left_alone_by_a_rotating_run(make_config):
+    # A run upgraded in place still has the pre-rotation book.jsonl: it is never
+    # appended to again — new records go to the day's segment.
+    cfg = make_config(run_name="wc")
+    cfg.event_dir.mkdir(parents=True)
+    legacy = cfg.event_dir / "book.jsonl"
+    legacy.write_text('{"legacy": true}\n', encoding="utf-8", newline="")
+    with CaptureWriter(cfg, now=_Clock("2026-09-03T10:00:00.000000Z")) as w:
+        w.write("book", _book("a"))
+    assert legacy.read_text(encoding="utf-8") == '{"legacy": true}\n'
+    assert _ids(_read(_seg(cfg, "2026-09-03"))) == ["a"]
+
+
+def test_single_event_capture_keeps_legacy_monolith_layout(make_config):
+    # Single-event captures (monitor/viewer tools) keep event-<id>/book.jsonl.
+    cfg = make_config()
+    with CaptureWriter(cfg, now=_Clock("2026-09-03T10:00:00.000000Z")) as w:
+        w.write("book", _book("a"))
+        assert w.segments == {}
+    assert _ids(_read(cfg.event_dir / "book.jsonl")) == ["a"]
+    assert list(cfg.event_dir.glob("book.*.jsonl")) == []
+    assert _meta(cfg)["segments"] == {}
+
+
+def test_segment_roll_over_failure_is_fatal_and_keeps_prior_records(make_config):
+    cfg = make_config(run_name="camp")
+    clock = _Clock(
+        "2026-09-02T23:59:59.000000Z",
+        "2026-09-02T23:59:59.500000Z",
+        "2026-09-03T00:00:00.000000Z",
+    )
+    with CaptureWriter(cfg, now=clock) as w:
+        w.write("book", _book("a"))
+        _seg(cfg, "2026-09-03").mkdir()  # the next segment's path cannot be opened
+        with pytest.raises(FatalRecorderError, match="roll-over"):
+            w.write("book", _book("b"))
+        assert w.counts == {"book": 1}  # the failed record was not counted
+    assert _ids(_read(_seg(cfg, "2026-09-02"))) == ["a"]  # closed cleanly on shutdown
+
+
+def test_write_envelope_with_unparseable_ts_stays_in_open_segment(make_config):
+    # A hand-built envelope without a usable ts_recv never rolls (or crashes) — it
+    # lands in whatever segment is open.
+    cfg = make_config(run_name="camp")
+    with CaptureWriter(cfg, now=_Clock("2026-09-03T10:00:00.000000Z")) as w:
+        for rid, ts in (("x", None), ("y", "garbage"), ("z", 1234)):
+            env = {"stream": "book", "id": rid, "ts_recv": ts, "ts_server": None, "raw": {}}
+            assert w.write_envelope(env) is True
+    assert _ids(_read(_seg(cfg, "2026-09-03"))) == ["x", "y", "z"]
+    assert sorted(cfg.event_dir.glob("book.*.jsonl")) == [_seg(cfg, "2026-09-03")]
+
+
+def test_clock_step_back_across_midnight_never_rolls_backwards(make_config):
+    # The roll is forward-only: a ts_recv from the previous day (an NTP step back right
+    # after midnight) stays in the open segment instead of re-creating yesterday's file —
+    # which may already be offloaded and would then sit beside its marker forever.
+    cfg = make_config(run_name="camp")
+    cfg.event_dir.mkdir(parents=True)
+    (cfg.event_dir / "segments").mkdir()
+    (cfg.event_dir / "segments" / "book.2026-09-02.offloaded.json").write_text(
+        '{"gs_uri": "gs://x/y"}', encoding="utf-8"
+    )
+    clock = _Clock(
+        "2026-09-03T00:00:05.000000Z",  # open(): today's segment
+        "2026-09-02T23:59:59.000000Z",  # a: the clock stepped back 6 s, across midnight
+        "2026-09-03T00:00:07.000000Z",  # b
+        "2026-09-03T00:00:08.000000Z",  # close()
+    )
+    with CaptureWriter(cfg, now=clock) as w:
+        w.write("book", _book("a"), event_id="7")
+        w.write("book", _book("b"), event_id="7")
+        assert w.segments["book"]["seen"] == ["book.2026-09-03.jsonl"]
+    assert not _seg(cfg, "2026-09-02").exists()
+    assert _ids(_read(_seg(cfg, "2026-09-03"))) == ["a", "b"]
+
+
+# -- crash safety of the append-open: a torn trailing line ------------------ #
+
+
+def _parsed_ids(path):
+    out = []
+    for raw in path.read_bytes().split(b"\n"):
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw)["id"])
+        except (ValueError, KeyError):
+            out.append("<torn>")
+    return out
+
+
+def test_restart_after_a_torn_trailing_line_does_not_glue_the_next_record(make_config, caplog):
+    # ENOSPC / SIGKILL mid-write leaves a partial last line in BOTH the segment and the
+    # per-match file. The restart's append-open must terminate it, or the first new
+    # record is glued onto it and readers lose two records (while counts say otherwise).
+    cfg = make_config(run_name="camp")
+    with CaptureWriter(cfg, now=_Clock("2026-09-03T10:00:00.000000Z")) as w:
+        w.write("book", _book("a"), event_id="7")
+    torn = b'{"stream": "book", "id": "torn", "ts_recv": "2026-09-03T10:00:01.0'
+    for path in (_seg(cfg, "2026-09-03"), _pm(cfg, "7")):
+        with open(path, "ab") as fh:
+            fh.write(torn)
+    with caplog.at_level(logging.WARNING, logger="polytape.writer"):
+        with CaptureWriter(cfg, now=_Clock("2026-09-03T10:05:00.000000Z")) as w:
+            w.write("book", _book("b"), event_id="7")
+            assert w.counts["book"] == 2
+    assert _parsed_ids(_seg(cfg, "2026-09-03")) == ["a", "<torn>", "b"]
+    assert _parsed_ids(_pm(cfg, "7")) == ["a", "<torn>", "b"]
+    assert caplog.text.count("torn line") == 2  # once per repaired file
+
+
+def test_repair_tail_helper(tmp_path):
+    missing = tmp_path / "missing.jsonl"
+    assert _repair_tail(missing) is False and not missing.exists()
+    empty = tmp_path / "empty.jsonl"
+    empty.write_bytes(b"")
+    assert _repair_tail(empty) is False and empty.read_bytes() == b""
+    clean = tmp_path / "clean.jsonl"
+    clean.write_bytes(b'{"id": 1}\n{"id": 2}\n')
+    assert _repair_tail(clean) is False and clean.read_bytes() == b'{"id": 1}\n{"id": 2}\n'
+    torn = tmp_path / "torn.jsonl"
+    torn.write_bytes(b'{"id": 1}\n{"id": 2')
+    assert _repair_tail(torn) is True and torn.read_bytes() == b'{"id": 1}\n{"id": 2\n'
+    assert _repair_tail(torn) is False  # idempotent
+
+
+# -- per-match meta flush economy ------------------------------------------- #
+
+
+def test_per_match_meta_is_rewritten_only_for_events_with_new_records(make_config):
+    # Hundreds of open events x a flush every 5 s must not rewrite hundreds of files
+    # for no new information: only events with records since their last write.
+    cfg = make_config(run_name="camp")
+    meta7 = _pm(cfg, "7").with_name("meta.json")
+    meta8 = _pm(cfg, "8").with_name("meta.json")
+    with CaptureWriter(cfg) as w:
+        w.write("book", _book("a"), event_id="7")
+        assert w.flush_meta() is True
+        assert meta7.exists()
+        meta7.unlink()  # a needless rewrite on the next flush would bring it back
+        w.write("book", _book("b"), event_id="8")
+        assert w.flush_meta() is True
+        assert not meta7.exists() and meta8.exists()
+        w.write("book", _book("c"), event_id="7")
+        assert w.flush_meta() is True
+        assert json.loads(meta7.read_text(encoding="utf-8"))["counts"] == {"book": 2}
+    # close() stamps stopped_at into EVERY open match's meta, dirty or not
+    stopped = json.loads(meta8.read_text(encoding="utf-8"))
+    assert stopped["stopped_at"] and stopped["counts"] == {"book": 1}

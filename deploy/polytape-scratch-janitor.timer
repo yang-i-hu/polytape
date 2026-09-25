@@ -1,10 +1,11 @@
-# Sweeps orphaned admin scratch hourly (and shortly after boot), so an OOM-killed
-# build's leftover multi-GB dir can never accumulate to ENOSPC on /data. Install:
+# Sweeps orphaned scratch hourly (and shortly after boot), so a hard-killed offload's
+# leftover multi-GB tar staging can never accumulate to ENOSPC on /data. Install
+# (deploy/bootstrap.sh does this):
 #   sudo install -m 0755 deploy/polytape-scratch-janitor.sh /opt/polytape/polytape-scratch-janitor.sh
 #   sudo cp deploy/polytape-scratch-janitor.{service,timer} /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now polytape-scratch-janitor.timer
 [Unit]
-Description=Run polytape admin-scratch janitor hourly
+Description=Run polytape scratch janitor hourly
 
 [Timer]
 OnBootSec=3min

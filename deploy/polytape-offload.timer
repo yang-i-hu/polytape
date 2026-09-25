@@ -1,14 +1,16 @@
-# Hourly trigger for the polytape finished-match offloader (see polytape-offload.service).
-# Finished matches roll out of the open set ~continuously during a tournament; an hourly
-# sweep keeps the per-match SSD footprint bounded without racing the recorder.
+# Hourly trigger for the polytape offloader (see polytape-offload.service).
+# Games finish and strike ladders expire continuously on an open-ended campaign, and
+# the monolith is sealed into segments as it grows; an hourly sweep keeps the local
+# SSD footprint bounded without racing the recorder.
 
 [Unit]
-Description=Run polytape finished-match offloader hourly
+Description=Run polytape offloader (matches + segments -> GCS) hourly
 
 [Timer]
 OnBootSec=10min
 OnUnitActiveSec=1h
-# Spread the run off the top of the hour so it doesn't line up with other timers.
+# Spread the run off the top of the hour so it doesn't line up with other timers
+# (and with the hourly crypto-ladder roll-over restart).
 RandomizedDelaySec=5min
 Persistent=true
 

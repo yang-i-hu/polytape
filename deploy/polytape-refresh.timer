@@ -1,10 +1,13 @@
-# Runs the match-set refresh every ~10 minutes (and shortly after boot), so
-# resolved matches roll out and newly-created fixtures roll in without manual
-# intervention. Install alongside polytape-refresh.service:
+# Runs the campaign event-set refresh every ~10 minutes (and shortly after boot),
+# so finished games / expired strike ladders roll out and new fixtures / the next
+# hour's ladder roll in without manual intervention. Because the hourly crypto
+# ladders rotate, expect roughly one genuine change (= one recorder restart) per
+# hour; the 10-minute cadence bounds how long a new ladder goes unrecorded.
+# Install (deploy/bootstrap.sh does this):
 #   sudo cp deploy/polytape-refresh.{service,timer} /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now polytape-refresh.timer
 [Unit]
-Description=Run polytape match-set refresh every 10 minutes
+Description=Run polytape campaign event-set refresh every 10 minutes
 
 [Timer]
 OnBootSec=5min

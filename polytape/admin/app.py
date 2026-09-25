@@ -15,7 +15,7 @@ Guarded control plane (only when ``POLYTAPE_ADMIN_TOKEN`` is set):
   rate-limited, audited; never runs systemctl itself — see :mod:`polytape.admin.control`)
 
 Binds to localhost by default — reach it through an SSH tunnel
-(``gcloud compute ssh polytape-rec -- -L 8080:localhost:8080``), so there is no
+(``gcloud compute ssh <vm-name> -- -L 8080:localhost:8080``), so there is no
 public port and no new firewall hole. fastapi/uvicorn are an optional extra
 (``pip install 'polytape[admin]'``); importing this module does not require them.
 """

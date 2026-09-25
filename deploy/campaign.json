@@ -1,0 +1,19 @@
+{
+  "run_name": "maker",
+  "lookahead_h": 72,
+  "lookback_h": 8,
+  "sports": [
+    {"tag": "mlb", "types": ["moneyline", "spreads", "totals"], "lines": "all"},
+    {"tag": "nfl", "types": ["moneyline", "spreads", "totals"], "lines": "main"},
+    {"tag": "cfb", "types": ["moneyline", "spreads", "totals"], "lines": "main"},
+    {"tag": "nba", "types": ["moneyline", "spreads", "totals"], "lines": "main"},
+    {"tag": "nhl", "types": ["moneyline", "spreads", "totals"], "lines": "main"},
+    {"tag": "epl", "types": ["moneyline", "totals"], "lines": "main"},
+    {"tag": "la-liga", "types": ["moneyline", "totals"], "lines": "main"},
+    {"tag": "ucl", "types": ["moneyline", "totals"], "lines": "main"},
+    {"tag": "bundesliga", "types": ["moneyline", "totals"], "lines": "main"},
+    {"tag": "sea", "types": ["moneyline", "totals"], "lines": "main"},
+    {"tag": "ligue-1", "types": ["moneyline", "totals"], "lines": "main"}
+  ],
+  "ladders": {"assets": ["bitcoin", "ethereum"], "hours_ahead": 2}
+}

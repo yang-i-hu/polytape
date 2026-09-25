@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
@@ -313,6 +313,47 @@ def _filter_markets(markets: tuple[Market, ...], market_ids: tuple[str, ...]) ->
     return selected
 
 
+def _apply_allowlist(
+    markets: tuple[Market, ...], allowed: Sequence[str], *, event_id: str
+) -> tuple[Market, ...]:
+    """Restrict ``markets`` to a per-event allow-list (a matches file's ``record_markets``).
+
+    Each allowed id may be a Gamma market id or a ``conditionId``; a market is kept
+    when either of its keys is listed, and the event's own market order is
+    preserved. An id that names no market in the event (stale file, typo) is
+    logged and skipped — the campaign refresh regenerates the file every few
+    minutes, so a mismatch must not be fatal. Raises :class:`GammaError` only when
+    NOTHING matches; :meth:`GammaClient.resolve_events` turns that into "event
+    dropped with a warning" instead of sinking the run.
+    """
+    if not allowed:
+        return markets
+    wanted = tuple(dict.fromkeys(str(a).strip() for a in allowed if str(a).strip()))
+    wanted_set = set(wanted)
+    matched: set[str] = set()
+    selected: list[Market] = []
+    for market in markets:
+        hits = {market.id, market.condition_id} & wanted_set
+        if hits:
+            selected.append(market)
+            matched |= hits
+    unknown = [a for a in wanted if a not in matched]
+    if unknown:
+        logger.warning(
+            "event %s: %d record_markets id(s) match no market in the event; skipped: %s",
+            event_id,
+            len(unknown),
+            unknown,
+        )
+    if not selected:
+        raise GammaError(
+            f"event {event_id}: none of record_markets {list(wanted)} matched; "
+            f"available gamma ids={[m.id for m in markets]} "
+            f"condition ids={[m.condition_id for m in markets]}"
+        )
+    return tuple(selected)
+
+
 def cond_to_event(events: Sequence[EventInfo]) -> dict[str, str]:
     """Map each market's condition id to its event id — the CLOB demux key.
 
@@ -412,16 +453,27 @@ class GammaClient:
         # Loop always returns or raises above.
         raise GammaError(f"Gamma GET {path} exhausted retries")  # pragma: no cover
 
-    async def resolve_event(self, event_id: str, market_ids: tuple[str, ...] = ()) -> EventInfo:
+    async def resolve_event(
+        self,
+        event_id: str,
+        market_ids: tuple[str, ...] = (),
+        allowed_markets: Sequence[str] = (),
+    ) -> EventInfo:
         """Resolve an Event ID to its markets and CLOB token ids.
 
         Args:
             event_id: Numeric Polymarket event id.
             market_ids: Optional ``--market-id`` overrides; matched against each
-                market's Gamma id or condition id.
+                market's Gamma id or condition id. Strict: nothing matching is an
+                error.
+            allowed_markets: Optional per-event allow-list (the matches file's
+                ``record_markets`` ids / conditionIds); see :func:`_apply_allowlist`.
+                Unknown ids are skipped with a warning. Applied first, so the two
+                filters compose as an intersection.
 
         Raises:
-            GammaError: if the event is missing or the response is unusable.
+            GammaError: if the event is missing, the response is unusable, or a
+                filter leaves no market to record.
         """
         try:
             payload = await self._get(f"/events/{event_id}")
@@ -430,6 +482,10 @@ class GammaClient:
                 raise GammaError(f"event {event_id} not found (HTTP 404)") from exc
             raise
         info = _parse_event(payload, event_id)
+        if allowed_markets:
+            info = replace(
+                info, markets=_apply_allowlist(info.markets, allowed_markets, event_id=event_id)
+            )
         if market_ids:
             info = replace(info, markets=_filter_markets(info.markets, market_ids))
         if not info.clob_token_ids:
@@ -437,7 +493,9 @@ class GammaClient:
                 "event %s has no CLOB token ids; the book stream has nothing to subscribe to",
                 event_id,
             )
-        logger.info(
+        # DEBUG, not INFO: a campaign restart resolves hundreds of events at once, and
+        # one line each would bury the journal (the resolve_events summary stays INFO).
+        logger.debug(
             "resolved event %s: %d market(s), %d CLOB token id(s)",
             event_id,
             len(info.markets),
@@ -446,20 +504,30 @@ class GammaClient:
         return info
 
     async def resolve_events(
-        self, event_ids: Sequence[str], market_ids: tuple[str, ...] = ()
+        self,
+        event_ids: Sequence[str],
+        market_ids: tuple[str, ...] = (),
+        event_markets: Mapping[str, Sequence[str]] | None = None,
     ) -> tuple[EventInfo, ...]:
         """Resolve several events concurrently (bounded), preserving input order.
 
-        Individual failures are logged and skipped so one delisted/changed event
-        cannot sink the whole run; raises :class:`GammaError` only if *none*
+        ``event_markets`` is the per-event allow-list (``event_id -> market ids /
+        conditionIds``, as on :class:`~polytape.config.Config`); an event absent from
+        it keeps every market. It composes with the global ``market_ids`` as an
+        intersection. Individual failures — including an allow-list that matches
+        none of the event's markets — are logged and skipped so one delisted/changed
+        event cannot sink the whole run; raises :class:`GammaError` only if *none*
         resolve.
         """
         sem = asyncio.Semaphore(5)
         ids = [str(e).strip() for e in event_ids]
+        allow: dict[str, Sequence[str]] = {
+            str(k).strip(): v for k, v in (event_markets or {}).items()
+        }
 
         async def _one(eid: str) -> EventInfo:
             async with sem:
-                return await self.resolve_event(eid, market_ids)
+                return await self.resolve_event(eid, market_ids, allow.get(eid, ()))
 
         results = await asyncio.gather(*(_one(e) for e in ids), return_exceptions=True)
         events: list[EventInfo] = []

@@ -19,7 +19,7 @@ class FakeGamma:
     async def resolve_event(self, event_id, market_ids=()):
         return self.event
 
-    async def resolve_events(self, event_ids, market_ids=()):
+    async def resolve_events(self, event_ids, market_ids=(), event_markets=None):
         return tuple(self.event for _ in event_ids)
 
     async def aclose(self):
