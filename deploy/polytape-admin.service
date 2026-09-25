@@ -63,11 +63,11 @@ Environment=POLYTAPE_SESSION_FILE=/var/log/polytape-admin/sessions.json
 # GCS offload of FINISHED matches: enables signed-URL downloads for matches whose native
 # files were moved to the archive bucket (see polytape-offload.service). Read-only object
 # access; used only to sign GET URLs. Unset = offload disabled (downloads use native/scan).
-# The bucket name is kept on the VM, not in this unit. /etc/polytape/gcs.env holds the
+# The bucket name is kept on the VM, not in this unit. /etc/polytape/admin-gcs.env holds the
 # same bucket as /etc/polytape/offload.env, as one line (systemd has no inline comments):
 #   POLYTAPE_GCS_BUCKET=<archive-bucket>
 # Optional ('-'): without it POLYTAPE_GCS_BUCKET is unset and offload stays disabled.
-EnvironmentFile=-/etc/polytape/gcs.env
+EnvironmentFile=-/etc/polytape/admin-gcs.env
 Environment=POLYTAPE_GCS_KEY=/etc/polytape/offload-sa.json
 # Scratch for the (multi-GB) filtered-copy of a download/extract. MUST sit on the big
 # run volume (/data, ~68 GB free) — NOT the small root fs that PrivateTmp's /tmp lands
