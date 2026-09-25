@@ -446,7 +446,7 @@ after the first week (`du -sh /data/run-maker` day over day, and
 | Symptom | Cause / fix |
 |---|---|
 | bootstrap: `BUCKET unset` | A first install (no `/etc/polytape/offload.env` yet) without `BUCKET=<archive-bucket>`; pass it as in §2. |
-| bootstrap: `no block device at ...` | `DATA_DISK` was not passed (it has no default), or the disk was attached with a different `device-name`, or not at all: `lsblk`, `ls /dev/disk/by-id/`, then `DATA_DISK=/dev/disk/by-id/google-<name> sudo bash /tmp/bootstrap.sh`. Never point it at the boot disk. |
+| bootstrap: `no block device at ...` | `DATA_DISK` was not passed (it has no default), or the disk was attached with a different `device-name`, or not at all: `lsblk`, `ls /dev/disk/by-id/`, then `sudo BUCKET=<archive-bucket> DATA_DISK=/dev/disk/by-id/google-<name> bash /tmp/bootstrap.sh`. Never point it at the boot disk. |
 | bootstrap: `carries a ... partition table; refusing to format it` | The disk is not blank (a partitioned disk from somewhere else). Check `lsblk -f`; wipe it deliberately (`wipefs -a`) only if you are sure it holds nothing. |
 | bootstrap: `tarball is missing scripts/list_campaign_events.py` | Built from a branch without the campaign work; rebuild from the branch that carries it (`campaign-v2` until merged, `main` after). |
 | `polytape` crash-loops with `no matching events found` | `/etc/polytape/campaign_events.json` is empty (discovery returned nothing / wrong spec). Run discovery by hand (§4); check the spec. |
