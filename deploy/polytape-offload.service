@@ -10,7 +10,7 @@
 # polytape/admin/offload.py.
 #
 # Auth: Application Default Credentials from the VM's ATTACHED service account
-# (polytape-offload@polytape-prod-194347.iam.gserviceaccount.com, objectAdmin on the
+# (<offload-sa>@<gcp-project>.iam.gserviceaccount.com, objectAdmin on the
 # archive bucket only, instance scope storage-rw). There is NO key file on this VM —
 # do not set POLYTAPE_GCS_KEY / GOOGLE_APPLICATION_CREDENTIALS in offload.env.
 #

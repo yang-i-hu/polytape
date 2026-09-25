@@ -4,7 +4,7 @@ Passive recorder for Polymarket's public real-time CLOB order-book feed, written
 to timestamped JSONL. **This repo is purely for getting data** — it never trades
 and never authenticates (public read-only endpoints only).
 
-All quantitative **research** (backtests, microstructure / ML / market-making
+All quantitative **research** (market microstructure / ML
 studies, the `polytape_mm` package, notebooks, the raw→parquet→tensor pipeline)
 lives in the sibling **PolyQuant** repo. Do not add analysis code here.
 

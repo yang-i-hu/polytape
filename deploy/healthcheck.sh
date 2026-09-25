@@ -1,5 +1,5 @@
 #!/bin/bash
-# polytape maker-campaign health check — read-only; run by hand over SSH (or from cron).
+# polytape campaign health check — read-only; run by hand over SSH (or from cron).
 #
 # Prints: recorder unit state, freshness from meta.json (age of last_record_at and of
 # started_at — a just-restarted recorder is not a stalled one —, cumulative counts,

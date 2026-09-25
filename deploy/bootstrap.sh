@@ -1,5 +1,5 @@
 #!/bin/bash
-# polytape maker-campaign bootstrap — Debian 12, run as root, IDEMPOTENT (re-run to upgrade).
+# polytape campaign bootstrap — Debian 12, run as root, IDEMPOTENT (re-run to upgrade).
 #
 # What it does (every step is a no-op when already done):
 #   1. apt: python3, python3-venv, zstd
@@ -29,20 +29,20 @@
 # attached to the VM has objectAdmin on the archive bucket ONLY and the storage-rw
 # scope; the offloader uses it through Application Default Credentials.
 #
-# Inputs (env, all optional):
+# Inputs (env; DATA_DISK and BUCKET have no defaults and are required on a FIRST install,
+# a re-run finds /data mounted and offload.env written and needs neither; the rest optional):
 #   SRC_TARBALL=/tmp/polytape-src.tar.gz            git-archive tarball of the repo (CAMPAIGN.md)
-#   DATA_DISK=/dev/disk/by-id/google-polytape-data2 the attached data disk (GCE device-name
-#                                                   polytape-data2 on polytape-rec2)
-#   BUCKET=polytape-prod-194347-archive             Coldline archive bucket
+#   DATA_DISK=/dev/disk/by-id/google-<device-name>  the attached data disk (its GCE device-name)
+#   BUCKET=<archive-bucket>                         Coldline archive bucket (-> offload.env)
 #   RUN_NAME=maker                                  -> /data/run-<RUN_NAME>, polytape --run-name,
 #                                                   GCS prefix run-<RUN_NAME>
 #   SKIP_APT=0 / SKIP_DISCOVERY=0                   1 = skip that step
 set -euo pipefail
 
 SRC_TARBALL=${SRC_TARBALL:-/tmp/polytape-src.tar.gz}
-DATA_DISK=${DATA_DISK:-/dev/disk/by-id/google-polytape-data2}
+DATA_DISK=${DATA_DISK:-}
 DATA_MOUNT=/data
-BUCKET=${BUCKET:-polytape-prod-194347-archive}
+BUCKET=${BUCKET:-}
 RUN_NAME=${RUN_NAME:-maker}
 SKIP_APT=${SKIP_APT:-0}
 SKIP_DISCOVERY=${SKIP_DISCOVERY:-0}
@@ -62,6 +62,8 @@ die() { echo "bootstrap: ERROR: $*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo bash bootstrap.sh)"
 [ -f "$SRC_TARBALL" ] || die "source tarball not found at $SRC_TARBALL (scp it first; see deploy/CAMPAIGN.md)"
+[ -n "$BUCKET" ] || [ -f "$ETC/offload.env" ] \
+    || die "BUCKET unset: a first install needs the archive bucket (sudo BUCKET=<archive-bucket> DATA_DISK=... bash bootstrap.sh; see deploy/CAMPAIGN.md)"
 
 # ---- 1. packages ----------------------------------------------------------- #
 if [ "$SKIP_APT" != 1 ]; then
@@ -110,7 +112,7 @@ elif [ -b "$DATA_DISK" ]; then
 elif [ "$ALLOW_ROOT_DATA" = 1 ]; then
     log "WARNING: no data disk; $DATA_MOUNT is on the root fs (ALLOW_ROOT_DATA=1 — dev only)"
 else
-    die "no block device at $DATA_DISK and $DATA_MOUNT is not a mount point — the recorder must not write to the root fs. Attach the disk (device-name polytape-data2) or set DATA_DISK=/dev/disk/by-id/google-<device-name>; see CAMPAIGN.md"
+    die "no block device at ${DATA_DISK:-(DATA_DISK unset)} and $DATA_MOUNT is not a mount point — the recorder must not write to the root fs. Attach the data disk and set DATA_DISK=/dev/disk/by-id/google-<device-name>; see CAMPAIGN.md"
 fi
 install -d -o polytape -g polytape -m 0755 "$DATA_MOUNT"
 install -d -o polytape -g polytape -m 0755 "$DATA_MOUNT/tmp"

@@ -1,4 +1,4 @@
-# polytape recorder — systemd unit (maker campaign: open-ended, multi-family).
+# polytape recorder — systemd unit (campaign: open-ended, multi-family).
 #
 # Records every event listed in /etc/polytape/campaign_events.json in ONE process
 # into /data/run-maker. That file is written by scripts/list_campaign_events.py from
@@ -25,7 +25,7 @@
 # the data disk (a separate pd-balanced volume mounted with `nofail`) is not mounted.
 
 [Unit]
-Description=polytape Polymarket recorder (maker campaign)
+Description=polytape Polymarket recorder (campaign)
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/data

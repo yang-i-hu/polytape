@@ -1,7 +1,7 @@
 # polytape admin dashboard — sidecar bound to localhost:8080.
 #
 # Reach it WITHOUT opening any port, via an SSH tunnel from your machine:
-#   gcloud compute ssh polytape-rec --zone=europe-west2-a --project=<proj> -- -L 8080:localhost:8080
+#   gcloud compute ssh <vm-name> --zone=<zone> --project=<gcp-project> -- -L 8080:localhost:8080
 # then open http://localhost:8080
 #
 # The dashboard is read-only UNLESS a control secret is configured. Read-only mode
@@ -11,6 +11,7 @@
 # ── read-only setup ────────────────────────────────────────────────────────
 #   pip install 'polytape[admin]'   # fastapi + uvicorn into the venv
 #   cp deploy/polytape-admin.service /etc/systemd/system/
+#   echo 'POLYTAPE_GCS_BUCKET=<archive-bucket>' > /etc/polytape/admin-gcs.env   # optional, see below
 #   systemctl daemon-reload && systemctl enable --now polytape-admin
 #
 # ── control-plane setup (run as root; verify on the VM before trusting) ──────
@@ -63,7 +64,9 @@ Environment=POLYTAPE_SESSION_FILE=/var/log/polytape-admin/sessions.json
 # GCS offload of FINISHED matches: enables signed-URL downloads for matches whose native
 # files were moved to the archive bucket (see polytape-offload.service). Read-only object
 # access; used only to sign GET URLs. Unset = offload disabled (downloads use native/scan).
-Environment=POLYTAPE_GCS_BUCKET=polytape-prod-194347-archive
+# The bucket name is kept on the VM, not in this unit. Optional ('-') file with one key:
+#   POLYTAPE_GCS_BUCKET=<archive-bucket>
+EnvironmentFile=-/etc/polytape/admin-gcs.env
 Environment=POLYTAPE_GCS_KEY=/etc/polytape/offload-sa.json
 # Scratch for the (multi-GB) filtered-copy of a download/extract. MUST sit on the big
 # run volume (/data, ~68 GB free) — NOT the small root fs that PrivateTmp's /tmp lands

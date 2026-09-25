@@ -1,24 +1,28 @@
-# Maker campaign — deployment runbook
+# Campaign deployment runbook
 
 Open-ended, multi-family recording on a GCP VM: sports game markets (main
 moneyline / spread / total per game for several leagues; all lines for MLB; games
 starting within 72 h) plus the hourly BTC/ETH strike ladders (current + next two
 hours). One recorder process, ~800–1,000 markets / ~1,600–2,000 tokens / ~9–12
 websocket shards (781 / 1,562 / 9 measured on 2026-09-03 with NFL, NBA, NHL and UCL
-not yet in season), feeding the maker-side market-making study and the
+not yet in season), feeding market microstructure research and the
 executor-profile measurement.
 
 This document is the operator's runbook: provision, ship, verify, daily checks, cost,
 teardown. The mechanics live in `deploy/` (units, scripts) and are installed by
 `deploy/bootstrap.sh`.
 
+Names in angle brackets (`<gcp-project>`, `<zone>`, `<vm-name>`, `<disk-name>`,
+`<device-name>`, `<offload-sa>`, `<archive-bucket>`) are placeholders for the
+deployment's own identifiers, which are kept out of this repo; substitute your values.
+
 | | |
 |---|---|
-| Project / zone | `polytape-prod-194347` / `europe-west2-a` |
-| VM | `polytape-rec2` — e2-medium, Debian 12, 20 GB pd-balanced boot (EXISTS, running, no network tags yet — see §1) |
-| Data disk | `polytape-data2` — 200 GB pd-balanced, attached as device-name `polytape-data2` (`/dev/disk/by-id/google-polytape-data2`), mounted at `/data` |
-| Service account (attached) | `polytape-offload@polytape-prod-194347.iam.gserviceaccount.com` — objectAdmin on the archive bucket ONLY; instance scope `storage-rw` |
-| Archive bucket | `gs://polytape-prod-194347-archive` (exists; Coldline objects under `run-maker/` — `event-<id>.tar.gz` and `segments/`; the World Cup run's `matches/` and `run-wc/` sit beside it) |
+| Project / zone | `<gcp-project>` / `<zone>` |
+| VM | `<vm-name>` — e2-medium, Debian 12, 20 GB pd-balanced boot (EXISTS, running, no network tags yet — see §1) |
+| Data disk | `<disk-name>` — 200 GB pd-balanced, attached as device-name `<device-name>` (`/dev/disk/by-id/google-<device-name>`), mounted at `/data` |
+| Service account (attached) | `<offload-sa>@<gcp-project>.iam.gserviceaccount.com` — objectAdmin on the archive bucket ONLY; instance scope `storage-rw` |
+| Archive bucket | `gs://<archive-bucket>` (exists; Coldline objects under `run-maker/` — `event-<id>.tar.gz` and `segments/`; the World Cup run's `matches/` and `run-wc/` sit beside it) |
 | Run dir | `/data/run-maker` (`polytape --run-name maker --no-per-match --out /data`; monolith segments only — measured ~45 MB/min in game hours, so no per-match dual write) |
 
 ---
@@ -75,20 +79,21 @@ Prerequisites on your workstation: `gcloud` authenticated as a project owner/edi
 with `roles/iam.serviceAccountUser` on the SA (to attach it) and
 `roles/iap.tunnelResourceAccessor` (to SSH via IAP). Owners have both.
 
-The VM `polytape-rec2` and its data disk `polytape-data2` ALREADY EXIST (created
-by hand; the disk is attached as device-name `polytape-data2`, the SA is attached with
+The VM `<vm-name>` and its data disk `<disk-name>` ALREADY EXIST (created
+by hand; the disk is attached as device-name `<device-name>`, the SA is attached with
 `storage-rw`). Steps 1–2 below are only for re-creating them from scratch; on the
 existing VM go straight to step 2b (adopt) and step 3 (firewall — in THIS order, or
 you lock yourself out).
 
 ```bash
-PROJECT=polytape-prod-194347
-ZONE=europe-west2-a
-VM=polytape-rec2
-DISK=polytape-data2
-DEVICE=polytape-data2            # GCE device-name -> /dev/disk/by-id/google-$DEVICE
-SA=polytape-offload@polytape-prod-194347.iam.gserviceaccount.com
-BUCKET=polytape-prod-194347-archive
+# fill in your deployment's values (see the placeholder note at the top)
+PROJECT=<gcp-project>
+ZONE=<zone>
+VM=<vm-name>
+DISK=<disk-name>
+DEVICE=<device-name>             # GCE device-name -> /dev/disk/by-id/google-$DEVICE
+SA=<offload-sa>@$PROJECT.iam.gserviceaccount.com
+BUCKET=<archive-bucket>
 
 # 0. sanity: the bucket and the scoped SA exist; the SA has NO project-level roles
 gcloud storage buckets describe gs://$BUCKET --project=$PROJECT \
@@ -124,7 +129,7 @@ gcloud compute instances add-tags $VM --project=$PROJECT --zone=$ZONE --tags=pol
 gcloud compute instances add-metadata $VM --project=$PROJECT --zone=$ZONE --metadata=enable-oslogin=TRUE
 gcloud compute instances describe $VM --project=$PROJECT --zone=$ZONE \
   --format='yaml(tags.items,disks[].deviceName,serviceAccounts[].scopes)'
-#   expect tags [polytape-maker], deviceNames [persistent-disk-0, polytape-data2], storage-rw
+#   expect tags [polytape-maker], deviceNames [persistent-disk-0, <device-name>], storage-rw
 
 # 3. inbound: SSH via IAP only. Create the IAP rule for the tag, PROVE the tunnel works,
 #    and only then delete default-allow-ssh (tcp:22 from 0.0.0.0/0 to EVERY VM) — deleting
@@ -139,7 +144,7 @@ gcloud compute ssh $VM --project=$PROJECT --zone=$ZONE --tunnel-through-iap -- '
 gcloud compute ssh $VM --project=$PROJECT --zone=$ZONE --tunnel-through-iap -- \
   'curl -s -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email; echo; lsblk -o NAME,SIZE,TYPE,MOUNTPOINT; ls -l /dev/disk/by-id/ | grep google-'
 # expect the SA email, an unformatted 200G disk (sdb) with no mountpoint, and
-# /dev/disk/by-id/google-polytape-data2 -> ../../sdb.
+# /dev/disk/by-id/google-<device-name> -> ../../sdb.
 ```
 
 ---
@@ -161,11 +166,11 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD)
 git -c core.autocrlf=false archive --format=tar.gz --prefix=polytape/ -o /tmp/polytape-src.tar.gz "$BRANCH"
 gcloud compute scp /tmp/polytape-src.tar.gz deploy/bootstrap.sh $VM:/tmp/ \
   --project=$PROJECT --zone=$ZONE --tunnel-through-iap
-# DATA_DISK defaults to /dev/disk/by-id/google-polytape-data2 (the existing disk); pass
-# it explicitly if the device-name ever differs. bootstrap dies (before touching
+# DATA_DISK and BUCKET have no defaults: a first install needs both (a re-run finds
+# /data mounted and offload.env written, and needs neither). bootstrap dies (before touching
 # anything) if the path does not exist — it never falls back to the boot disk.
 gcloud compute ssh $VM --project=$PROJECT --zone=$ZONE --tunnel-through-iap -- \
-  "sudo sed -i 's/\r\$//' /tmp/bootstrap.sh && sudo DATA_DISK=/dev/disk/by-id/google-$DEVICE bash /tmp/bootstrap.sh"
+  "sudo sed -i 's/\r\$//' /tmp/bootstrap.sh && sudo BUCKET=$BUCKET DATA_DISK=/dev/disk/by-id/google-$DEVICE bash /tmp/bootstrap.sh"
 ```
 
 `bootstrap.sh` is idempotent — re-run it to upgrade (new tarball in `/tmp` first). It:
@@ -185,7 +190,8 @@ installed set is left to the refresh timer); enables `polytape` + the three time
 restarted (one gap) — that is the upgrade path.
 
 Environment knobs (`sudo BUCKET=... bash /tmp/bootstrap.sh`): `SRC_TARBALL`, `DATA_DISK`,
-`BUCKET`, `RUN_NAME` (default `maker`; drives the run dir, the recorder's `--run-name`
+`BUCKET` (these two have no defaults; required on a first install), `RUN_NAME`
+(default `maker`; drives the run dir, the recorder's `--run-name`
 and the GCS prefix `run-<RUN_NAME>` together), `SKIP_APT`, `SKIP_DISCOVERY`.
 
 Optional dead-man's switch (recommended for an unattended run): create a healthchecks.io
@@ -282,7 +288,7 @@ What to act on:
   (`not enough free space to stage ...` in its journal) rather than pushing the recorder
   into ENOSPC — at that point grow the disk. As a last resort the disk can be grown
   online by hand from your workstation
-  (`gcloud compute disks resize $DISK --size=300GB` then `sudo resize2fs /dev/disk/by-id/google-polytape-data2`
+  (`gcloud compute disks resize $DISK --size=300GB` then `sudo resize2fs /dev/disk/by-id/google-<device-name>`
   on the VM) — the VM's own SA deliberately cannot do this.
 * Refresh says `discovery failed` for more than an hour → Gamma changed shape or the
   spec is wrong. The journal line carries the discovery's last stderr lines and the
@@ -332,9 +338,9 @@ sudo systemctl stop polytape polytape-refresh.timer polytape-offload.timer polyt
 sudo systemctl start polytape-offload.service && sudo journalctl -u polytape-offload -n 20 --no-pager
 # whatever is still local (the live segment, matches that were open at stop time):
 sudo /opt/polytape/healthcheck.sh || true
-sudo gcloud storage cp -r /data/run-maker gs://polytape-prod-194347-archive/run-maker/final/
+sudo gcloud storage cp -r /data/run-maker gs://<archive-bucket>/run-maker/final/
 #   (gcloud on the VM authenticates as the attached SA; objectAdmin on the bucket suffices)
-gcloud storage ls -l gs://polytape-prod-194347-archive/run-maker/final/** | wc -l   # from your workstation: verify
+gcloud storage ls -l gs://$BUCKET/run-maker/final/** | wc -l   # from your workstation: verify
 
 # from your workstation: delete the VM, then the data disk (auto-delete=no), then the rule
 gcloud compute instances delete $VM --project=$PROJECT --zone=$ZONE --quiet
@@ -409,7 +415,7 @@ GB-month); the SA can stay — it has no other rights.
 
 ---
 
-## 8. Cost (approximate, europe-west2 on-demand list prices — check the calculator)
+## 8. Cost (approximate on-demand list prices for the VM's region; check the calculator)
 
 | Item | Estimate |
 |---|---|
@@ -439,7 +445,8 @@ after the first week (`du -sh /data/run-maker` day over day, and
 
 | Symptom | Cause / fix |
 |---|---|
-| bootstrap: `no block device at /dev/disk/by-id/google-polytape-data2` | The disk was attached with a different `device-name`, or not at all: `lsblk`, `ls /dev/disk/by-id/`, then `DATA_DISK=/dev/disk/by-id/google-<name> sudo bash /tmp/bootstrap.sh`. Never point it at the boot disk. |
+| bootstrap: `BUCKET unset` | A first install (no `/etc/polytape/offload.env` yet) without `BUCKET=<archive-bucket>`; pass it as in §2. |
+| bootstrap: `no block device at ...` | `DATA_DISK` was not passed (it has no default), or the disk was attached with a different `device-name`, or not at all: `lsblk`, `ls /dev/disk/by-id/`, then `DATA_DISK=/dev/disk/by-id/google-<name> sudo bash /tmp/bootstrap.sh`. Never point it at the boot disk. |
 | bootstrap: `carries a ... partition table; refusing to format it` | The disk is not blank (a partitioned disk from somewhere else). Check `lsblk -f`; wipe it deliberately (`wipefs -a`) only if you are sure it holds nothing. |
 | bootstrap: `tarball is missing scripts/list_campaign_events.py` | Built from a branch without the campaign work; rebuild from the branch that carries it (`campaign-v2` until merged, `main` after). |
 | `polytape` crash-loops with `no matching events found` | `/etc/polytape/campaign_events.json` is empty (discovery returned nothing / wrong spec). Run discovery by hand (§4); check the spec. |

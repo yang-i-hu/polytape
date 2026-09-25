@@ -1,4 +1,4 @@
-"""Tests for the maker-campaign deployment scripts under deploy/ — fully offline.
+"""Tests for the campaign deployment scripts under deploy/ — fully offline.
 
 The units and scripts cannot run on the target VM here, but their contracts can:
 
@@ -475,7 +475,7 @@ def _bootstrap_offload_env() -> dict[str, str]:
     subs = {
         "$DATA_MOUNT": "/data",
         "$RUN_NAME": "maker",
-        "$BUCKET": "polytape-prod-194347-archive",
+        "$BUCKET": "<archive-bucket>",
         "$ETC": "/etc/polytape",
     }
     out: dict[str, str] = {}
@@ -674,8 +674,10 @@ def test_bootstrap_offload_env_matches_the_example_and_the_runbook():
 
 def test_bootstrap_targets_the_existing_disk_and_installs_safely():
     text = (DEPLOY / "bootstrap.sh").read_text(encoding="utf-8")
-    assert "DATA_DISK=${DATA_DISK:-/dev/disk/by-id/google-polytape-data2}" in text
-    assert re.search(r"google-polytape-data(?!2)", text) is None  # the old, non-existent device
+    # no baked-in disk or bucket: a first install passes both, a re-run needs neither
+    assert "DATA_DISK=${DATA_DISK:-}" in text and "BUCKET=${BUCKET:-}" in text
+    assert re.search(r"by-id/google-[a-z0-9]", text) is None  # only google-<device-name>
+    assert '[ -n "$BUCKET" ] || [ -f "$ETC/offload.env" ]' in text
     # a partitioned disk is somebody's: refuse to mkfs it, and show what was there
     assert 'blkid -o value -s PTTYPE "$DATA_DISK"' in text
     assert "partition table; refusing to format it" in text
@@ -725,11 +727,13 @@ def test_refresh_unit_is_bounded_and_identified():
 
 def test_runbook_targets_the_existing_vm_and_orders_the_firewall_change_safely():
     runbook = (DEPLOY / "CAMPAIGN.md").read_text(encoding="utf-8")
-    assert "VM=polytape-rec2" in runbook and "DISK=polytape-data2" in runbook
+    assert "VM=<vm-name>" in runbook and "DISK=<disk-name>" in runbook
     assert "polytape-maker-data" not in runbook
-    assert re.search(r"google-polytape-data(?!2)", runbook) is None
-    assert "DATA_DISK=/dev/disk/by-id/google-$DEVICE bash /tmp/bootstrap.sh" in runbook
-    assert "resize2fs /dev/disk/by-id/google-polytape-data2" in runbook
+    assert re.search(r"by-id/google-[a-z0-9]", runbook) is None  # $DEVICE / <device-name> only
+    assert (
+        "BUCKET=$BUCKET DATA_DISK=/dev/disk/by-id/google-$DEVICE bash /tmp/bootstrap.sh" in runbook
+    )
+    assert "resize2fs /dev/disk/by-id/google-<device-name>" in runbook
     # adopt (tag) the untagged VM, create the IAP rule, PROVE the tunnel, only then delete
     # default-allow-ssh — the other order locks the VM out of SSH
     assert (
