@@ -13,7 +13,7 @@
 #   # env file with the bucket + key + scratch (0644 ok; no secrets, just paths):
 #   cat >/etc/polytape/offload.env <<'ENV'
 #   POLYTAPE_RUN_DIR=/data/run-wc
-#   POLYTAPE_GCS_BUCKET=polytape-prod-194347-archive
+#   POLYTAPE_GCS_BUCKET=<archive-bucket>
 #   POLYTAPE_GCS_KEY=/etc/polytape/offload-sa.json
 #   POLYTAPE_GCS_STORAGE_CLASS=COLDLINE
 #   POLYTAPE_SCRATCH_DIR=/data/tmp/polytape-admin
