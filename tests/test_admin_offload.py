@@ -56,10 +56,12 @@ def _native(run_dir, event_id, *, book_lines=("a", "b"), meta=None):
     return d
 
 
-def _write_meta(run_dir, open_ids):
-    (run_dir / "meta.json").write_text(
-        json.dumps({"events": [{"id": e} for e in open_ids]}), encoding="utf-8"
-    )
+def _write_meta(run_dir, open_ids, counts_by_event=None):
+    meta = {"events": [{"id": e} for e in open_ids]}
+    if counts_by_event is not None:
+        meta["counts_by_event"] = counts_by_event
+    (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return meta
 
 
 # --------------------------------------------------------------------------- #
@@ -80,6 +82,20 @@ def test_offloadable_excludes_open_and_already_offloaded(tmp_path):
 
 def test_offloadable_none_when_no_matches_dir(tmp_path):
     assert ofl.offloadable_event_ids(tmp_path, {"events": []}) == []
+
+
+def test_offloadable_excludes_partial_native(tmp_path):
+    """A match that straddled the per-match deploy has a PARTIAL native book.jsonl
+    (fewer lines than the monolith count) — it must never be selected for offload."""
+    meta = _write_meta(
+        tmp_path,
+        open_ids=[],
+        counts_by_event={"0900": {"book": 5}, "0901": {"book": 2}},
+    )
+    _native(tmp_path, "0900", book_lines=["r4", "r5"])  # partial: 2 < 5 -> skipped
+    _native(tmp_path, "0901", book_lines=["r1", "r2"])  # complete: 2 >= 2
+    _native(tmp_path, "0902")  # no monolith count -> cannot dispute; offloadable
+    assert ofl.offloadable_event_ids(tmp_path, meta) == ["0901", "0902"]
 
 
 # --------------------------------------------------------------------------- #
@@ -149,6 +165,20 @@ def test_run_offload_batch_and_skips_failures(tmp_path):
     assert (tmp_path / "matches" / "event-1001").exists()  # untouched
     # idempotent: a second pass finds nothing new
     assert ofl.run_offload(tmp_path, be) == []
+
+
+def test_run_offload_skips_partial_native(tmp_path):
+    """End to end: a partial native is NOT uploaded/marked/deleted; the complete
+    sibling still offloads normally."""
+    _write_meta(tmp_path, open_ids=[], counts_by_event={"0900": {"book": 5}, "0901": {"book": 2}})
+    _native(tmp_path, "0900", book_lines=["r4", "r5"])  # post-deploy tail only (2 of 5)
+    _native(tmp_path, "0901", book_lines=["r1", "r2"])
+    be = FakeBackend()
+    assert ofl.run_offload(tmp_path, be) == ["0901"]
+    # the partial match is untouched: native kept, no marker, nothing in GCS
+    assert (tmp_path / "matches" / "event-0900" / "book.jsonl").exists()
+    assert not ofl.is_offloaded(tmp_path / "matches", "0900")
+    assert "matches/event-0900.tar.gz" not in be.objects
 
 
 def test_run_offload_limit(tmp_path):
