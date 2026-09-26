@@ -20,14 +20,14 @@
 #          compute.disks.resize) on the project/disk, AND
 #        - the instance access scope includes compute-rw or cloud-platform.
 #      Test:  gcloud compute disks describe "$AUTOGROW_DISK" --zone "$ZONE" --project "$PROJECT"
-#      !! polytape-rec currently has NO service account attached, so the on-VM
+#      !! If the VM has NO service account attached, the on-VM
 #         resize WILL fail until you attach one. Attaching a SA requires the VM to
 #         be STOPPED (brief recorder downtime):
-#           gcloud compute instances stop polytape-rec --zone=europe-west2-a --project=polytape-prod-194347
-#           gcloud compute instances set-service-account polytape-rec \
+#           gcloud compute instances stop <vm-name> --zone=<zone> --project=<gcp-project>
+#           gcloud compute instances set-service-account <vm-name> \
 #             --service-account=<SA_EMAIL> --scopes=cloud-platform \
-#             --zone=europe-west2-a --project=polytape-prod-194347
-#           gcloud compute instances start polytape-rec --zone=europe-west2-a --project=polytape-prod-194347
+#             --zone=<zone> --project=<gcp-project>
+#           gcloud compute instances start <vm-name> --zone=<zone> --project=<gcp-project>
 #         then grant that SA roles/compute.instanceAdmin.v1 (or compute.disks.resize).
 #      If you can't take downtime, drop the resize step and run it remotely instead
 #      (your laptop's user creds CAN resize); keep only the FS-grow half on the VM.
